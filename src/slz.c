@@ -525,7 +525,7 @@ static inline long memmatch(const unsigned char *a, const unsigned char *b, long
 	unsigned long xor;
 
 	while (1) {
-		if (len + 2 * sizeof(long) > max) {
+		if ((long)(len + 2 * sizeof(long)) > max) {
 			while (len < max) {
 				if (a[len] != b[len])
 					break;
