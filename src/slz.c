@@ -309,10 +309,10 @@ static inline void send_eob(struct slz_stream *strm)
 }
 
 /* copies at most <len> litterals from <buf>, returns the amount of data
- * copied. <more> indicates that there are data past buf + <len>. It must not
- * be called with len <= 0.
+ * copied. <more> indicates that there are data past buf + <len>. <len> must
+ * not be null.
  */
-static unsigned int copy_lit(struct slz_stream *strm, const void *buf, int len, int more)
+static uint32_t copy_lit(struct slz_stream *strm, const void *buf, uint32_t len, int more)
 {
 	if (len > 65535) {
 		len = 65535;
@@ -334,10 +334,10 @@ static unsigned int copy_lit(struct slz_stream *strm, const void *buf, int len, 
 }
 
 /* copies at most <len> litterals from <buf>, returns the amount of data
- * copied. <more> indicates that there are data past buf + <len>. It must not
- * be called with len <= 0.
+ * copied. <more> indicates that there are data past buf + <len>. <len> must
+ * not be null.
  */
-static unsigned int copy_lit_huff(struct slz_stream *strm, const unsigned char *buf, int len, int more)
+static uint32_t copy_lit_huff(struct slz_stream *strm, const unsigned char *buf, uint32_t len, int more)
 {
 	uint32_t pos;
 
