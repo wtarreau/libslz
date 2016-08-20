@@ -597,6 +597,11 @@ static inline long memmatch(const unsigned char *a, const unsigned char *b, long
 		len += sizeof(long);
 	}
 
+#if defined(__x86_64__) || defined(__i386__) || defined(__i486__) || defined(__i586__) || defined(__i686__)
+	/* x86 has bsf. We know that xor is non-null here */
+	asm("bsf %1,%0\n" : "=r"(xor) : "0" (xor));
+	return len + xor / 8;
+#else
 	if (sizeof(long) > 4 && !(xor & 0xffffffff)) {
 		/* This code is optimized out on 32-bit archs, but we still
 		 * need to shift in two passes to avoid a warning. It is
@@ -621,6 +626,7 @@ static inline long memmatch(const unsigned char *a, const unsigned char *b, long
 	if (xor & 0xffffff)
 		return len + 2;
 	return len + 3;
+#endif // x86
 
 #else // UNALIGNED_LE_OK
 	/* This is the generic version for big endian or unaligned-incompatible
