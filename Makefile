@@ -54,10 +54,10 @@ $(SONAME): src/slz-pic.o
 $(SHARED): $(SONAME)
 	ln -sf $^ $@
 
-%.o: %.c src/slz.h
+%.o: %.c src/slz.h src/tables.h
 	$(CC) $(CFLAGS) -o $@ -c $<
 
-%-pic.o: %.c src/slz.h
+%-pic.o: %.c src/slz.h src/tables.h
 	$(CC) $(CFLAGS) $(LIB_CFLAGS) -o $@ -c $<
 
 install: install-headers install-static install-shared install-tools
