@@ -494,7 +494,7 @@ static inline void send_huff(struct slz_stream *strm, uint32_t code)
 
 static inline void send_eob(struct slz_stream *strm)
 {
-	send_huff(strm, 256); // cf rfc1951: 256 = EOB
+	enqueue8(strm, 0, 7); // direct encoding of 256 = EOB (cf RFC1951)
 }
 
 /* copies at most <len> litterals from <buf>, returns the amount of data
