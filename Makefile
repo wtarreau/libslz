@@ -1,6 +1,7 @@
 TOPDIR     := $(PWD)
 DESTDIR    :=
 PREFIX     := /usr/local
+LIBDIR     := lib
 
 CROSS_COMPILE :=
 
@@ -45,10 +46,10 @@ libslz.a: src/slz.o
 
 install:
 	[ -d "$(DESTDIR)$(PREFIX)/include/." ] || mkdir -p -m 0755 $(DESTDIR)$(PREFIX)/include
-	[ -d "$(DESTDIR)$(PREFIX)/lib/." ]     || mkdir -p -m 0755 $(DESTDIR)$(PREFIX)/lib
+	[ -d "$(DESTDIR)$(PREFIX)/$(LIBDIR)/." ] || mkdir -p -m 0755 $(DESTDIR)$(PREFIX)/$(LIBDIR)
 	[ -d "$(DESTDIR)$(PREFIX)/bin/." ]     || mkdir -p -m 0755 $(DESTDIR)$(PREFIX)/bin
 	cp src/slz.h $(DESTDIR)$(PREFIX)/include/ && chmod 644 $(DESTDIR)$(PREFIX)/include/slz.h
-	if [ -e libslz.a ]; then cp libslz.a $(DESTDIR)$(PREFIX)/lib/ && chmod 644 $(DESTDIR)$(PREFIX)/lib/libslz.a; fi
+	if [ -e libslz.a ]; then cp libslz.a $(DESTDIR)$(PREFIX)/$(LIBDIR)/ && chmod 644 $(DESTDIR)$(PREFIX)/$(LIBDIR)/libslz.a; fi
 	if [ -e zenc ]; then $(STRIP) zenc; cp zenc $(DESTDIR)$(PREFIX)/bin/ && chmod 755 $(DESTDIR)$(PREFIX)/bin/zenc; fi
 
 clean:
