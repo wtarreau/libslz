@@ -40,7 +40,7 @@ zdec: src/zdec.o
 zenc: src/zenc.o src/slz.o
 	$(LD) $(LDFLAGS) -o $@ $^
 
-libslz.a: src/slz.o
+$(STATIC): src/slz.o
 	$(AR) rv $@ $^
 
 %.o: %.c
@@ -55,8 +55,8 @@ install-headers:
 
 install-static: static
 	[ -d "$(DESTDIR)$(PREFIX)/$(LIBDIR)/." ] || mkdir -p -m 0755 $(DESTDIR)$(PREFIX)/$(LIBDIR)
-	cp libslz.a $(DESTDIR)$(PREFIX)/$(LIBDIR)/libslz.a
-	chmod 644 $(DESTDIR)$(PREFIX)/$(LIBDIR)/libslz.a
+	cp $(STATIC) $(DESTDIR)$(PREFIX)/$(LIBDIR)/$(STATIC)
+	chmod 644 $(DESTDIR)$(PREFIX)/$(LIBDIR)/$(STATIC)
 
 install-tools: tools
 	$(STRIP) zenc
