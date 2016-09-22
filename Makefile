@@ -32,6 +32,8 @@ all: $(BINS) $(STATIC)
 
 static: $(STATIC)
 
+tools: $(BINS)
+
 zdec: src/zdec.o
 	$(LD) $(LDFLAGS) -o $@ $^
 
