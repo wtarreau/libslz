@@ -28,7 +28,7 @@ OBJS       :=
 OBJS       += $(patsubst %.c,%.o,$(wildcard src/*.c))
 OBJS       += $(patsubst %.S,%.o,$(wildcard src/*.S))
 
-all: $(BINS) $(STATIC)
+all: static tools
 
 static: $(STATIC)
 
