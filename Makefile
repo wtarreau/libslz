@@ -7,7 +7,7 @@ CROSS_COMPILE :=
 
 CC         := $(CROSS_COMPILE)gcc
 OPT_CFLAGS := -O3
-CPU_CFLAGS := -fomit-frame-pointer -DCONFIG_REGPARM=3
+CPU_CFLAGS := -fomit-frame-pointer
 DEB_CFLAGS := -Wall -g
 DEF_CFLAGS :=
 USR_CFLAGS :=
