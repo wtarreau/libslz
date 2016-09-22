@@ -46,13 +46,23 @@ libslz.a: src/slz.o
 %.o: %.c
 	$(CC) $(CFLAGS) -o $@ -c $^
 
-install:
+install: install-headers install-static install-tools
+
+install-headers:
 	[ -d "$(DESTDIR)$(PREFIX)/include/." ] || mkdir -p -m 0755 $(DESTDIR)$(PREFIX)/include
+	cp src/slz.h $(DESTDIR)$(PREFIX)/include/slz.h
+	chmod 644 $(DESTDIR)$(PREFIX)/include/slz.h
+
+install-static: static
 	[ -d "$(DESTDIR)$(PREFIX)/$(LIBDIR)/." ] || mkdir -p -m 0755 $(DESTDIR)$(PREFIX)/$(LIBDIR)
-	[ -d "$(DESTDIR)$(PREFIX)/bin/." ]     || mkdir -p -m 0755 $(DESTDIR)$(PREFIX)/bin
-	cp src/slz.h $(DESTDIR)$(PREFIX)/include/slz.h && chmod 644 $(DESTDIR)$(PREFIX)/include/slz.h
-	if [ -e libslz.a ]; then cp libslz.a $(DESTDIR)$(PREFIX)/$(LIBDIR)/libslz.a && chmod 644 $(DESTDIR)$(PREFIX)/$(LIBDIR)/libslz.a; fi
-	if [ -e zenc ]; then $(STRIP) zenc; cp zenc $(DESTDIR)$(PREFIX)/bin/zenc && chmod 755 $(DESTDIR)$(PREFIX)/bin/zenc; fi
+	cp libslz.a $(DESTDIR)$(PREFIX)/$(LIBDIR)/libslz.a
+	chmod 644 $(DESTDIR)$(PREFIX)/$(LIBDIR)/libslz.a
+
+install-tools: tools
+	$(STRIP) zenc
+	[ -d "$(DESTDIR)$(PREFIX)/bin/." ] || mkdir -p -m 0755 $(DESTDIR)$(PREFIX)/bin
+	cp zenc $(DESTDIR)$(PREFIX)/bin/zenc
+	chmod 755 $(DESTDIR)$(PREFIX)/bin/zenc
 
 clean:
 	-rm -f $(BINS) $(OBJS) $(STATIC) *.[oa] *~ */*.[oa] */*~
