@@ -11,6 +11,7 @@ CPU_CFLAGS := -fomit-frame-pointer
 DEB_CFLAGS := -Wall -g
 DEF_CFLAGS :=
 USR_CFLAGS :=
+LIB_CFLAGS := -fPIC
 INC_CFLAGS := -I$(TOPDIR)/include
 CFLAGS     := $(OPT_CFLAGS) $(CPU_CFLAGS) $(DEB_CFLAGS) $(DEF_CFLAGS) $(USR_CFLAGS) $(INC_CFLAGS)
 
@@ -24,13 +25,17 @@ AR         := $(CROSS_COMPILE)ar
 STRIP      := $(CROSS_COMPILE)strip
 BINS       := zdec zenc
 STATIC     := libslz.a
+SHARED     := libslz.so
+SONAME     := $(SHARED).1
 OBJS       :=
 OBJS       += $(patsubst %.c,%.o,$(wildcard src/*.c))
 OBJS       += $(patsubst %.S,%.o,$(wildcard src/*.S))
 
-all: static tools
+all: static shared tools
 
 static: $(STATIC)
+
+shared: $(SHARED)
 
 tools: $(BINS)
 
@@ -43,10 +48,19 @@ zenc: src/zenc.o src/slz.o
 $(STATIC): src/slz.o
 	$(AR) rv $@ $^
 
+$(SONAME): src/slz-pic.o
+	$(LD) -shared $(LDFLAGS) -Wl,-soname,$@ -o $@ $^
+
+$(SHARED): $(SONAME)
+	ln -sf $^ $@
+
 %.o: %.c
 	$(CC) $(CFLAGS) -o $@ -c $^
 
-install: install-headers install-static install-tools
+%-pic.o: %.c
+	$(CC) $(CFLAGS) $(LIB_CFLAGS) -o $@ -c $<
+
+install: install-headers install-static install-shared install-tools
 
 install-headers:
 	[ -d "$(DESTDIR)$(PREFIX)/include/." ] || mkdir -p -m 0755 $(DESTDIR)$(PREFIX)/include
@@ -58,6 +72,12 @@ install-static: static
 	cp $(STATIC) $(DESTDIR)$(PREFIX)/$(LIBDIR)/$(STATIC)
 	chmod 644 $(DESTDIR)$(PREFIX)/$(LIBDIR)/$(STATIC)
 
+install-shared: shared
+	[ -d "$(DESTDIR)$(PREFIX)/$(LIBDIR)/." ] || mkdir -p -m 0755 $(DESTDIR)$(PREFIX)/$(LIBDIR)
+	cp    $(SONAME) $(DESTDIR)$(PREFIX)/$(LIBDIR)/$(SONAME)
+	cp -P $(SHARED) $(DESTDIR)$(PREFIX)/$(LIBDIR)/$(SHARED)
+	chmod 644 $(DESTDIR)$(PREFIX)/$(LIBDIR)/$(SONAME)
+
 install-tools: tools
 	$(STRIP) zenc
 	[ -d "$(DESTDIR)$(PREFIX)/bin/." ] || mkdir -p -m 0755 $(DESTDIR)$(PREFIX)/bin
@@ -67,4 +87,4 @@ install-tools: tools
 	chmod 755 $(DESTDIR)$(PREFIX)/bin/zenc
 
 clean:
-	-rm -f $(BINS) $(OBJS) $(STATIC) *.[oa] *~ */*.[oa] */*~
+	-rm -f $(BINS) $(OBJS) $(STATIC) $(SHARED) *.[oa] *.so *.so.* *~ */*.[oa] */*~
