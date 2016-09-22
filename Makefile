@@ -61,7 +61,9 @@ install-static: static
 install-tools: tools
 	$(STRIP) zenc
 	[ -d "$(DESTDIR)$(PREFIX)/bin/." ] || mkdir -p -m 0755 $(DESTDIR)$(PREFIX)/bin
+	cp zdec $(DESTDIR)$(PREFIX)/bin/zdec
 	cp zenc $(DESTDIR)$(PREFIX)/bin/zenc
+	chmod 755 $(DESTDIR)$(PREFIX)/bin/zdec
 	chmod 755 $(DESTDIR)$(PREFIX)/bin/zenc
 
 clean:
