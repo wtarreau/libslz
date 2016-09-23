@@ -133,3 +133,110 @@ static const uint32_t len_fh[259] = {
  */
 static uint32_t crc32_fast[4][256];
 static uint32_t fh_dist_table[32768];
+
+/* Make the table for a fast CRC.
+ * Not thread-safe, must be called exactly once.
+ */
+static inline void __slz_make_crc_table(void)
+{
+	uint32_t c;
+	int n, k;
+
+	for (n = 0; n < 256; n++) {
+		c = (uint32_t) n ^ 255;
+		for (k = 0; k < 8; k++) {
+			if (c & 1) {
+				c = 0xedb88320 ^ (c >> 1);
+			} else {
+				c = c >> 1;
+			}
+		}
+		crc32_fast[0][n] = c ^ 0xff000000;
+	}
+
+	/* Note: here we *do not* have to invert the bits corresponding to the
+	 * byte position, because [0] already has the 8 highest bits inverted,
+	 * and these bits are shifted by 8 at the end of the operation, which
+	 * results in having the next 8 bits shifted in turn. That's why we
+	 * have the xor in the index used just after a computation.
+	 */
+	for (n = 0; n < 256; n++) {
+		crc32_fast[1][n] = 0xff000000 ^ crc32_fast[0][(0xff000000 ^ crc32_fast[0][n] ^ 0xff) & 0xff] ^ (crc32_fast[0][n] >> 8);
+		crc32_fast[2][n] = 0xff000000 ^ crc32_fast[0][(0x00ff0000 ^ crc32_fast[1][n] ^ 0xff) & 0xff] ^ (crc32_fast[1][n] >> 8);
+		crc32_fast[3][n] = 0xff000000 ^ crc32_fast[0][(0x0000ff00 ^ crc32_fast[2][n] ^ 0xff) & 0xff] ^ (crc32_fast[2][n] >> 8);
+	}
+}
+
+/* Returns code for lengths 1 to 32768. The bit size for the next value can be
+ * found this way :
+ *
+ *	bits = code >> 1;
+ *	if (bits)
+ *		bits--;
+ *
+ */
+static inline uint32_t dist_to_code(uint32_t l)
+{
+	uint32_t code;
+
+	code = 0;
+	switch (l) {
+	case 24577 ... 32768: code++;
+	case 16385 ... 24576: code++;
+	case 12289 ... 16384: code++;
+	case 8193 ... 12288: code++;
+	case 6145 ... 8192: code++;
+	case 4097 ... 6144: code++;
+	case 3073 ... 4096: code++;
+	case 2049 ... 3072: code++;
+	case 1537 ... 2048: code++;
+	case 1025 ... 1536: code++;
+	case 769 ... 1024: code++;
+	case 513 ... 768: code++;
+	case 385 ... 512: code++;
+	case 257 ... 384: code++;
+	case 193 ... 256: code++;
+	case 129 ... 192: code++;
+	case 97 ... 128: code++;
+	case 65 ... 96: code++;
+	case 49 ... 64: code++;
+	case 33 ... 48: code++;
+	case 25 ... 32: code++;
+	case 17 ... 24: code++;
+	case 13 ... 16: code++;
+	case 9 ... 12: code++;
+	case 7 ... 8: code++;
+	case 5 ... 6: code++;
+	case 4: code++;
+	case 3: code++;
+	case 2: code++;
+	}
+
+	return code;
+}
+
+/* not thread-safe, must be called exactly once */
+static inline void __slz_prepare_dist_table()
+{
+	uint32_t dist;
+	uint32_t code;
+	uint32_t bits;
+
+	for (dist = 0; dist < sizeof(fh_dist_table) / sizeof(*fh_dist_table); dist++) {
+		code = dist_to_code(dist + 1);
+		bits = code >> 1;
+		if (bits)
+			bits--;
+
+		/* Distance codes are stored on 5 bits reversed. The RFC
+		 * doesn't state that they are reversed, but it's the only
+		 * way it works.
+		 */
+		code = ((code & 0x01) << 4) | ((code & 0x02) << 2) |
+		       (code & 0x04) |
+		       ((code & 0x08) >> 2) | ((code & 0x10) >> 4);
+
+		code += (dist & ((1 << bits) - 1)) << 5;
+		fh_dist_table[dist] = (code << 5) + bits + 5;
+	}
+}
