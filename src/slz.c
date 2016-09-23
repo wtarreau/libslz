@@ -923,7 +923,7 @@ int slz_rfc1951_finish(struct slz_stream *strm, unsigned char *buf)
 }
 
 /* not thread-safe, must be called exactly once */
-void slz_prepare_dist_table()
+static void __slz_prepare_dist_table()
 {
 	uint32_t dist;
 	uint32_t code;
@@ -1071,7 +1071,7 @@ static const unsigned char gzip_hdr[] = { 0x1F, 0x8B,   // ID1, ID2
 /* Make the table for a fast CRC.
  * Not thread-safe, must be called exactly once.
  */
-void slz_make_crc_table(void)
+static void __slz_make_crc_table(void)
 {
 	uint32_t c;
 	int n, k;
@@ -1531,4 +1531,23 @@ int slz_rfc1950_finish(struct slz_stream *strm, unsigned char *buf)
 	copy_8b(strm, (strm->crc32 >>  0) & 0xff);
 	strm->state = SLZ_ST_END;
 	return strm->outbuf - buf;
+}
+
+/* This used to be the function called to build the CRC table at init time.
+ * Now it does nothing, it's only kept for API/ABI compatibility.
+ */
+void slz_make_crc_table(void)
+{
+}
+
+/* does nothing anymore, only kept for ABI compatibility */
+void slz_prepare_dist_table()
+{
+}
+
+__attribute__((constructor))
+static void __slz_initialize(void)
+{
+	__slz_make_crc_table();
+	__slz_prepare_dist_table();
 }
