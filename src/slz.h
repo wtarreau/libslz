@@ -37,6 +37,7 @@
 #if defined(__x86_64__)
 #define UNALIGNED_LE_OK
 #define UNALIGNED_FASTER
+#define USE_64BIT_QUEUE
 #elif defined(__i386__) || defined(__i486__) || defined(__i586__) || defined(__i686__)
 #define UNALIGNED_LE_OK
 //#define UNALIGNED_FASTER
@@ -64,8 +65,12 @@ enum {
 };
 
 struct slz_stream {
+#ifdef USE_64BIT_QUEUE
+	uint64_t queue; /* last pending bits, LSB first */
+#else
 	uint32_t queue; /* last pending bits, LSB first */
-	uint32_t qbits; /* number of bits in queue, < 8 */
+#endif
+	uint32_t qbits; /* number of bits in queue, < 8 on 32-bit, < 32 on 64-bit */
 	unsigned char *outbuf; /* set by encode() */
 	uint16_t state; /* one of slz_state */
 	uint8_t level:1; /* 0 = no compression, 1 = compression */

@@ -160,6 +160,51 @@ union ref {
 	uint64_t by64;
 };
 
+#if defined(USE_64BIT_QUEUE) && defined(UNALIGNED_LE_OK)
+
+/* enqueue code x of <xbits> bits (LSB aligned, at most 24) and copy complete
+ * 32-bit words into output buffer. X must not contain non-zero bits above
+ * xbits.
+ */
+static inline void enqueue24(struct slz_stream *strm, uint32_t x, uint32_t xbits)
+{
+	uint64_t queue = strm->queue + ((uint64_t)x << strm->qbits);
+	uint32_t qbits = strm->qbits + xbits;
+
+	if (__builtin_expect(qbits >= 32, 1)) {
+		*(uint32_t *)strm->outbuf = queue;
+		queue >>= 32;
+		qbits -= 32;
+		strm->outbuf += 4;
+	}
+
+	strm->queue = queue;
+	strm->qbits = qbits;
+}
+
+#define enqueue8 enqueue24
+
+/* flush the queue and align to next byte */
+static inline void flush_bits(struct slz_stream *strm)
+{
+	if (strm->qbits > 0)
+		*strm->outbuf++ = strm->queue;
+
+	if (strm->qbits > 8)
+		*strm->outbuf++ = strm->queue >> 8;
+
+	if (strm->qbits > 16)
+		*strm->outbuf++ = strm->queue >> 16;
+
+	if (strm->qbits > 24)
+		*strm->outbuf++ = strm->queue >> 24;
+
+	strm->queue = 0;
+	strm->qbits = 0;
+}
+
+#else /* non-64 bit or aligned or big endian */
+
 /* enqueue code x of <xbits> bits (LSB aligned, at most 24) and copy complete
  * bytes into out buf. X must not contain non-zero bits above xbits. Prefer
  * enqueue8() when xbits is known for being 8 or less.
@@ -221,6 +266,8 @@ static inline void flush_bits(struct slz_stream *strm)
 	strm->queue = 0;
 	strm->qbits = 0;
 }
+#endif
+
 
 /* only valid if buffer is already aligned */
 static inline void copy_8b(struct slz_stream *strm, uint32_t x)
