@@ -160,39 +160,35 @@ union ref {
 	uint64_t by64;
 };
 
-/* enqueue code x of <xbits> bits (LSB aligned, at most 16) and copy complete
+/* enqueue code x of <xbits> bits (LSB aligned, at most 24) and copy complete
  * bytes into out buf. X must not contain non-zero bits above xbits. Prefer
  * enqueue8() when xbits is known for being 8 or less.
  */
-static void enqueue16(struct slz_stream *strm, uint32_t x, uint32_t xbits)
+static void enqueue24(struct slz_stream *strm, uint32_t x, uint32_t xbits)
 {
 	uint32_t queue = strm->queue + (x << strm->qbits);
 	uint32_t qbits = strm->qbits + xbits;
 
-	if (__builtin_expect(qbits < 16, 1)) {
-		if (qbits >= 8) {
-			/* usual case */
-			qbits -= 8;
-			*strm->outbuf++ = queue;
-			queue >>= 8;
-		}
-		strm->qbits = qbits;
-		strm->queue = queue;
-		return;
-	}
-	/* case where we queue large codes after small ones, eg: 7 then 9 */
-
+	if (qbits >= 16) {
 #ifndef UNALIGNED_LE_OK
-	strm->outbuf[0] = queue;
-	strm->outbuf[1] = queue >> 8;
+		strm->outbuf[0] = queue;
+		strm->outbuf[1] = queue >> 8;
 #else
-	*(uint16_t *)strm->outbuf = queue;
+		*(uint16_t *)strm->outbuf = queue;
 #endif
-	strm->outbuf += 2;
-	queue >>= 16;
-	qbits -= 16;
+		strm->outbuf += 2;
+		queue >>= 16;
+		qbits -= 16;
+	}
+
+	if (qbits >= 8) {
+		qbits -= 8;
+		*strm->outbuf++ = queue;
+		queue >>= 8;
+	}
 	strm->qbits = qbits;
 	strm->queue = queue;
+	return;
 }
 
 /* enqueue code x of <xbits> bits (at most 8) and copy complete bytes into
@@ -257,7 +253,7 @@ static inline void send_huff(struct slz_stream *strm, uint32_t code)
 	code = fixed_huff[code];
 	bits = code & 15;
 	code >>= 4;
-	enqueue16(strm, code, bits);
+	enqueue24(strm, code, bits);
 }
 
 static inline void send_eob(struct slz_stream *strm)
@@ -606,10 +602,10 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 		}
 
 		/* copy the length first */
-		enqueue16(strm, code & 0xFFFF, code >> 16);
+		enqueue24(strm, code & 0xFFFF, code >> 16);
 
 		/* in fixed huffman mode, dist is fixed 5 bits */
-		enqueue16(strm, dist >> 5, dist & 0x1f);
+		enqueue24(strm, dist >> 5, dist & 0x1f);
 		bit9 = 0;
 		rem -= mlen;
 		pos += mlen;
