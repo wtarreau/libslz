@@ -216,11 +216,14 @@ static inline void enqueue8(struct slz_stream *strm, uint32_t x, uint32_t xbits)
 /* align to next byte */
 static inline void flush_bits(struct slz_stream *strm)
 {
-	if (strm->qbits) {
+	if (strm->qbits > 0)
 		*strm->outbuf++ = strm->queue;
-		strm->queue = 0;
-		strm->qbits = 0;
-	}
+
+	if (strm->qbits > 8)
+		*strm->outbuf++ = strm->queue >> 8;
+
+	strm->queue = 0;
+	strm->qbits = 0;
 }
 
 /* only valid if buffer is already aligned */
