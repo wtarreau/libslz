@@ -192,16 +192,6 @@ static const uint16_t len_code[259] = {
 	0x1dbb, 0x1ebb, 0x001c					        // 256
 };
 
-/* Distance codes are stored on 5 bits reversed. The RFC doesn't state that
- * they are reversed, but it's the only way it works.
- */
-static const uint8_t dist_codes[32] = {
-	0, 16, 8, 24, 4, 20, 12, 28,
-	2, 18, 10, 26, 6, 22, 14, 30,
-	1, 17, 9, 25, 5, 21, 13, 29,
-	3, 19, 11, 27, 7, 23, 15, 31
-};
-
 /* Fixed Huffman table as per RFC1951.
  *
  *       Lit Value    Bits        Codes
@@ -935,7 +925,14 @@ static void __slz_prepare_dist_table()
 		if (bits)
 			bits--;
 
-		code = dist_codes[code];
+		/* Distance codes are stored on 5 bits reversed. The RFC
+		 * doesn't state that they are reversed, but it's the only
+		 * way it works.
+		 */
+		code = ((code & 0x01) << 4) | ((code & 0x02) << 2) |
+		       (code & 0x04) |
+		       ((code & 0x08) >> 2) | ((code & 0x10) >> 4);
+
 		code += (dist & ((1 << bits) - 1)) << 5;
 		fh_dist_table[dist] = (code << 5) + bits + 5;
 	}
