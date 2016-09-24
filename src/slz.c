@@ -308,36 +308,38 @@ static inline void send_eob(struct slz_stream *strm)
 	enqueue8(strm, 0, 7); // direct encoding of 256 = EOB (cf RFC1951)
 }
 
-/* copies at most <len> litterals from <buf>, returns the amount of data
- * copied. <more> indicates that there are data past buf + <len>. <len> must
- * not be null.
+/* copies <len> litterals from <buf>. <more> indicates that there are data past
+ * buf + <len>. <len> must not be null.
  */
-static uint32_t copy_lit(struct slz_stream *strm, const void *buf, uint32_t len, int more)
+static void copy_lit(struct slz_stream *strm, const void *buf, uint32_t len, int more)
 {
-	if (len > 65535) {
-		len = 65535;
-		more = 1;
-	}
+	uint32_t len2;
 
-	if (strm->state != SLZ_ST_EOB)
-		send_eob(strm);
+	do {
+		len2 = len;
+		if (__builtin_expect(len2 > 65535, 0))
+			len2 = 65535;
 
-	strm->state = more ? SLZ_ST_EOB : SLZ_ST_DONE;
+		len -= len2;
 
-	enqueue8(strm, !more, 3); // BFINAL = !more ; BTYPE = 00
-	flush_bits(strm);
-	copy_16b(strm, len);  // len
-	copy_16b(strm, ~len); // nlen
-	memcpy(strm->outbuf, buf, len);
-	strm->outbuf += len;
-	return len;
+		if (strm->state != SLZ_ST_EOB)
+			send_eob(strm);
+
+		strm->state = (more || len) ? SLZ_ST_EOB : SLZ_ST_DONE;
+
+		enqueue8(strm, !(more || len), 3); // BFINAL = !more ; BTYPE = 00
+		flush_bits(strm);
+		copy_16b(strm, len2);  // len2
+		copy_16b(strm, ~len2); // nlen2
+		memcpy(strm->outbuf, buf, len2);
+		strm->outbuf += len2;
+	} while (len);
 }
 
-/* copies at most <len> litterals from <buf>, returns the amount of data
- * copied. <more> indicates that there are data past buf + <len>. <len> must
- * not be null.
+/* copies <len> litterals from <buf>. <more> indicates that there are data past
+ * buf + <len>. <len> must not be null.
  */
-static uint32_t copy_lit_huff(struct slz_stream *strm, const unsigned char *buf, uint32_t len, int more)
+static void copy_lit_huff(struct slz_stream *strm, const unsigned char *buf, uint32_t len, int more)
 {
 	uint32_t pos;
 
@@ -358,7 +360,6 @@ static uint32_t copy_lit_huff(struct slz_stream *strm, const unsigned char *buf,
 	while (pos < len) {
 		send_huff(strm, buf[pos++]);
 	}
-	return len;
 }
 
 /* format:
@@ -502,7 +503,6 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 	uint32_t h;
 	uint64_t ent;
 
-	uint32_t len;
 	uint32_t plit = 0;
 	uint32_t bit9 = 0;
 	uint32_t dist, code;
@@ -626,7 +626,7 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 			goto send_as_lit;
 
 		/* first, copy pending literals */
-		while (plit) {
+		if (plit) {
 			/* Huffman encoding requires 9 bits for octets 144..255, so this
 			 * is a waste of space for binary data. Switching between Huffman
 			 * and no-comp then huffman consumes 52 bits (7 for EOB + 3 for
@@ -635,11 +635,11 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 			 * to save then.
 			 */
 			if (bit9 >= 52)
-				len = copy_lit(strm, in + pos - plit, plit, 1);
+				copy_lit(strm, in + pos - plit, plit, 1);
 			else
-				len = copy_lit_huff(strm, in + pos - plit, plit, 1);
+				copy_lit_huff(strm, in + pos - plit, plit, 1);
 
-			plit -= len;
+			plit = 0;
 		}
 
 		/* use mode 01 - fixed huffman */
@@ -676,13 +676,13 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 
  final_lit_dump:
 	/* now copy remaining literals or mark the end */
-	while (plit) {
+	if (plit) {
 		if (bit9 >= 52)
-			len = copy_lit(strm, in + pos - plit, plit, more);
+			copy_lit(strm, in + pos - plit, plit, more);
 		else
-			len = copy_lit_huff(strm, in + pos - plit, plit, more);
+			copy_lit_huff(strm, in + pos - plit, plit, more);
 
-		plit -= len;
+		plit = 0;
 	}
 
 	strm->ilen += ilen;
