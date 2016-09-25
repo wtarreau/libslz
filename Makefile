@@ -1,7 +1,7 @@
 TOPDIR     := $(PWD)
 DESTDIR    :=
 PREFIX     := /usr/local
-LIBDIR     := lib
+LIBDIR     := $(PREFIX)/lib
 
 CROSS_COMPILE :=
 
@@ -68,15 +68,15 @@ install-headers:
 	chmod 644 $(DESTDIR)$(PREFIX)/include/slz.h
 
 install-static: static
-	[ -d "$(DESTDIR)$(PREFIX)/$(LIBDIR)/." ] || mkdir -p -m 0755 $(DESTDIR)$(PREFIX)/$(LIBDIR)
-	cp $(STATIC) $(DESTDIR)$(PREFIX)/$(LIBDIR)/$(STATIC)
-	chmod 644 $(DESTDIR)$(PREFIX)/$(LIBDIR)/$(STATIC)
+	[ -d "$(DESTDIR)$(LIBDIR)/." ] || mkdir -p -m 0755 $(DESTDIR)$(LIBDIR)
+	cp $(STATIC) $(DESTDIR)$(LIBDIR)/$(STATIC)
+	chmod 644 $(DESTDIR)$(LIBDIR)/$(STATIC)
 
 install-shared: shared
-	[ -d "$(DESTDIR)$(PREFIX)/$(LIBDIR)/." ] || mkdir -p -m 0755 $(DESTDIR)$(PREFIX)/$(LIBDIR)
-	cp    $(SONAME) $(DESTDIR)$(PREFIX)/$(LIBDIR)/$(SONAME)
-	cp -P $(SHARED) $(DESTDIR)$(PREFIX)/$(LIBDIR)/$(SHARED)
-	chmod 644 $(DESTDIR)$(PREFIX)/$(LIBDIR)/$(SONAME)
+	[ -d "$(DESTDIR)$(LIBDIR)/." ] || mkdir -p -m 0755 $(DESTDIR)$(LIBDIR)
+	cp    $(SONAME) $(DESTDIR)$(LIBDIR)/$(SONAME)
+	cp -P $(SHARED) $(DESTDIR)$(LIBDIR)/$(SHARED)
+	chmod 644 $(DESTDIR)$(LIBDIR)/$(SONAME)
 
 install-tools: tools
 	$(STRIP) zenc
