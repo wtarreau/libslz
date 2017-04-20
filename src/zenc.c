@@ -269,13 +269,29 @@ int main(int argc, char **argv)
 				start = buffer + ofs;
 			}
 			else {
-				tocompress = read(fd, buffer, more ? block_size : toread - ofs);
-				if (tocompress <= 0) {
-					if (!tocompress) // done
+				/* we'll try to fill at least half a buffer with
+				 * input data, it ensures we compress reasonably
+				 * well without having to wait too much for the
+				 * sender when it's a pipe.
+				 */
+				size_t ret;
+				tocompress = 0;
+
+				do {
+					ret = read(fd, buffer + tocompress, more ? block_size - tocompress : toread - ofs - tocompress);
+					if (ret <= 0) {
+						if (ret < 0) {
+							perror("read");
+							exit(2);
+						}
 						break;
-					perror("read");
-					exit(2);
-				}
+					}
+					tocompress += ret;
+				} while (tocompress < block_size / 3);
+
+				if (!tocompress) // done
+					break;
+
 				start = buffer;
 			}
 			outblen += slz_encode(&strm, outbuf + outblen, start, tocompress, more);
