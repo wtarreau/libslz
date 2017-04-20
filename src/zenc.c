@@ -41,9 +41,6 @@
 #define PAGE_SIZE sysconf(_SC_PAGESIZE)
 #endif
 
-/* block size for experimentations */
-#define BLK 32768
-
 /* display the message and exit with the code */
 __attribute__((noreturn)) void die(int code, const char *format, ...)
 {
@@ -61,8 +58,10 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    "Usage: %s [option]* [file]\n"
 	    "\n"
 	    "The following arguments are supported :\n"
-	    "  -0         disable compression, only uses format\n"
-	    "  -1         enable compression [default]\n"
+	    "  -0         disable compression, only uses output format\n"
+	    "  -1         compress faster\n"
+	    "  -2         compress better\n"
+	    "  -3 .. -9   compress even better [default]\n"
 	    "  -b <size>  only use <size> bytes from the input file\n"
 	    "  -c         send output to stdout [default]\n"
 	    "  -f         force sending output to a terminal\n"
@@ -93,12 +92,13 @@ int main(int argc, char **argv)
 	off_t ofs;
 	size_t outblen;
 	size_t outbsize;
+	size_t block_size;
 	size_t mapsize = 0;
 	unsigned long long totin = 0;
 	unsigned long long totout = 0;
 	int loops = 1;
 	int console = 1;
-	int level   = 1;
+	int level   = 3;
 	int verbose = 0;
 	int test    = 0;
 	int format  = SLZ_FMT_GZIP;
@@ -112,11 +112,8 @@ int main(int argc, char **argv)
 		if (**argv != '-')
 			break;
 
-		if (strcmp(argv[0], "-0") == 0)
-			level = 0;
-
-		else if (strcmp(argv[0], "-1") == 0)
-			level = 1;
+		if (argv[0][0] == '-' && argv[0][1] >= '0' && argv[0][1] <= '9')
+			level = argv[0][1] - '0';
 
 		else if (strcmp(argv[0], "-b") == 0) {
 			if (argc < 2)
@@ -179,7 +176,13 @@ int main(int argc, char **argv)
 	slz_make_crc_table();
 	slz_prepare_dist_table();
 
-	outbsize = 2 * BLK; // allows to pack more than one full output at each round
+	block_size = 32768;
+	if (level > 1)
+		block_size *= 4; // 128 kB
+	if (level > 2)
+		block_size *= 8; // 1 MB
+
+	outbsize = 2 * block_size; // allows to pack more than one full output at each round
 	outbuf = calloc(1, outbsize + 4096);
 	if (!outbuf) {
 		perror("calloc");
@@ -209,7 +212,7 @@ int main(int argc, char **argv)
 
 	if (!mapsize) {
 		/* no mmap() done, read the size of a default block */
-		mapsize = BLK;
+		mapsize = block_size;
 		if (toread && toread < mapsize)
 			mapsize = toread;
 
@@ -235,24 +238,24 @@ int main(int argc, char **argv)
 	}
 
 	while (loops--) {
-		slz_init(&strm, level, format);
+		slz_init(&strm, !!level, format);
 
 		outblen = ofs = 0;
 		do {
-			int more = !toread || (toread - ofs) > BLK;
+			int more = !toread || (toread - ofs) > block_size;
 			unsigned char *start;
 
 			if (toread && toread <= mapsize) {
 				/* We use the memory-mapped file so the next
 				 * block starts at the buffer + file offset. We
-				 * read by blocks of BLK bytes at one except the
-				 * last one.
+				 * read by blocks of <block_size> bytes at one
+				 * except the last one.
 				 */
-				tocompress = more ? BLK : toread - ofs;
+				tocompress = more ? block_size : toread - ofs;
 				start = buffer + ofs;
 			}
 			else {
-				tocompress = read(fd, buffer, more ? BLK : toread - ofs);
+				tocompress = read(fd, buffer, more ? block_size : toread - ofs);
 				if (tocompress <= 0) {
 					if (!tocompress) // done
 						break;
