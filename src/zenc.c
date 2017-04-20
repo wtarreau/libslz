@@ -88,13 +88,13 @@ int main(int argc, char **argv)
 	struct slz_stream strm;
 	unsigned char *outbuf;
 	unsigned char *buffer;
-	int toread = -1;
-	int totin = 0;
-	int totout = 0;
-	int ofs;
-	int len;
+	off_t toread = -1;
+	off_t ofs;
+	size_t len;
+	size_t mapsize = 0;
+	unsigned long long totin = 0;
+	unsigned long long totout = 0;
 	int loops = 1;
-	int mapsize = 0;
 	int console = 1;
 	int level   = 1;
 	int verbose = 0;
@@ -119,7 +119,7 @@ int main(int argc, char **argv)
 		else if (strcmp(argv[0], "-b") == 0) {
 			if (argc < 2)
 				usage(name, 1);
-			toread = atoi(argv[1]);
+			toread = atoll(argv[1]);
 			argv++;
 			argc--;
 		}
@@ -237,7 +237,8 @@ int main(int argc, char **argv)
 			write(1, outbuf, len);
 	}
 	if (verbose)
-		fprintf(stderr, "totin=%d totout=%d ratio=%.2f%% crc32=%08x\n", totin, totout, totout * 100.0 / totin, strm.crc32);
+		fprintf(stderr, "totin=%llu totout=%llu ratio=%.2f%% crc32=%08x\n",
+		        totin, totout, totout * 100.0 / totin, strm.crc32);
 
 	return 0;
 }
