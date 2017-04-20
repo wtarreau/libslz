@@ -88,7 +88,7 @@ int main(int argc, char **argv)
 	struct slz_stream strm;
 	unsigned char *outbuf;
 	unsigned char *buffer;
-	int toread = 0;
+	int toread = -1;
 	int totin = 0;
 	int totout = 0;
 	int ofs;
@@ -188,13 +188,13 @@ int main(int argc, char **argv)
 	 * file size. If it fails we'll bound the input buffer to the buffer size
 	 * and read the input in smaller blocks.
 	 */
-	if (toread <= 0) {
+	if (toread < 0) {
 		if (fstat(fd, &instat) == -1) {
 			perror("fstat(fd)");
 			exit(1);
 		}
 		toread = instat.st_size;
-		if (toread <= 0)
+		if (toread < 0)
 			die(1, "Cannot determine input size, use -b to force it.\n");
 	}
 
