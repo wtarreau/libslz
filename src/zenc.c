@@ -89,6 +89,7 @@ int main(int argc, char **argv)
 	unsigned char *outbuf;
 	unsigned char *buffer;
 	off_t toread = -1;
+	off_t tocompress = 0;
 	off_t ofs;
 	size_t len;
 	size_t mapsize = 0;
@@ -194,23 +195,40 @@ int main(int argc, char **argv)
 			exit(1);
 		}
 		toread = instat.st_size;
-		if (toread < 0)
-			die(1, "Cannot determine input size, use -b to force it.\n");
 	}
 
-	mapsize = (toread + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-	buffer = mmap(NULL, mapsize, PROT_READ, MAP_PRIVATE, fd, 0);
-	if (buffer == MAP_FAILED) {
-		buffer = calloc(1, toread);
+	if (toread) {
+		/* we know the size to map, let's do it */
+		mapsize = (toread + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+		buffer = mmap(NULL, mapsize, PROT_READ, MAP_PRIVATE, fd, 0);
+		if (buffer == MAP_FAILED)
+			mapsize = 0;
+	}
+
+	if (!mapsize) {
+		/* no mmap() done, read the size of a default block */
+		mapsize = BLK;
+		if (toread && toread < mapsize)
+			mapsize = toread;
+
+		buffer = calloc(1, mapsize);
 		if (!buffer) {
 			perror("calloc");
 			exit(1);
 		}
 
-		toread = read(fd, buffer, toread);
-		if (toread < 0) {
-			perror("read");
-			exit(2);
+		if (toread && toread <= mapsize) {
+			/* file-at-once, read it now */
+			toread = read(fd, buffer, toread);
+			if (toread < 0) {
+				perror("read");
+				exit(2);
+			}
+		}
+
+		if (loops > 1 && !toread) {
+			loops = 1;
+			fprintf(stderr, "Warning: disabling loops on non-regular file\n");
 		}
 	}
 
@@ -219,22 +237,49 @@ int main(int argc, char **argv)
 
 		len = ofs = 0;
 		do {
-			len += slz_encode(&strm, outbuf + len, buffer + ofs, (toread - ofs) > BLK ? BLK : toread - ofs, (toread - ofs) > BLK);
-			if (toread - ofs > BLK) {
-				totout += len;
-				ofs += BLK;
+			int more = !toread || (toread - ofs) > BLK;
+			unsigned char *start;
+
+			if (toread && toread <= mapsize) {
+				/* We use the memory-mapped file so the next
+				 * block starts at the buffer + file offset. We
+				 * read by blocks of BLK bytes at one except the
+				 * last one.
+				 */
+				tocompress = more ? BLK : toread - ofs;
+				start = buffer + ofs;
+			}
+			else {
+				tocompress = read(fd, buffer, more ? BLK : toread - ofs);
+				if (tocompress <= 0) {
+					if (!tocompress) // done
+						break;
+					perror("read");
+					exit(2);
+				}
+				start = buffer;
+			}
+			len += slz_encode(&strm, outbuf + len, start, tocompress, more);
+
+			if (more) {
 				if (console && !test)
 					write(1, outbuf, len);
+				totout += len;
 				len = 0;
 			}
-			else
-				ofs = toread;
-		} while (ofs < toread);
+			ofs += tocompress;
+		} while (!toread || ofs < toread);
+
 		len += slz_finish(&strm, outbuf + len);
 		totin += ofs;
 		totout += len;
 		if (console && !test)
 			write(1, outbuf, len);
+
+		if (loops && (!toread || toread > mapsize)) {
+			/* this is a seeked file, let's rewind it now */
+			lseek(fd, 0, SEEK_SET);
+		}
 	}
 	if (verbose)
 		fprintf(stderr, "totin=%llu totout=%llu ratio=%.2f%% crc32=%08x\n",
