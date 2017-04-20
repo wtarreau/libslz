@@ -91,7 +91,8 @@ int main(int argc, char **argv)
 	off_t toread = -1;
 	off_t tocompress = 0;
 	off_t ofs;
-	size_t len;
+	size_t outblen;
+	size_t outbsize;
 	size_t mapsize = 0;
 	unsigned long long totin = 0;
 	unsigned long long totout = 0;
@@ -178,7 +179,8 @@ int main(int argc, char **argv)
 	slz_make_crc_table();
 	slz_prepare_dist_table();
 
-	outbuf = calloc(1, BLK + 4096);
+	outbsize = 2 * BLK; // allows to pack more than one full output at each round
+	outbuf = calloc(1, outbsize + 4096);
 	if (!outbuf) {
 		perror("calloc");
 		exit(1);
@@ -235,7 +237,7 @@ int main(int argc, char **argv)
 	while (loops--) {
 		slz_init(&strm, level, format);
 
-		len = ofs = 0;
+		outblen = ofs = 0;
 		do {
 			int more = !toread || (toread - ofs) > BLK;
 			unsigned char *start;
@@ -259,22 +261,22 @@ int main(int argc, char **argv)
 				}
 				start = buffer;
 			}
-			len += slz_encode(&strm, outbuf + len, start, tocompress, more);
-
-			if (more) {
+			outblen += slz_encode(&strm, outbuf + outblen, start, tocompress, more);
+			if (outblen + block_size > outbsize) {
+				/* not enough space left, need to flush */
 				if (console && !test)
-					write(1, outbuf, len);
-				totout += len;
-				len = 0;
+					write(1, outbuf, outblen);
+				totout += outblen;
+				outblen = 0;
 			}
 			ofs += tocompress;
 		} while (!toread || ofs < toread);
 
-		len += slz_finish(&strm, outbuf + len);
+		outblen += slz_finish(&strm, outbuf + outblen);
 		totin += ofs;
-		totout += len;
+		totout += outblen;
 		if (console && !test)
-			write(1, outbuf, len);
+			write(1, outbuf, outblen);
 
 		if (loops && (!toread || toread > mapsize)) {
 			/* this is a seeked file, let's rewind it now */
