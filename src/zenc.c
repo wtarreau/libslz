@@ -88,13 +88,13 @@ int main(int argc, char **argv)
 	struct slz_stream strm;
 	unsigned char *outbuf;
 	unsigned char *buffer;
-	int buflen;
+	int toread = 0;
 	int totin = 0;
 	int totout = 0;
 	int ofs;
 	int len;
 	int loops = 1;
-	int bufsize = 0;
+	int mapsize = 0;
 	int console = 1;
 	int level   = 1;
 	int verbose = 0;
@@ -119,7 +119,7 @@ int main(int argc, char **argv)
 		else if (strcmp(argv[0], "-b") == 0) {
 			if (argc < 2)
 				usage(name, 1);
-			bufsize = atoi(argv[1]);
+			toread = atoi(argv[1]);
 			argv++;
 			argc--;
 		}
@@ -177,37 +177,38 @@ int main(int argc, char **argv)
 	slz_make_crc_table();
 	slz_prepare_dist_table();
 
-	buflen = bufsize;
-	if (bufsize <= 0) {
-		if (fstat(fd, &instat) == -1) {
-			perror("fstat(fd)");
-			exit(1);
-		}
-		/* size of zero means stat the file */
-		bufsize = instat.st_size;
-		if (bufsize <= 0)
-			die(1, "Cannot determine input size, use -b to force it.\n");
-
-		buflen = bufsize;
-		bufsize = (bufsize + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-	}
-
 	outbuf = calloc(1, BLK + 4096);
 	if (!outbuf) {
 		perror("calloc");
 		exit(1);
 	}
 
-	buffer = mmap(NULL, bufsize, PROT_READ, MAP_PRIVATE, fd, 0);
+	/* principle : we'll determine the input file size and try to map the
+	 * file at once. If it works we have a single input buffer of the whole
+	 * file size. If it fails we'll bound the input buffer to the buffer size
+	 * and read the input in smaller blocks.
+	 */
+	if (toread <= 0) {
+		if (fstat(fd, &instat) == -1) {
+			perror("fstat(fd)");
+			exit(1);
+		}
+		toread = instat.st_size;
+		if (toread <= 0)
+			die(1, "Cannot determine input size, use -b to force it.\n");
+	}
+
+	mapsize = (toread + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+	buffer = mmap(NULL, mapsize, PROT_READ, MAP_PRIVATE, fd, 0);
 	if (buffer == MAP_FAILED) {
-		buffer = calloc(1, bufsize);
+		buffer = calloc(1, toread);
 		if (!buffer) {
 			perror("calloc");
 			exit(1);
 		}
 
-		buflen = read(fd, buffer, bufsize);
-		if (buflen < 0) {
+		toread = read(fd, buffer, toread);
+		if (toread < 0) {
 			perror("read");
 			exit(2);
 		}
@@ -218,8 +219,8 @@ int main(int argc, char **argv)
 
 		len = ofs = 0;
 		do {
-			len += slz_encode(&strm, outbuf + len, buffer + ofs, (buflen - ofs) > BLK ? BLK : buflen - ofs, (buflen - ofs) > BLK);
-			if (buflen - ofs > BLK) {
+			len += slz_encode(&strm, outbuf + len, buffer + ofs, (toread - ofs) > BLK ? BLK : toread - ofs, (toread - ofs) > BLK);
+			if (toread - ofs > BLK) {
 				totout += len;
 				ofs += BLK;
 				if (console && !test)
@@ -227,8 +228,8 @@ int main(int argc, char **argv)
 				len = 0;
 			}
 			else
-				ofs = buflen;
-		} while (ofs < buflen);
+				ofs = toread;
+		} while (ofs < toread);
 		len += slz_finish(&strm, outbuf + len);
 		totin += ofs;
 		totout += len;
