@@ -22,6 +22,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#define _GNU_SOURCE /* for F_SETPIPE_SZ */
 #include <errno.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -204,6 +205,15 @@ int main(int argc, char **argv)
 			exit(1);
 		}
 		toread = instat.st_size;
+
+#if defined(F_GETPIPE_SZ) && defined(F_SETPIPE_SZ)
+		/* attempt to optimize the pipe size if needed and possible */
+		if (S_ISFIFO(instat.st_mode)) {
+			int size = fcntl(fd, F_GETPIPE_SZ);
+			if (size > 0 && size < block_size)
+				fcntl(fd, F_SETPIPE_SZ, block_size);
+		}
+#endif
 	}
 
 	if (toread) {
