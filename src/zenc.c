@@ -67,6 +67,7 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    "  -f         force sending output to a terminal\n"
 	    "  -h         display this help\n"
 	    "  -l <loops> loop <loops> times over the same file\n"
+	    "  -n         does nothing, just for gzip compatibility\n"
 	    "  -t         test mode: do not emit anything\n"
 	    "  -v         increase verbosity\n"
 	    "\n"
@@ -139,6 +140,9 @@ int main(int argc, char **argv)
 			argv++;
 			argc--;
 		}
+
+		else if (strcmp(argv[0], "-n") == 0)
+			/* just for gzip compatibility */ ;
 
 		else if (strcmp(argv[0], "-t") == 0)
 			test = 1;
