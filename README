@@ -220,7 +220,7 @@ licensed programs, as well as use it in proprietary software. Contributions are
 welcome and should be sent as Git patches (see "git format-patch") and will be
 made under the same license exclusively.
 
-Project's webpage : http://1wt.eu/projects/libslz/
+Project's webpage : http://www.libslz.org/
 Download sources  : http://git.1wt.eu/web/libslz.git/
 Contact           : Willy Tarreau <w+slz@1wt.eu>
 
