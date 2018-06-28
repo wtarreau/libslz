@@ -274,7 +274,7 @@ int main(int argc, char **argv)
 				 * well without having to wait too much for the
 				 * sender when it's a pipe.
 				 */
-				size_t ret;
+				ssize_t ret;
 				tocompress = 0;
 
 				do {
