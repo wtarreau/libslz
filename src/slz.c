@@ -332,6 +332,7 @@ static void copy_lit(struct slz_stream *strm, const void *buf, uint32_t len, int
 		copy_16b(strm, len2);  // len2
 		copy_16b(strm, ~len2); // nlen2
 		memcpy(strm->outbuf, buf, len2);
+		buf += len2;
 		strm->outbuf += len2;
 	} while (len);
 }
