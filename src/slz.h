@@ -44,6 +44,9 @@
 #elif defined(__ARMEL__) && defined(__ARM_ARCH_7A__)
 #define UNALIGNED_LE_OK
 #define UNALIGNED_FASTER
+#elif defined(__ARM_ARCH_8A) || defined(__ARM_FEATURE_UNALIGNED)
+#define UNALIGNED_LE_OK
+#define UNALIGNED_FASTER
 #endif
 
 /* Log2 of the size of the hash table used for the references table. */
