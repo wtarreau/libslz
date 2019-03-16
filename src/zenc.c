@@ -106,6 +106,7 @@ int main(int argc, char **argv)
 	int format  = SLZ_FMT_GZIP;
 	int force   = 0;
 	int fd = 0;
+	int error = 0;
 
 	argv++;
 	argc--;
@@ -297,8 +298,9 @@ int main(int argc, char **argv)
 			outblen += slz_encode(&strm, outbuf + outblen, start, tocompress, more);
 			if (outblen + block_size > outbsize) {
 				/* not enough space left, need to flush */
-				if (console && !test)
-					write(1, outbuf, outblen);
+				if (console && !test && !error)
+					if (write(1, outbuf, outblen) < 0)
+						error = 1;
 				totout += outblen;
 				outblen = 0;
 			}
@@ -308,8 +310,9 @@ int main(int argc, char **argv)
 		outblen += slz_finish(&strm, outbuf + outblen);
 		totin += ofs;
 		totout += outblen;
-		if (console && !test)
-			write(1, outbuf, outblen);
+		if (console && !test && !error)
+			if (write(1, outbuf, outblen) < 0)
+				error = 1;
 
 		if (loops && (!toread || toread > mapsize)) {
 			/* this is a seeked file, let's rewind it now */
@@ -320,5 +323,5 @@ int main(int argc, char **argv)
 		fprintf(stderr, "totin=%llu totout=%llu ratio=%.2f%% crc32=%08x\n",
 		        totin, totout, totout * 100.0 / totin, strm.crc32);
 
-	return 0;
+	return error;
 }
