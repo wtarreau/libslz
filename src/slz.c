@@ -868,15 +868,27 @@ static const unsigned char gzip_hdr[] = { 0x1F, 0x8B,   // ID1, ID2
 
 static inline uint32_t crc32_char(uint32_t crc, uint8_t x)
 {
-	return crc32_fast[0][(crc ^ x) & 0xff] ^ (crc >> 8);
+#if defined(__ARM_FEATURE_CRC32)
+	crc = ~crc;
+	__asm__ volatile("crc32b %w0,%w0,%w1" : "+r"(crc) : "r"(x));
+	crc = ~crc;
+#else
+	crc = crc32_fast[0][(crc ^ x) & 0xff] ^ (crc >> 8);
+#endif
+	return crc;
 }
 
 static inline uint32_t crc32_uint32(uint32_t data)
 {
+#if defined(__ARM_FEATURE_CRC32)
+	__asm__ volatile("crc32w %w0,%w0,%w1" : "+r"(data) : "r"(~0UL));
+	data = ~data;
+#else
 	data = crc32_fast[3][(data >>  0) & 0xff] ^
 	       crc32_fast[2][(data >>  8) & 0xff] ^
 	       crc32_fast[1][(data >> 16) & 0xff] ^
 	       crc32_fast[0][(data >> 24) & 0xff];
+#endif
 	return data;
 }
 
@@ -899,6 +911,14 @@ uint32_t slz_crc32_by4(uint32_t crc, const unsigned char *buf, int len)
 
 	while (buf <= end - 16) {
 #ifdef UNALIGNED_LE_OK
+#if defined(__ARM_FEATURE_CRC32)
+		crc = ~crc;
+		__asm__ volatile("crc32w %w0,%w0,%w1" : "+r"(crc) : "r"(*(uint32_t*)(buf)));
+		__asm__ volatile("crc32w %w0,%w0,%w1" : "+r"(crc) : "r"(*(uint32_t*)(buf + 4)));
+		__asm__ volatile("crc32w %w0,%w0,%w1" : "+r"(crc) : "r"(*(uint32_t*)(buf + 8)));
+		__asm__ volatile("crc32w %w0,%w0,%w1" : "+r"(crc) : "r"(*(uint32_t*)(buf + 12)));
+		crc = ~crc;
+#else
 		crc ^= *(uint32_t *)buf;
 		crc = crc32_uint32(crc);
 
@@ -910,6 +930,7 @@ uint32_t slz_crc32_by4(uint32_t crc, const unsigned char *buf, int len)
 
 		crc ^= *(uint32_t *)(buf + 12);
 		crc = crc32_uint32(crc);
+#endif
 #else
 		crc = crc32_fast[3][(buf[0] ^ (crc >>  0)) & 0xff] ^
 		      crc32_fast[2][(buf[1] ^ (crc >>  8)) & 0xff] ^
