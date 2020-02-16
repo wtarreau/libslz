@@ -1,5 +1,9 @@
-SLZ / StateLess Zip - v1.0.0 - 2015/04/06 - Willy Tarreau <w+slz@1wt.eu>
+SLZ / StateLess Zip - v1.2.0 - 2020/02/16 - Willy Tarreau <w+slz@1wt.eu>
 ------------------------------------------------------------------------
+
+[ Note: the description and performance measurements below were established
+  on 2015-04-06 for version 1.0.0. Since then performance significantly
+  increased on x86_64 and on armv8 and new tests are deserved ]
 
 SLZ is a fast and memory-less stream compressor which produces an output that
 can be decompressed with zlib or gzip. It does not implement decompression at
