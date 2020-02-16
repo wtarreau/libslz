@@ -1217,7 +1217,7 @@ uint32_t slz_adler32_block(uint32_t crc, const unsigned char *buf, long len)
 		 * have to take care of the values between 65521 and 65536.
 		 */
 		s1 = (s1 & 0xffff) + 15 * (s1 >> 16);
-		if (s1 > 65521)
+		if (s1 >= 65521)
 			s1 -= 65521;
 
 		/* For s2, the largest value is estimated to 2^32-1 for
@@ -1226,7 +1226,7 @@ uint32_t slz_adler32_block(uint32_t crc, const unsigned char *buf, long len)
 		 */
 		s2 = (s2 & 0xffff) + 15 * (s2 >> 16);
 		s2 = (s2 & 0xffff) + 15 * (s2 >> 16);
-		if (s2 > 65521)
+		if (s2 >= 65521)
 			s2 -= 65521;
 
 		buf += blk;
