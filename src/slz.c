@@ -358,9 +358,9 @@ static void copy_lit_huff(struct slz_stream *strm, const unsigned char *buf, uin
 	}
 
 	pos = 0;
-	while (pos < len) {
+	do {
 		send_huff(strm, buf[pos++]);
-	}
+	} while (pos < len);
 }
 
 /* format:
