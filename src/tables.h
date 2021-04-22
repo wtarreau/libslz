@@ -4562,35 +4562,35 @@ static inline uint32_t dist_to_code(uint32_t l)
 
 	code = 0;
 	switch (l) {
-	case 24577 ... 32768: code++;
-	case 16385 ... 24576: code++;
-	case 12289 ... 16384: code++;
-	case 8193 ... 12288: code++;
-	case 6145 ... 8192: code++;
-	case 4097 ... 6144: code++;
-	case 3073 ... 4096: code++;
-	case 2049 ... 3072: code++;
-	case 1537 ... 2048: code++;
-	case 1025 ... 1536: code++;
-	case 769 ... 1024: code++;
-	case 513 ... 768: code++;
-	case 385 ... 512: code++;
-	case 257 ... 384: code++;
-	case 193 ... 256: code++;
-	case 129 ... 192: code++;
-	case 97 ... 128: code++;
-	case 65 ... 96: code++;
-	case 49 ... 64: code++;
-	case 33 ... 48: code++;
-	case 25 ... 32: code++;
-	case 17 ... 24: code++;
-	case 13 ... 16: code++;
-	case 9 ... 12: code++;
-	case 7 ... 8: code++;
-	case 5 ... 6: code++;
-	case 4: code++;
-	case 3: code++;
-	case 2: code++;
+	case 24577 ... 32768: code++; /* fall through */
+	case 16385 ... 24576: code++; /* fall through */
+	case 12289 ... 16384: code++; /* fall through */
+	case  8193 ... 12288: code++; /* fall through */
+	case  6145 ...  8192: code++; /* fall through */
+	case  4097 ...  6144: code++; /* fall through */
+	case  3073 ...  4096: code++; /* fall through */
+	case  2049 ...  3072: code++; /* fall through */
+	case  1537 ...  2048: code++; /* fall through */
+	case  1025 ...  1536: code++; /* fall through */
+	case   769 ...  1024: code++; /* fall through */
+	case   513 ...   768: code++; /* fall through */
+	case   385 ...   512: code++; /* fall through */
+	case   257 ...   384: code++; /* fall through */
+	case   193 ...   256: code++; /* fall through */
+	case   129 ...   192: code++; /* fall through */
+	case    97 ...   128: code++; /* fall through */
+	case    65 ...    96: code++; /* fall through */
+	case    49 ...    64: code++; /* fall through */
+	case    33 ...    48: code++; /* fall through */
+	case    25 ...    32: code++; /* fall through */
+	case    17 ...    24: code++; /* fall through */
+	case    13 ...    16: code++; /* fall through */
+	case     9 ...    12: code++; /* fall through */
+	case     7 ...     8: code++; /* fall through */
+	case     5 ...     6: code++; /* fall through */
+	case     4          : code++; /* fall through */
+	case     3          : code++; /* fall through */
+	case     2          : code++; /* fall through */
 	}
 
 	return code;
