@@ -228,10 +228,19 @@ int main(int argc, char **argv)
 		buffer = mmap(NULL, mapsize, PROT_READ, MAP_PRIVATE, fd, 0);
 		if (buffer == MAP_FAILED)
 			mapsize = 0;
+		else {
+#if defined(MADV_DONTDUMP)
+			madvise(buffer, mapsize, MADV_DONTDUMP);
+#endif
+#if defined(MADV_SEQUENTIAL)
+			madvise(buffer, mapsize, MADV_SEQUENTIAL);
+#endif
+		}
 	}
 
 	if (!mapsize) {
 		/* no mmap() done, read the size of a default block */
+		buffer_mode = 1;
 		mapsize = block_size;
 		if (toread && toread < mapsize)
 			mapsize = toread;
@@ -301,6 +310,13 @@ int main(int argc, char **argv)
 				start = buffer;
 			}
 			outblen += slz_encode(&strm, outbuf + outblen, start, tocompress, more);
+
+#if defined(MADV_DONTNEED)
+			if (!buffer_mode && (((ofs + tocompress) ^ ofs) & 2097152)) {
+				/* we've crossed a MB boundary, let's release the previous MB */
+				madvise(buffer + (ofs & -2097152), 2097152, MADV_DONTNEED);
+			}
+#endif
 			if (outblen + block_size > outbsize) {
 				/* not enough space left, need to flush */
 				if (console && !test && !error)
