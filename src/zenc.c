@@ -64,6 +64,7 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    "  -2         compress better\n"
 	    "  -3 .. -9   compress even better [default]\n"
 	    "  -b <size>  only use <size> bytes from the input file\n"
+	    "  -B         use buffered mode instead of mmap (uses less memory)\n"
 	    "  -c         send output to stdout [default]\n"
 	    "  -f         force sending output to a terminal\n"
 	    "  -h         display this help\n"
@@ -98,6 +99,7 @@ int main(int argc, char **argv)
 	size_t mapsize = 0;
 	unsigned long long totin = 0;
 	unsigned long long totout = 0;
+	int buffer_mode = 0;
 	int loops = 1;
 	int console = 1;
 	int level   = 3;
@@ -145,6 +147,9 @@ int main(int argc, char **argv)
 
 		else if (strcmp(argv[0], "-n") == 0)
 			/* just for gzip compatibility */ ;
+
+		else if (strcmp(argv[0], "-B") == 0)
+			buffer_mode = 1;
 
 		else if (strcmp(argv[0], "-t") == 0)
 			test = 1;
@@ -217,7 +222,7 @@ int main(int argc, char **argv)
 #endif
 	}
 
-	if (toread) {
+	if (toread && !buffer_mode) {
 		/* we know the size to map, let's do it */
 		mapsize = (toread + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 		buffer = mmap(NULL, mapsize, PROT_READ, MAP_PRIVATE, fd, 0);
