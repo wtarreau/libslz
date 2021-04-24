@@ -207,19 +207,20 @@ int main(int argc, char **argv)
 	 */
 	if (toread < 0) {
 		if (fstat(fd, &instat) == -1) {
-			perror("fstat(fd)");
-			exit(1);
+			toread = 0;
 		}
-		toread = instat.st_size;
+		else {
+			toread = instat.st_size;
 
 #if defined(F_GETPIPE_SZ) && defined(F_SETPIPE_SZ)
-		/* attempt to optimize the pipe size if needed and possible */
-		if (S_ISFIFO(instat.st_mode)) {
-			int size = fcntl(fd, F_GETPIPE_SZ);
-			if (size > 0 && size < block_size)
-				fcntl(fd, F_SETPIPE_SZ, block_size);
-		}
+			/* attempt to optimize the pipe size if needed and possible */
+			if (S_ISFIFO(instat.st_mode)) {
+				int size = fcntl(fd, F_GETPIPE_SZ);
+				if (size > 0 && size < block_size)
+					fcntl(fd, F_SETPIPE_SZ, block_size);
+			}
 #endif
+		}
 	}
 
 	if (toread && !buffer_mode) {
