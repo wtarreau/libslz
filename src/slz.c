@@ -1319,6 +1319,8 @@ void slz_prepare_dist_table()
 __attribute__((constructor))
 static void __slz_initialize(void)
 {
+#if defined(__ARM_FEATURE_CRC32)
 	__slz_make_crc_table();
+#endif
 	__slz_prepare_dist_table();
 }
