@@ -86,7 +86,7 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 int main(int argc, char **argv)
 {
 	const char *name = argv[0];
-	struct stat instat;
+	struct stat statbuf;
 	struct slz_stream strm;
 	unsigned char *outbuf;
 	unsigned char *buffer;
@@ -206,15 +206,15 @@ int main(int argc, char **argv)
 	 * and read the input in smaller blocks.
 	 */
 	if (toread < 0) {
-		if (fstat(fd, &instat) == -1) {
+		if (fstat(fd, &statbuf) == -1) {
 			toread = 0;
 		}
 		else {
-			toread = instat.st_size;
+			toread = statbuf.st_size;
 
 #if defined(F_GETPIPE_SZ) && defined(F_SETPIPE_SZ)
 			/* attempt to optimize the pipe size if needed and possible */
-			if (S_ISFIFO(instat.st_mode)) {
+			if (S_ISFIFO(statbuf.st_mode)) {
 				int size = fcntl(fd, F_GETPIPE_SZ);
 				if (size > 0 && size < block_size)
 					fcntl(fd, F_SETPIPE_SZ, block_size);
@@ -222,6 +222,18 @@ int main(int argc, char **argv)
 #endif
 		}
 	}
+
+	/* try to increase output pipe size to avoid blocking on writes */
+#if defined(F_GETPIPE_SZ) && defined(F_SETPIPE_SZ)
+	if (fstat(1, &statbuf) != -1) {
+		/* attempt to optimize the pipe size if needed and possible */
+		if (S_ISFIFO(statbuf.st_mode)) {
+			int size = fcntl(1, F_GETPIPE_SZ);
+			if (size > 0 && size < block_size)
+				fcntl(1, F_SETPIPE_SZ, block_size);
+		}
+	}
+#endif
 
 	if (toread && !buffer_mode) {
 		/* we know the size to map, let's do it */
