@@ -4,6 +4,7 @@ PREFIX     := /usr/local
 LIBDIR     := $(PREFIX)/lib
 
 CROSS_COMPILE :=
+PLATFORM := $(shell $(CC) -dumpmachine | sed -e 's,-gnu[^-]*,,; s,.*-,,')
 
 CC         := $(CROSS_COMPILE)gcc
 OPT_CFLAGS := -O3
@@ -25,8 +26,13 @@ AR         := $(CROSS_COMPILE)ar
 STRIP      := $(CROSS_COMPILE)strip
 BINS       := zdec zenc
 STATIC     := libslz.a
-SHARED     := libslz.so
-SONAME     := $(SHARED).1
+ifneq ($(filter darwin%, $(PLATFORM)),)
+	SHARED := libslz.dylib
+	SONAME := libslz.1.dylib
+else
+	SHARED := libslz.so
+	SONAME := $(SHARED).1
+endif
 OBJS       :=
 OBJS       += $(patsubst %.c,%.o,$(wildcard src/*.c))
 OBJS       += $(patsubst %.S,%.o,$(wildcard src/*.S))
@@ -49,7 +55,11 @@ $(STATIC): src/slz.o
 	$(AR) rv $@ $^
 
 $(SONAME): src/slz-pic.o
+ifneq ($(filter darwin%, $(PLATFORM)),)
+	$(LD) -dynamiclib $(LDFLAGS) -install_name $@ -o $@ $^
+else
 	$(LD) -shared $(LDFLAGS) -Wl,-soname,$@ -o $@ $^
+endif
 
 $(SHARED): $(SONAME)
 	ln -sf $^ $@
@@ -87,4 +97,4 @@ install-tools: tools
 	chmod 755 $(DESTDIR)$(PREFIX)/bin/zenc
 
 clean:
-	-rm -f $(BINS) $(OBJS) $(STATIC) $(SHARED) *.[oa] *.so *.so.* *~ */*.[oa] */*~
+	-rm -f $(BINS) $(OBJS) $(STATIC) $(SHARED) *.[oa] *.so *.so.* *.dylib *~ */*.[oa] */*~
