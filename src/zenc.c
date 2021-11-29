@@ -243,10 +243,10 @@ int main(int argc, char **argv)
 			mapsize = 0;
 		else {
 #if defined(MADV_DONTDUMP)
-			madvise(buffer, mapsize, MADV_DONTDUMP);
+			madvise((void *)buffer, mapsize, MADV_DONTDUMP);
 #endif
 #if defined(MADV_SEQUENTIAL)
-			madvise(buffer, mapsize, MADV_SEQUENTIAL);
+			madvise((void *)buffer, mapsize, MADV_SEQUENTIAL);
 #endif
 		}
 	}
@@ -327,7 +327,7 @@ int main(int argc, char **argv)
 #if defined(MADV_DONTNEED)
 			if (!buffer_mode && (((ofs + tocompress) ^ ofs) & 2097152)) {
 				/* we've crossed a MB boundary, let's release the previous MB */
-				madvise(buffer + (ofs & -2097152), 2097152, MADV_DONTNEED);
+				madvise((void *)(buffer + (ofs & -2097152)), 2097152, MADV_DONTNEED);
 			}
 #endif
 			if (outblen + block_size > outbsize) {
