@@ -4,9 +4,9 @@ PREFIX     := /usr/local
 LIBDIR     := $(PREFIX)/lib
 
 CROSS_COMPILE :=
-PLATFORM := $(shell $(CC) -dumpmachine | sed -e 's,-gnu[^-]*,,; s,.*-,,')
-
 CC         := $(CROSS_COMPILE)gcc
+PLATFORM   := $(shell $(CC) -dumpmachine | sed -e 's,-gnu[^-]*,,; s,.*-,,')
+
 OPT_CFLAGS := -O3
 CPU_CFLAGS := -fomit-frame-pointer
 DEB_CFLAGS := -Wall -g
