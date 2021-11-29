@@ -58,7 +58,11 @@ $(SONAME): src/slz-pic.o
 ifneq ($(filter darwin%, $(PLATFORM)),)
 	$(LD) -dynamiclib $(LDFLAGS) -install_name $@ -o $@ $^
 else
+ifneq ($(filter aix%, $(PLATFORM)),)
+	$(LD) -shared $(LDFLAGS) -Wl,-G -o $@ $^
+else
 	$(LD) -shared $(LDFLAGS) -Wl,-soname,$@ -o $@ $^
+endif
 endif
 
 $(SHARED): $(SONAME)
