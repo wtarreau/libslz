@@ -98,3 +98,7 @@ install-tools: tools
 
 clean:
 	-rm -f $(BINS) $(OBJS) $(STATIC) $(SHARED) *.[oa] *.so *.so.* *.dylib *~ */*.[oa] */*~
+
+snapshot:
+	ver=$$(git describe --tags --match 'v*' HEAD | cut -c2-); ver=$${ver%-g*}; \
+	git archive --format=tar --prefix="libslz-$${ver}/" HEAD | gzip -9 > libslz-$${ver}.tar.gz
