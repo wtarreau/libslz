@@ -123,7 +123,7 @@ int main(int argc, char **argv)
 		else if (strcmp(argv[0], "-b") == 0) {
 			if (argc < 2)
 				usage(name, 1);
-			toread = atoll(argv[1]);
+			toread = strtoll(argv[1], NULL, 0);
 			argv++;
 			argc--;
 		}
