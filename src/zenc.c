@@ -32,10 +32,15 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/user.h>
 #include <fcntl.h>
 #include "slz.h"
+#if defined(__linux__)
+#include <linux/fs.h>
+#endif
+
 
 /* some platforms do not provide PAGE_SIZE */
 #ifndef PAGE_SIZE
@@ -211,6 +216,14 @@ int main(int argc, char **argv)
 		}
 		else {
 			toread = statbuf.st_size;
+
+#if defined(BLKGETSIZE64)
+			/* block devices are reported as size zero */
+			if (statbuf.st_mode & S_IFBLK) {
+				if (ioctl(fd, BLKGETSIZE64, &toread) == -1)
+					toread = 0;
+			}
+#endif
 
 #if defined(F_GETPIPE_SZ) && defined(F_SETPIPE_SZ)
 			/* attempt to optimize the pipe size if needed and possible */
