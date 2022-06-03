@@ -153,7 +153,7 @@ static inline long slz_encode(struct slz_stream *strm, void *out,
  * It returns the number of bytes emitted. The trailer consists in flushing the
  * possibly pending bits from the queue (up to 24 bits), rounding to the next
  * byte, then 4 bytes for the CRC when doing zlib/gzip, then another 4 bytes
- * for the input length for gzip. That may abount to 4+4+4 = 12 bytes, that the
+ * for the input length for gzip. That may amount to 4+4+4 = 12 bytes, that the
  * caller must ensure are available before calling the function. Note that if
  * the initial header was never sent, it will be sent first as well (up to 10
  * extra bytes).

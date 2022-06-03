@@ -1058,7 +1058,7 @@ int slz_rfc1952_init(struct slz_stream *strm, int level)
  * returns the number of bytes emitted. The trailer consists in flushing the
  * possibly pending bits from the queue (up to 24 bits), rounding to the next
  * byte, then 4 bytes for the CRC and another 4 bytes for the input length.
- * That may abount to 4+4+4 = 12 bytes, that the caller must ensure are
+ * That may amount to 4+4+4 = 12 bytes, that the caller must ensure are
  * available before calling the function. Note that if the initial header was
  * never sent, it will be sent first as well (10 extra bytes).
  */
@@ -1312,7 +1312,7 @@ int slz_rfc1950_init(struct slz_stream *strm, int level)
  * buffer <buf>. When it's done, the stream state is updated to SLZ_ST_END. It
  * returns the number of bytes emitted. The trailer consists in flushing the
  * possibly pending bits from the queue (up to 24 bits), rounding to the next
- * byte, then 4 bytes for the CRC. That may abount to 4+4 = 8 bytes, that the
+ * byte, then 4 bytes for the CRC. That may amount to 4+4 = 8 bytes, that the
  * caller must ensure are available before calling the function. Note that if
  * the initial header was never sent, it will be sent first as well (2 extra
  * bytes).
