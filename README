@@ -1,10 +1,6 @@
 SLZ / StateLess Zip - v1.2.0 - 2020/02/16 - Willy Tarreau <w+slz@1wt.eu>
 ------------------------------------------------------------------------
 
-[ Note: the description and performance measurements below were established
-  on 2015-04-06 for version 1.0.0. Since then performance significantly
-  increased on x86_64 and on armv8 and new tests are deserved ]
-
 SLZ is a fast and memory-less stream compressor which produces an output that
 can be decompressed with zlib or gzip. It does not implement decompression at
 all, zlib is perfectly fine for this.
@@ -59,8 +55,10 @@ Product           Input BW  Compression ratio
 
 lz4-r124          352 MB/s  2.09
 lzo-2.09          347 MB/s  2.10
-slz-142           266 MB/s  2.12  # deflate format
-slz-142           214 MB/s  2.12  # gzip format
+slz-1.2.1 -1 -D   293 MB/s  2.12  # deflate format
+slz-1.2.1 -3 -D   279 MB/s  2.20  # deflate format
+slz-1.2.1 -1      232 MB/s  2.12  # gzip format
+slz-1.2.1 -3      223 MB/s  2.20  # gzip format
 zlib-1.28 -1 -h    88 MB/s  1.64  # huffman only
 zlib-1.28 -1 -r    81 MB/s  1.65  # RLE only
 zlib-1.28 -1 -F    70 MB/s  2.32  # fixed huffman
@@ -79,10 +77,18 @@ parallel (low memory bandwidth) as shown in this tests run on a quad-core ARM
 Cortex A17 (RK3288) running at 1.8 GHz and the same input data :
 
    #Cores  Input size  Time(s)  BW/core(MB/s)   Total BW(MB/s)
-      1     211938580   3.575       59.3             59.3
-      2     211938580   3.669       57.8            115.5
-      3     211938580   3.697       57.3            172.0
-      4     211938580   3.748       56.5            226.2
+      1     211938580   2.870       73.8             73.8
+      2     211938580   2.880       73.5            147.1
+      3     211938580   2.885       73.4            220.3
+      4     211938580   2.975       71.2            284.9
+
+On an ARMv8 with CRC32 (88F8040) running at 2.0 GHz it's even better:
+
+   #Cores  Input size  Time(s)  BW/core(MB/s)   Total BW(MB/s)
+      1     211938580   2.016      105.1            105.1
+      2     211938580   2.025      104.6            209.3
+      3     211938580   2.085      101.6            304.9
+      4     211938580   2.041      103.8            415.3
 
 Since some products automatically throttle the compression level based on the
 CPU usage or the available memory, on high speed networks, zlib can end up
@@ -113,6 +119,15 @@ uncompressed. This explains how the gigabit link was always saturated, and it
 is then the input bandwidth which varies according to the average compression
 ratio. In all situations, SLZ resulted in bandwidth savings 3 times higher than
 zlib.
+
+The "zenc" utility, which was orginally aimed at running regression tests,
+found its way into backup systems since it permits to reach network links
+limits with compressed streams before saturating the CPU. This results in a
+shorter total backup time, while relying on a well-known and standard output
+compression format. Such use cases could benefit from a multithreaded version
+that would work on different blocks and adapt the running CRC once blocks are
+finished, but given that a not-so-fast x86 system easily saturates a gigabit
+link using a single core, there's not much demand for this at the moment.
 
 There are 6 key points having a large impact on compression speed in any LZ-
 based compressor :
@@ -186,6 +201,9 @@ based compressor :
   the functions, the checksum computation was moved out of the function with a
   very low extra cost (less than 1%) as it can process all the input at once 4
   bytes at a time, contributes to preloading the input data into the caches.
+  And on CPU architectures featuring a CRC32 instruction (e.g. ARMv8), this
+  instruction is used and allows the gzip format to be roughly as fast as the
+  deflate one.
 
 - implementation-specific optimizations : modern CPUs can load unaligned words
   from memory with minimal to no overhead. On architectures that support this
@@ -217,14 +235,14 @@ These two factors have a significant impact on the compression ratio :
   overhead beyond the base 5 bytes per 32kB plus headers for non-compressible
   data.
 
-SLZ is provided as a library with a few extra tools (eg: zenc, a compressor
-emitting the various formats). It is distributed under the X11 license, meaning
+SLZ is provided as a library with a few extra tools (such as the zenc testing
+utility mentioned above). It is distributed under the X11 license, meaning
 that you can do a lot of things with it, such as merge it into GPL or BSD-
 licensed programs, as well as use it in proprietary software. Contributions are
 welcome and should be sent as Git patches (see "git format-patch") and will be
 made under the same license exclusively.
 
 Project's webpage : http://www.libslz.org/
-Download sources  : http://git.1wt.eu/web/libslz.git/
+Download sources  : https://github.com/wtarreau/libslz/
 Contact           : Willy Tarreau <w+slz@1wt.eu>
 
