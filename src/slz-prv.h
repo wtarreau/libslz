@@ -164,4 +164,21 @@ static inline long memmatch(const unsigned char *a, const unsigned char *b, long
 #endif
 }
 
+/* helper function to reverse bits in <input> which is expected to be
+ * <len> bits long.
+ */
+static inline short rev_short(short input, int len)
+{
+	short ret = 0;
+
+	while (len) {
+		ret <<= 1;
+		ret |= (input & 1);
+		input >>= 1;
+		len--;
+	}
+
+	return ret;
+}
+
 #endif

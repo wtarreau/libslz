@@ -65,7 +65,7 @@ zdec: src/zdec.o
 zenc: src/zenc.o src/slz_common.o src/slz.o
 	$(LD) $(LDFLAGS) -o $@ $^
 
-$(STATIC): src/slz_common.o src/slz.o
+$(STATIC): src/slz_common.o src/slz.o src/uslz.o
 	$(AR) rv $@ $^
 
 $(SONAME): src/slz-pic.o

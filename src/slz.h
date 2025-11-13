@@ -26,6 +26,7 @@
 #define _SLZ_H
 
 #include <inttypes.h>
+#include <stddef.h>
 
 /*
  * =============================================================================
@@ -193,5 +194,157 @@ static inline int slz_flush(struct slz_stream *strm, void *buf)
  *                      (u stands for uncompress)
  * =============================================================================
  */
+
+#define USLZ_FL_NONE        0x0000
+#define USLZ_FL_GZIP        0x0001
+#define USLZ_FL_ZLIB        0x0002
+#define USLZ_FL_FINAL       0x0004   /* current block is the last one. */
+#define USLZ_FL_COMPLETE    0x0008   /* last block is completely treated, marks end of the decompressed stream */
+
+
+enum uslz_stream_state {
+	USLZ_ST_INITIAL = 0,  /* Initial state of a new state block (must be zero). */
+	USLZ_ST_PARTIAL_HEADER,  /* Waiting for a second data byte. */
+	USLZ_ST_HEADER,
+	USLZ_ST_UNCOMPRESSED_LEN,
+	USLZ_ST_UNCOMPRESSED_ILEN,
+	USLZ_ST_UNCOMPRESSED_DATA,
+	USLZ_ST_LITERAL_COUNT,
+	USLZ_ST_DISTANCE_COUNT,
+	USLZ_ST_CODELEN_COUNT,
+	USLZ_ST_READ_CODE_LENGTHS,
+	USLZ_ST_READ_LENGTHS,
+	USLZ_ST_READ_LENGTHS_16,
+	USLZ_ST_READ_LENGTHS_17,
+	USLZ_ST_READ_LENGTHS_18,
+	USLZ_ST_READ_SYMBOL,
+	USLZ_ST_READ_LENGTH,
+	USLZ_ST_READ_DISTANCE,
+	USLZ_ST_READ_DISTANCE_RET,
+	USLZ_ST_READ_DISTANCE_EXTRA,
+	USLZ_ST_CHECK_CKSUM,
+};
+
+/* decompression state */
+struct uslz_stream {
+	enum uslz_stream_state state;         /* parsing state, USLZ_ST_* */
+
+	uint32_t crc;                         /* current crc value for the stream */
+	short crc_flush;                      /* byte counter to know when to perform
+	                                       * the next crc computing batch
+	                                       */
+	uint16_t flags;                       /* USLZ_FL_* flags */
+	unsigned int counter;                 /* generic counter */
+	const unsigned char *in_ptr;          /* pointer to the next byte to read from
+	                                       * input buffer
+	                                       */
+	const unsigned char *in_top;          /* pointer to one byte past the last byte
+	                                       * of the input buffer
+	                                       */
+	unsigned int distance_avail;
+	unsigned int distance;
+	unsigned char *out_base;              /* pointer to the beginning of the output
+	                                       * buffer
+	                                       */
+	unsigned long out_max;                /* max number of bytes in ouput buffer */
+	unsigned long dec_total;              /* total number of decoded bytes from stream */
+	unsigned long dec_bofs;               /* offset used to read the current decoded block */
+	unsigned long dec_bsize;              /* size of the current decoded block */
+
+	uint64_t bit_accum;                   /* bit accumulator (used by GETBITS() macro) */
+	unsigned char num_bits;               /* number of bits in the accumulator */
+
+	unsigned char block_type;             /* compressed block type */
+	unsigned int huff_index;              /* current index for pending huffman decoding
+	                                       * attempt
+	                                       */
+	unsigned int symbol;                  /* symbol code currently being processed */
+	unsigned int last_value;              /* last value read for length / distance table
+	                                       * construction
+	                                       */
+	unsigned int repeat_length;           /* repeated string length */
+
+	unsigned int len;                     /* uncompressed block length */
+	unsigned int ilen;                    /* uncompressed block inverted length */
+	unsigned int nread;                   /* number of bytes copied from uncompressed block */
+
+	/* literal_table: Code-to-symbol conversion table for the alphabet used
+	 * for literals and length values.  Elements 0 and 1 correspond to a
+	 * one-bit code of 0 or 1, respectively; other elements are linked
+	 * (directly or indirectly) from these to represent the Huffman tree.
+	 * The value of each element is:
+	 *    - for terminal codes, the symbol corresponding to the code (a
+	 *      nonnegative value);
+	 *    - for nonterminal codes, the one's complement of the array index
+	 *      corresponding to the code with a zero appended (the following
+	 *      array element corresponds to the code with a one appended).
+	 * For an alphabet of N symbols, a Huffman tree will have N-1 non-leaf
+	 * nodes (including the root node, which is not represented in the
+	 * array).  In the case of the literal/length alphabet, there are
+	 * normally 286 symbols; however, the default (static) Huffman table
+	 * uses a 288-symbol alphabet with two unused symbols, so we reserve
+	 * enough space for that alphabet.
+	 */
+	short literal_table[288*2-2];
+	union {
+		/* Code-to-symbol conversion table for the alphabet used for
+		 * distances.  This alphabet consists of 32 symbols, 2 of
+		 * which are unused.
+		 */
+		short distance_table[32*2-2];
+		/* we may need to hold up to 10 bytes to detect the format
+		 * (zlib/gzip/raw) before starting to decode the stream, thus
+		 * we use the distance table memory which is only used when we
+		 * start decoding.
+		 */
+		struct {
+			unsigned char buf[10];
+			int buf_len;
+			char gzip_flags;
+		} hdr_detect;
+	};
+	short codelen_table[19*2-2];          /* Code-to-symbol conversion table for the alphabet
+	                                       * used for code lengths.
+	                                       */
+	unsigned int literal_count;           /* number of literal codes in the Huffman table
+	                                       * (HLIT in RFC 1951)
+	                                       */
+	unsigned int distance_count;          /* number of distance codes in the Huffman table
+	                                       * (HDIST in RFC 1951)
+	                                       */
+	unsigned int codelen_count;           /* number of codelen codes in the Huffman table
+	                                       * used for decompressing the main Huffman tables
+	                                       * (HCLEN in RFC 1951)
+	                                       */
+	unsigned char literal_len[288];       /* code length for the symbol in literal_table */
+	unsigned char distance_len[32];       /* code length for the symbol in distance table */
+	unsigned char codelen_len[19];        /* code length for the symbol in codelen table */
+};
+
+/* list of possible return values for uslz_decode() */
+enum uslz_decode_ret {
+	USLZ_DECODE_SUCCESS,
+	USLZ_DECODE_OUT_OF_SPACE,
+	USLZ_DECODE_OUT_OF_DATA,
+	USLZ_DECODE_E_INVALID_ARGUMENT,
+	USLZ_DECODE_E_BAD_COMP_METHOD,
+	USLZ_DECODE_E_BAD_CRC,
+	USLZ_DECODE_E_DICT,
+	USLZ_DECODE_E_OUT_BUFFER,
+	USLZ_DECODE_E_GEN_HUFF,
+	USLZ_DECODE_E_DISTANCE,
+	USLZ_DECODE_E_INVALID_SYMBOL,
+	USLZ_DECODE_E_INVALID_STATE,
+	USLZ_DECODE_E_INVALID_BLOCK_CODE,
+	USLZ_DECODE_E_INVALID_DATA,
+	USLZ_DECODE_E_CORRUPT,
+	USLZ_DECODE_E_UNEXPECTED,
+};
+
+int uslz_init(struct uslz_stream *strm, unsigned char *output_buffer, long output_size);
+enum uslz_decode_ret uslz_decode(struct uslz_stream *state,
+                                 const unsigned char *compressed_data, long compressed_size,
+                                 unsigned char **decoded_data, long *decoded_size,
+                                 long *consumed_bytes, uint32_t *crc_ret);
 
 #endif
