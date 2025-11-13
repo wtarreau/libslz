@@ -22,12 +22,18 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include "slz.h"
 #include "slz-prv.h"
 #include "tables.h"
+
+/* if PRECOMPUTE_TABLES not set, then tables.h does not provide fh_dist_table
+ * table as we need to recompute it.
+ */
+#ifndef PRECOMPUTE_TABLES
+static uint32_t fh_dist_table[32768];
+#endif // ifndef PRECOMPUTE_TABLES
 
 /* First, RFC1951-specific declarations and extracts from the RFC.
  *
@@ -153,6 +159,10 @@ Distance encoding :
 */
 
 /* back references, built in a way that is optimal for 32/64 bits */
+/* format:
+ * bit0..31  = word
+ * bit32..63 = last position in buffer of similar content
+ */
 union ref {
 	struct {
 		uint32_t pos;
@@ -854,136 +864,6 @@ static const unsigned char gzip_hdr[] = { 0x1F, 0x8B,   // ID1, ID2
                                           0x00, 0x00, 0x00, 0x00, // mtime: none
                                           0x04, 0x03 }; // fastest comp, OS=Unix
 
-static inline uint32_t crc32_char(uint32_t crc, uint8_t x)
-{
-#if defined(__ARM_FEATURE_CRC32)
-	crc = ~crc;
-#  if defined(__ARM_ARCH_ISA_A64)
-	// 64 bit mode
-	__asm__ volatile("crc32b %w0,%w0,%w1" : "+r"(crc) : "r"(x));
-#  else
-	// 32 bit mode (e.g. armv7 compiler building for armv8
-	__asm__ volatile("crc32b %0,%0,%1" : "+r"(crc) : "r"(x));
-#  endif
-	crc = ~crc;
-#else
-	crc = crc32_fast[0][(crc ^ x) & 0xff] ^ (crc >> 8);
-#endif
-	return crc;
-}
-
-#ifdef UNALIGNED_LE_OK
-static inline uint32_t crc32_uint32(uint32_t data)
-{
-#if defined(__ARM_FEATURE_CRC32)
-#  if defined(__ARM_ARCH_ISA_A64)
-	// 64 bit mode
-	__asm__ volatile("crc32w %w0,%w0,%w1" : "+r"(data) : "r"(~0UL));
-#  else
-	// 32 bit mode (e.g. armv7 compiler building for armv8
-	__asm__ volatile("crc32w %0,%0,%1" : "+r"(data) : "r"(~0UL));
-#  endif
-	data = ~data;
-#else
-	data = crc32_fast[3][(data >>  0) & 0xff] ^
-	       crc32_fast[2][(data >>  8) & 0xff] ^
-	       crc32_fast[1][(data >> 16) & 0xff] ^
-	       crc32_fast[0][(data >> 24) & 0xff];
-#endif
-	return data;
-}
-#endif
-
-/* Modified version originally from RFC1952, working with non-inverting CRCs */
-uint32_t slz_crc32_by1(uint32_t crc, const unsigned char *buf, int len)
-{
-	int n;
-
-	for (n = 0; n < len; n++)
-		crc = crc32_char(crc, buf[n]);
-	return crc;
-}
-
-/* This version computes the crc32 of <buf> over <len> bytes, doing most of it
- * in 32-bit chunks.
- */
-uint32_t slz_crc32_by4(uint32_t crc, const unsigned char *buf, int len)
-{
-	const unsigned char *end = buf + len;
-
-	while (buf <= end - 16) {
-#ifdef UNALIGNED_LE_OK
-#if defined(__ARM_FEATURE_CRC32)
-		crc = ~crc;
-#  if defined(__ARM_ARCH_ISA_A64)
-	// 64 bit mode
-		__asm__ volatile("crc32w %w0,%w0,%w1" : "+r"(crc) : "r"(*(uint32_t*)(buf)));
-		__asm__ volatile("crc32w %w0,%w0,%w1" : "+r"(crc) : "r"(*(uint32_t*)(buf + 4)));
-		__asm__ volatile("crc32w %w0,%w0,%w1" : "+r"(crc) : "r"(*(uint32_t*)(buf + 8)));
-		__asm__ volatile("crc32w %w0,%w0,%w1" : "+r"(crc) : "r"(*(uint32_t*)(buf + 12)));
-#  else
-	// 32 bit mode (e.g. armv7 compiler building for armv8
-		__asm__ volatile("crc32w %0,%0,%1" : "+r"(crc) : "r"(*(uint32_t*)(buf)));
-		__asm__ volatile("crc32w %0,%0,%1" : "+r"(crc) : "r"(*(uint32_t*)(buf + 4)));
-		__asm__ volatile("crc32w %0,%0,%1" : "+r"(crc) : "r"(*(uint32_t*)(buf + 8)));
-		__asm__ volatile("crc32w %0,%0,%1" : "+r"(crc) : "r"(*(uint32_t*)(buf + 12)));
-#  endif
-		crc = ~crc;
-#else
-		crc ^= *(uint32_t *)buf;
-		crc = crc32_uint32(crc);
-
-		crc ^= *(uint32_t *)(buf + 4);
-		crc = crc32_uint32(crc);
-
-		crc ^= *(uint32_t *)(buf + 8);
-		crc = crc32_uint32(crc);
-
-		crc ^= *(uint32_t *)(buf + 12);
-		crc = crc32_uint32(crc);
-#endif
-#else
-		crc = crc32_fast[3][(buf[0] ^ (crc >>  0)) & 0xff] ^
-		      crc32_fast[2][(buf[1] ^ (crc >>  8)) & 0xff] ^
-		      crc32_fast[1][(buf[2] ^ (crc >> 16)) & 0xff] ^
-		      crc32_fast[0][(buf[3] ^ (crc >> 24)) & 0xff];
-
-		crc = crc32_fast[3][(buf[4] ^ (crc >>  0)) & 0xff] ^
-		      crc32_fast[2][(buf[5] ^ (crc >>  8)) & 0xff] ^
-		      crc32_fast[1][(buf[6] ^ (crc >> 16)) & 0xff] ^
-		      crc32_fast[0][(buf[7] ^ (crc >> 24)) & 0xff];
-
-		crc = crc32_fast[3][(buf[8] ^ (crc >>  0)) & 0xff] ^
-		      crc32_fast[2][(buf[9] ^ (crc >>  8)) & 0xff] ^
-		      crc32_fast[1][(buf[10] ^ (crc >> 16)) & 0xff] ^
-		      crc32_fast[0][(buf[11] ^ (crc >> 24)) & 0xff];
-
-		crc = crc32_fast[3][(buf[12] ^ (crc >>  0)) & 0xff] ^
-		      crc32_fast[2][(buf[13] ^ (crc >>  8)) & 0xff] ^
-		      crc32_fast[1][(buf[14] ^ (crc >> 16)) & 0xff] ^
-		      crc32_fast[0][(buf[15] ^ (crc >> 24)) & 0xff];
-#endif
-		buf += 16;
-	}
-
-	while (buf <= end - 4) {
-#ifdef UNALIGNED_LE_OK
-		crc ^= *(uint32_t *)buf;
-		crc = crc32_uint32(crc);
-#else
-		crc = crc32_fast[3][(buf[0] ^ (crc >>  0)) & 0xff] ^
-		      crc32_fast[2][(buf[1] ^ (crc >>  8)) & 0xff] ^
-		      crc32_fast[1][(buf[2] ^ (crc >> 16)) & 0xff] ^
-		      crc32_fast[0][(buf[3] ^ (crc >> 24)) & 0xff];
-#endif
-		buf += 4;
-	}
-
-	while (buf < end)
-		crc = crc32_char(crc, *buf++);
-	return crc;
-}
-
 /* Sends the gzip header for stream <strm> into buffer <buf>. When it's done,
  * the stream state is updated to SLZ_ST_EOB. It returns the number of bytes
  * emitted which is always 10. The caller is responsible for ensuring there's
@@ -1193,73 +1073,6 @@ int slz_rfc1952_finish(struct slz_stream *strm, unsigned char *buf)
 
 static const unsigned char zlib_hdr[] = { 0x78, 0x01 };   // 32k win, deflate, chk=1
 
-
-/* Original version from RFC1950, verified and works OK */
-uint32_t slz_adler32_by1(uint32_t crc, const unsigned char *buf, int len)
-{
-	uint32_t s1 = crc & 0xffff;
-	uint32_t s2 = (crc >> 16) & 0xffff;
-	int n;
-
-	for (n = 0; n < len; n++) {
-		s1 = (s1 + buf[n]) % 65521;
-		s2 = (s2 + s1)     % 65521;
-	}
-	return (s2 << 16) + s1;
-}
-
-/* Computes the adler32 sum on <buf> for <len> bytes. It avoids the expensive
- * modulus by retrofitting the number of bytes missed between 65521 and 65536
- * which is easy to count : For every sum above 65536, the modulus is offset
- * by (65536-65521) = 15. So for any value, we can count the accumulated extra
- * values by dividing the sum by 65536 and multiplying this value by
- * (65536-65521). That's easier with a drawing with boxes and marbles. It gives
- * this :
- *          x % 65521 = (x % 65536) + (x / 65536) * (65536 - 65521)
- *                    = (x & 0xffff) + (x >> 16) * 15.
- */
-uint32_t slz_adler32_block(uint32_t crc, const unsigned char *buf, long len)
-{
-	long s1 = crc & 0xffff;
-	long s2 = (crc >> 16);
-	long blk;
-	long n;
-
-	do {
-		blk = len;
-		/* ensure we never overflow s2 (limit is about 2^((32-8)/2) */
-		if (blk > (1U << 12))
-			blk = 1U << 12;
-		len -= blk;
-
-		for (n = 0; n < blk; n++) {
-			s1 = (s1 + buf[n]);
-			s2 = (s2 + s1);
-		}
-
-		/* Largest value here is 2^12 * 255 = 1044480 < 2^20. We can
-		 * still overflow once, but not twice because the right hand
-		 * size is 225 max, so the total is 65761. However we also
-		 * have to take care of the values between 65521 and 65536.
-		 */
-		s1 = (s1 & 0xffff) + 15 * (s1 >> 16);
-		if (s1 >= 65521)
-			s1 -= 65521;
-
-		/* For s2, the largest value is estimated to 2^32-1 for
-		 * simplicity, so the right hand side is about 15*65535
-		 * = 983025. We can overflow twice at most.
-		 */
-		s2 = (s2 & 0xffff) + 15 * (s2 >> 16);
-		s2 = (s2 & 0xffff) + 15 * (s2 >> 16);
-		if (s2 >= 65521)
-			s2 -= 65521;
-
-		buf += blk;
-	} while (len);
-	return (s2 << 16) + s1;
-}
-
 /* Sends the zlib header for stream <strm> into buffer <buf>. When it's done,
  * the stream state is updated to SLZ_ST_EOB. It returns the number of bytes
  * emitted which is always 2. The caller is responsible for ensuring there's
@@ -1351,23 +1164,84 @@ int slz_rfc1950_finish(struct slz_stream *strm, unsigned char *buf)
 	return strm->outbuf - buf;
 }
 
-/* This used to be the function called to build the CRC table at init time.
- * Now it does nothing, it's only kept for API/ABI compatibility.
+/* Returns code for lengths 1 to 32768. The bit size for the next value can be
+ * found this way :
+ *
+ *	bits = code >> 1;
+ *	if (bits)
+ *		bits--;
+ *
  */
-void slz_make_crc_table(void)
+static inline uint32_t dist_to_code(uint32_t l)
 {
+	uint32_t code;
+
+	code = 0;
+	switch (l) {
+	case 24577 ... 32768: code++; __fallthrough;
+	case 16385 ... 24576: code++; __fallthrough;
+	case 12289 ... 16384: code++; __fallthrough;
+	case  8193 ... 12288: code++; __fallthrough;
+	case  6145 ...  8192: code++; __fallthrough;
+	case  4097 ...  6144: code++; __fallthrough;
+	case  3073 ...  4096: code++; __fallthrough;
+	case  2049 ...  3072: code++; __fallthrough;
+	case  1537 ...  2048: code++; __fallthrough;
+	case  1025 ...  1536: code++; __fallthrough;
+	case   769 ...  1024: code++; __fallthrough;
+	case   513 ...   768: code++; __fallthrough;
+	case   385 ...   512: code++; __fallthrough;
+	case   257 ...   384: code++; __fallthrough;
+	case   193 ...   256: code++; __fallthrough;
+	case   129 ...   192: code++; __fallthrough;
+	case    97 ...   128: code++; __fallthrough;
+	case    65 ...    96: code++; __fallthrough;
+	case    49 ...    64: code++; __fallthrough;
+	case    33 ...    48: code++; __fallthrough;
+	case    25 ...    32: code++; __fallthrough;
+	case    17 ...    24: code++; __fallthrough;
+	case    13 ...    16: code++; __fallthrough;
+	case     9 ...    12: code++; __fallthrough;
+	case     7 ...     8: code++; __fallthrough;
+	case     5 ...     6: code++; __fallthrough;
+	case     4          : code++; __fallthrough;
+	case     3          : code++; __fallthrough;
+	case     2          : code++;
+	}
+
+	return code;
 }
 
-/* does nothing anymore, only kept for ABI compatibility */
-void slz_prepare_dist_table()
+/* not thread-safe, must be called exactly once */
+static inline void __slz_prepare_dist_table()
 {
+#ifndef PRECOMPUTE_TABLES
+	uint32_t dist;
+	uint32_t code;
+	uint32_t bits;
+
+	for (dist = 0; dist < sizeof(fh_dist_table) / sizeof(*fh_dist_table); dist++) {
+		code = dist_to_code(dist + 1);
+		bits = code >> 1;
+		if (bits)
+			bits--;
+
+		/* Distance codes are stored on 5 bits reversed. The RFC
+		 * doesn't state that they are reversed, but it's the only
+		 * way it works.
+		 */
+		code = ((code & 0x01) << 4) | ((code & 0x02) << 2) |
+		       (code & 0x04) |
+		       ((code & 0x08) >> 2) | ((code & 0x10) >> 4);
+
+		code += (dist & ((1 << bits) - 1)) << 5;
+		fh_dist_table[dist] = (code << 5) + bits + 5;
+	}
+#endif
 }
 
 __attribute__((constructor))
 static void __slz_initialize(void)
 {
-#if !defined(__ARM_FEATURE_CRC32)
-	__slz_make_crc_table();
-#endif
-	__slz_prepare_dist_table();
+	__slz_prepare_dist_table(); // used by slz_rfc1951_encode()
 }

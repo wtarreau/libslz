@@ -27,6 +27,24 @@
 
 #include <inttypes.h>
 
+/*
+ * =============================================================================
+ *                                Common API
+ *                     shared by slz and uslz APIs
+ * =============================================================================
+ */
+void slz_make_crc_table(void); /* obsolete, not needed anymore */
+uint32_t slz_crc32_by1(uint32_t crc, const unsigned char *buf, int len);
+uint32_t slz_crc32_by4(uint32_t crc, const unsigned char *buf, int len);
+uint32_t slz_adler32_by1(uint32_t crc, const unsigned char *buf, int len);
+uint32_t slz_adler32_block(uint32_t crc, const unsigned char *buf, long len);
+
+/*
+ * =============================================================================
+ *                                slz API (compression)
+ * =============================================================================
+ */
+
 enum slz_state {
 	SLZ_ST_INIT,  /* stream initialized */
 	SLZ_ST_EOB,   /* header or end of block already sent */
@@ -66,9 +84,6 @@ int slz_rfc1951_flush(struct slz_stream *strm, unsigned char *buf);
 int slz_rfc1951_finish(struct slz_stream *strm, unsigned char *buf);
 
 /* Functions specific to rfc1952 (gzip) */
-void slz_make_crc_table(void); /* obsolete, not needed anymore */
-uint32_t slz_crc32_by1(uint32_t crc, const unsigned char *buf, int len);
-uint32_t slz_crc32_by4(uint32_t crc, const unsigned char *buf, int len);
 long slz_rfc1952_encode(struct slz_stream *strm, unsigned char *out, const unsigned char *in, long ilen, int more);
 int slz_rfc1952_send_header(struct slz_stream *strm, unsigned char *buf);
 int slz_rfc1952_init(struct slz_stream *strm, int level);
@@ -76,8 +91,6 @@ int slz_rfc1952_flush(struct slz_stream *strm, unsigned char *buf);
 int slz_rfc1952_finish(struct slz_stream *strm, unsigned char *buf);
 
 /* Functions specific to rfc1950 (zlib) */
-uint32_t slz_adler32_by1(uint32_t crc, const unsigned char *buf, int len);
-uint32_t slz_adler32_block(uint32_t crc, const unsigned char *buf, long len);
 long slz_rfc1950_encode(struct slz_stream *strm, unsigned char *out, const unsigned char *in, long ilen, int more);
 int slz_rfc1950_send_header(struct slz_stream *strm, unsigned char *buf);
 int slz_rfc1950_init(struct slz_stream *strm, int level);
@@ -173,5 +186,12 @@ static inline int slz_flush(struct slz_stream *strm, void *buf)
 
 	return ret;
 }
+
+/*
+ * =============================================================================
+ *                                uslz API
+ *                      (u stands for uncompress)
+ * =============================================================================
+ */
 
 #endif

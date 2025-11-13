@@ -62,10 +62,10 @@ tools: $(BINS)
 zdec: src/zdec.o
 	$(LD) $(LDFLAGS) -o $@ $^
 
-zenc: src/zenc.o src/slz.o
+zenc: src/zenc.o src/slz_common.o src/slz.o
 	$(LD) $(LDFLAGS) -o $@ $^
 
-$(STATIC): src/slz.o
+$(STATIC): src/slz_common.o src/slz.o
 	$(AR) rv $@ $^
 
 $(SONAME): src/slz-pic.o
