@@ -21,11 +21,11 @@ tens to hundreds of thousands of concurrent streams.
 The key difference between zlib and SLZ is that SLZ is stateless in that it
 doesn't consider the data previously compressed as part of its dictionary. It
 doesn't hurt compression performance when it is fed in large enough chunks (at
-least a few kB at once), but it must not be used if it has to read less than
-a few kB at a time, or the caller will have to implement the input buffer to
-maximize the compression ratio. For example, an HTTP gateway may defragment all
-the parts from a chunked-encoded response buffer into a linear buffer that is
-then fed at once to SLZ. This temporary buffer would then be static and shared
+least a few kB at once), but it should preferably not be used if it has to read
+less than a few kB at a time without implementing an input buffer to maximize
+the compression ratio. For example, an HTTP gateway may defragment all the
+parts from a chunked-encoded response buffer into a linear buffer that is then
+fed at once to SLZ. This temporary buffer would then be static and shared
 between all streams running on the same thread.
 
 A side effect from its stateless nature is that it can emit a zlib-compatible
