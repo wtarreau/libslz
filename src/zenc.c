@@ -61,7 +61,11 @@ __attribute__((noreturn)) void die(int code, const char *format, ...)
 __attribute__((noreturn)) void usage(const char *name, int code)
 {
 	die(code,
-	    "Usage: %s [option]* [file]\n"
+	    "zenc"
+#ifdef SLZ_VERSION
+	    " version " SLZ_VERSION
+#endif
+	    "\nUsage: %s [option]* [file]\n"
 	    "\n"
 	    "The following arguments are supported :\n"
 	    "  -0         disable compression, only uses output format\n"

@@ -37,6 +37,20 @@ OBJS       :=
 OBJS       += $(patsubst %.c,%.o,$(wildcard src/*.c))
 OBJS       += $(patsubst %.S,%.o,$(wildcard src/*.S))
 
+# retrieve the version from the current Git tree unless IGNOREGIT is set
+ifeq ($(IGNOREGIT),)
+  VERSION := $(shell [ -d .git/. ] && (git describe --tags --match 'v*' --abbrev=0 | cut -c 2-) 2>/dev/null)
+  ifneq ($(VERSION),)
+    # OK git is there and works.
+    SUBVERS := $(shell comms=`git log --format=oneline --no-merges v$(VERSION).. 2>/dev/null | wc -l | tr -d '[:space:]'`; commit=`(git log -1 --pretty=%h --abbrev=6) 2>/dev/null`; [ $$comms -gt 0 ] && echo "-$$commit-$$comms")
+  endif
+endif
+
+ifeq ($(VERSION),)
+  VERSION := $(shell cat VERSION 2>/dev/null)
+  SUBVERS :=
+endif
+
 all: static shared tools
 
 static: $(STATIC)
@@ -69,7 +83,7 @@ $(SHARED): $(SONAME)
 	ln -sf $^ $@
 
 %.o: %.c src/slz.h src/tables.h
-	$(CC) $(CFLAGS) -o $@ -c $<
+	$(CC) $(CFLAGS) -o $@ -DSLZ_VERSION='"'$(VERSION)$(SUBVERS)'"' -c $<
 
 %-pic.o: %.c src/slz.h src/tables.h
 	$(CC) $(CFLAGS) $(LIB_CFLAGS) -o $@ -c $<
