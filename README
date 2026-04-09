@@ -90,6 +90,32 @@ On an ARMv8 with CRC32 (88F8040) running at 2.0 GHz it's even better:
       3     211938580   2.085      101.6            304.9
       4     211938580   2.041      103.8            415.3
 
+On a more powerful machine (64-core AMD EPYC), we observe this:
+
+   #Cores  Input size  Time(s)  BW/core(MB/s)   Total BW(MB/s)
+      1     211957760   0.520      407.6            407.6
+      2     211957760   0.524      404.5            809.0
+      3     211957760   0.525      403.7           1211.1
+      4     211957760   0.526      403.0           1612.0
+      8     211957760   0.532      398.4           3187.3
+     16     211957760   0.626      338.6           5417.5
+     32     211957760   0.630      336.4          10766.1
+     64     211957760   0.724      292.8          18736.6
+
+On a 64-core AMD EPYC with 2 threads per core:
+
+   #Cores  Input size  Time(s)  BW/core(MB/s)   Total BW(MB/s)
+      1   2*211957760   0.765      554.1            554.1
+      2   2*211957760   0.749      566.0           1132.0
+      4   2*211957760   0.752      563.7           2254.9
+      8   2*211957760   0.766      553.4           4427.3
+     16   2*211957760   0.772      549.1           8785.8
+     32   2*211957760   0.895      473.6          15156.8
+     64   2*211957760   0.912      464.8          29748.5
+
+The last one compresses the equivalent of about 250 Gbps of input TCP traffic
+to 113 Gbps of output TCP traffic.
+
 Since some products automatically throttle the compression level based on the
 CPU usage or the available memory, on high speed networks, zlib can end up
 showing a much lower average compression ratio in order to fill an uplink. With
