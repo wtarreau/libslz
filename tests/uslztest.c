@@ -15,7 +15,7 @@
 int main(int argc, char **argv)
 {
 	static unsigned char obuf[1 << 20];
-	static unsigned char inbuf[1 << 20];
+	static unsigned char inbuf[8 << 20];
 	struct uslz_stream state;
 	long ring = argc > 1 ? atol(argv[1]) : 32768;
 	long chunk = argc > 2 ? atol(argv[2]) : 8192;
@@ -27,8 +27,16 @@ int main(int argc, char **argv)
 		return 2;
 
 	while (1) {
-		long ret = read(0, inbuf + in_len, sizeof(inbuf) - in_len);
+		long ret;
 
+		if (in_len == (long)sizeof(inbuf)) {
+			/* refuse rather than silently decode a truncated
+			 * input, which would look like a decoder failure.
+			 */
+			fprintf(stderr, "input larger than %zu bytes\n", sizeof(inbuf));
+			return 2;
+		}
+		ret = read(0, inbuf + in_len, sizeof(inbuf) - in_len);
 		if (ret <= 0)
 			break;
 		in_len += ret;

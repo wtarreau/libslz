@@ -39,11 +39,17 @@ cat tests/index.html tests/noncomp.bin tests/daniels.html > "$T/ref/mixed"
 
 for r in "$T"/ref/*; do
 	n=${r##*/}
-	# gzip: stored blocks (-0), fast and best; zenc: slz static huffman;
-	# python: zlib and raw deflate containers.
-	gzip -0 -c  < "$r" > "$T/$n.gz0"
+	# gzip: fast and best; zenc: slz static huffman; python: zlib and raw
+	# deflate containers, and a gzip made of stored blocks only. The latter
+	# is built by hand because not every gzip(1) accepts -0, and a silently
+	# missing file would just be skipped below.
 	gzip -1 -c  < "$r" > "$T/$n.gz1"
 	gzip -9 -c  < "$r" > "$T/$n.gz9"
+	python3 -c 'import sys,zlib,struct
+d=sys.stdin.buffer.read()
+c=zlib.compressobj(0,zlib.DEFLATED,-15)
+body=c.compress(d)+c.flush()
+sys.stdout.buffer.write(b"\x1f\x8b\x08\0\0\0\0\0\0\x03"+body+struct.pack("<II",zlib.crc32(d)&0xffffffff,len(d)&0xffffffff))' < "$r" > "$T/$n.gz0"
 	./zenc       < "$r" > "$T/$n.slz" 2>/dev/null
 	python3 -c 'import sys,zlib; sys.stdout.buffer.write(zlib.compress(sys.stdin.buffer.read(),6))' < "$r" > "$T/$n.zlib"
 	python3 -c 'import sys,zlib
