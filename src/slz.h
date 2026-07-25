@@ -264,6 +264,9 @@ enum uslz_stream_state {
  * have to be defined identically when building the library and when building
  * anything that instantiates a stream.
  */
+/* number of bytes needed to hold <n> code lengths packed two per byte */
+#define USLZ_LEN_BYTES(n) (((n) + 1) / 2)
+
 #ifndef USLZ_FAST_BITS
 #define USLZ_FAST_BITS 9
 #endif
@@ -346,7 +349,10 @@ struct uslz_stream {
 			                               * code length alphabet, same
 			                               * format as literal_table
 			                               */
-			unsigned char codelen_len[19];/* code length per codelen symbol */
+			unsigned char codelen_len[USLZ_LEN_BYTES(19)];
+			                              /* code length per codelen symbol,
+			                               * packed like the two above
+			                               */
 		} hdr;
 	};
 
@@ -392,8 +398,14 @@ struct uslz_stream {
 	                                       * used for decompressing the main Huffman tables
 	                                       * (HCLEN in RFC 1951)
 	                                       */
-	unsigned char literal_len[288];       /* code length for the symbol in literal_table */
-	unsigned char distance_len[32];       /* code length for the symbol in distance table */
+	/* Code lengths are 0 to 15, so two of them fit in a byte and these
+	 * arrays are stored packed, one nibble per symbol, low nibble first.
+	 * They are only read when the tables are built, once per block, so the
+	 * packing costs almost nothing and halves them. See the get_len() and
+	 * set_len() helpers in uslz.c, the only places aware of the layout.
+	 */
+	unsigned char literal_len[USLZ_LEN_BYTES(288)];  /* code length per literal symbol */
+	unsigned char distance_len[USLZ_LEN_BYTES(32)];  /* code length per distance symbol */
 };
 
 /* list of possible return values for uslz_decode() */

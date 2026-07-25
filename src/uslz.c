@@ -48,6 +48,22 @@ static uint16_t fixed_huff_dec_table[512];
   #define CRC_BLOCK 4096
 #endif /* CRC_BLOCK */
 
+/* The code lengths passed to the table builders are packed two per byte,
+ * low nibble first, since they never exceed 15. These two helpers are the
+ * only places aware of that layout.
+ */
+static inline unsigned int get_len(const unsigned char *lengths, unsigned int idx)
+{
+	return (lengths[idx / 2] >> ((idx & 1) * 4)) & 0xF;
+}
+
+static inline void set_len(unsigned char *lengths, unsigned int idx, unsigned int len)
+{
+	unsigned int shift = (idx & 1) * 4;
+
+	lengths[idx / 2] = (lengths[idx / 2] & ~(0xF << shift)) | (len << shift);
+}
+
 /*
  * gen_huffman_table:  Generate a Huffman table from a set of code lengths,
  * using the algorithm described in RFC 1951.  The table format is as
@@ -95,8 +111,8 @@ static int gen_huffman_table(unsigned int symbols,
 		 * in forming the tree.  (It's also convenient to have
 		 * length_count[0] == 0 for the code range calculation below.)
 		 */
-		if (lengths[i] > 0) {
-			length_count[lengths[i]]++;
+		if (get_len(lengths, i) > 0) {
+			length_count[get_len(lengths, i)]++;
 		}
 	}
 
@@ -111,7 +127,7 @@ static int gen_huffman_table(unsigned int symbols,
 		return allow_no_symbols;
 	else if (total_count == 1) {
 		for (i = 0; i < symbols; i++) {
-			if (lengths[i] != 0) {
+			if (get_len(lengths, i) != 0) {
 				table[0] = i;
 				table[1] = i;
 			}
@@ -179,7 +195,7 @@ static int gen_huffman_table(unsigned int symbols,
 
 		/* Fill in any symbols of this code length. */
 		for (j = 0; j < symbols; j++) {
-			if (lengths[j] == i) {
+			if (get_len(lengths, j) == i) {
 				table[index] = j;
 				index += 1;
 			}
@@ -226,7 +242,7 @@ static void gen_fast_table(unsigned int symbols, const unsigned char *lengths,
 	memset(count, 0, sizeof(count));
 
 	for (i = 0; i < symbols; i++)
-		count[lengths[i]]++;
+		count[get_len(lengths, i)]++;
 
 	/* first code of each length, as specified in rfc1951 3.2.2 */
 	count[0] = 0;
@@ -239,7 +255,7 @@ static void gen_fast_table(unsigned int symbols, const unsigned char *lengths,
 	for (i = 0; i < symbols; i++) {
 		unsigned int rev, step;
 
-		len = lengths[i];
+		len = get_len(lengths, i);
 		if (!len)
 			continue;
 
@@ -737,11 +753,12 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 
  state_READ_CODE_LENGTHS:
 		while (state->counter < state->codelen_count) {
-			GETBITS(3, state->hdr.codelen_len[codelen_order[state->counter]]);
+			GETBITS(3, get_bits);
+			set_len(state->hdr.codelen_len, codelen_order[state->counter], get_bits);
 			state->counter++;
 		}
 		for (; state->counter < 19; state->counter++)
-			state->hdr.codelen_len[codelen_order[state->counter]] = 0;
+			set_len(state->hdr.codelen_len, codelen_order[state->counter], 0);
 
 		/* Generate the code length Huffman table. */
 		if (!gen_huffman_table(19, state->hdr.codelen_len, 0,
@@ -802,9 +819,10 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 				}
 			}  /* if (remain == 0) */
 			if (state->counter < state->literal_count)
-				state->literal_len[state->counter] = state->last_value;
+				set_len(state->literal_len, state->counter, state->last_value);
 			else
-				state->distance_len[state->counter - state->literal_count] = state->last_value;
+				set_len(state->distance_len, state->counter - state->literal_count,
+				        state->last_value);
 			state->counter++;
 			remain--;
 			state->state = USLZ_ST_READ_LENGTHS;
