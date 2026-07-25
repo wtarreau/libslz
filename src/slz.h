@@ -325,7 +325,7 @@ struct uslz_stream {
 	 * The value of each element is:
 	 *    - for terminal codes, the symbol corresponding to the code (a
 	 *      nonnegative value);
-	 *    - for nonterminal codes, the one's complement of the array index
+	 *    - for nonterminal codes, USLZ_HUFF_NODE ored with the array index
 	 *      corresponding to the code with a zero appended (the following
 	 *      array element corresponds to the code with a one appended).
 	 * For an alphabet of N symbols, a Huffman tree will have N-1 non-leaf
@@ -343,9 +343,9 @@ struct uslz_stream {
 	 * the current block.
 	 */
 	union {
-		short literal_table[288*2-2];
+		unsigned short literal_table[288*2-2];
 		struct {
-			short codelen_table[19*2-2];  /* code-to-symbol table for the
+			unsigned short codelen_table[19*2-2];  /* code-to-symbol table for the
 			                               * code length alphabet, same
 			                               * format as literal_table
 			                               */
@@ -376,7 +376,7 @@ struct uslz_stream {
 		 * distances.  This alphabet consists of 32 symbols, 2 of
 		 * which are unused.
 		 */
-		short distance_table[32*2-2];
+		unsigned short distance_table[32*2-2];
 		/* we may need to hold up to 10 bytes to detect the format
 		 * (zlib/gzip/raw) before starting to decode the stream, thus
 		 * we use the distance table memory which is only used when we

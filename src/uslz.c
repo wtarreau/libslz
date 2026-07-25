@@ -48,6 +48,15 @@ static uint16_t fixed_huff_dec_table[512];
   #define CRC_BLOCK 4096
 #endif /* CRC_BLOCK */
 
+/* Marks an internal node in the huffman trees built by gen_huffman_table():
+ * the rest of the entry is then the index of its first child, otherwise the
+ * entry is a leaf and holds the symbol itself. Symbols are at most 287 and
+ * indexes at most 2*288-2, so both fit well below this bit. This used to be
+ * the sign of a signed short, which stopped working when the tables became
+ * unsigned.
+ */
+#define USLZ_HUFF_NODE 0x8000
+
 /* The code lengths passed to the table builders are packed two per byte,
  * low nibble first, since they never exceed 15. These two helpers are the
  * only places aware of that layout.
@@ -91,7 +100,7 @@ static inline void set_len(unsigned char *lengths, unsigned int idx, unsigned in
 static int gen_huffman_table(unsigned int symbols,
                              const unsigned char *lengths,
                              int allow_no_symbols,
-                             short *table)
+                             unsigned short *table)
 {
 	unsigned short length_count[16];
 	unsigned short total_count;
@@ -203,7 +212,7 @@ static int gen_huffman_table(unsigned int symbols,
 
 		/* Fill in remaining (internal) nodes for this length. */
 		for (j = next_code; j < code_limit; j++) {
-			table[index] = ~next_index;
+			table[index] = USLZ_HUFF_NODE | next_index;
 			index += 1;
 			next_index += 2;
 		}
@@ -315,7 +324,7 @@ static inline int bit_accumulate(const unsigned char **in_ptr, const unsigned ch
 static inline int gethuff(unsigned int *huff_index,
                                              const unsigned char **in_ptr, const unsigned char *in_top,
                                              unsigned char *num_bits, uint64_t *bit_accum,
-                                             unsigned int *var, short *table)
+                                             unsigned int *var, unsigned short *table)
 {
 	unsigned int index;
 	unsigned int bits;
@@ -341,10 +350,10 @@ static inline int gethuff(unsigned int *huff_index,
 		index += (bit_follow & 1);
 		bit_follow >>= 1;
 		bits--;
-		if (table[index] >= 0) {
+		if (!(table[index] & USLZ_HUFF_NODE)) {
 			break;
 		}
-		index = ~(table[index]);
+		index = table[index] & ~USLZ_HUFF_NODE;
 	}
 
 	*num_bits = bits;
@@ -370,7 +379,7 @@ static inline int gethuff_fixed(const unsigned char **in_ptr, const unsigned cha
 	unsigned long bit_follow;
 	unsigned int bits;
 	char bits_needed = 7;
-	short idx = 0;
+	unsigned short idx = 0;
 
 	bits = *num_bits;
 	bit_follow = *bit_accum;
