@@ -197,6 +197,8 @@ static int gen_huffman_table(unsigned int symbols,
 	return 1;
 }
 
+#if USLZ_FAST_BITS || USLZ_FAST_DBITS
+
 /*
  * gen_fast_table: fill the direct lookup <table> from the code lengths in
  * <lengths>, for an alphabet of <symbols> symbols. Entries have the same
@@ -205,13 +207,13 @@ static int gen_huffman_table(unsigned int symbols,
  * and are decoded by walking the tree built by gen_huffman_table() instead.
  *
  * Each code is replicated over every combination of the bits above it, so
- * that a lookup performed with fewer than USLZ_FAST_BITS bits still finds it,
+ * that a lookup performed with fewer than <tbits> bits still finds it,
  * provided the length found is not larger than the number of bits available.
  * That is what lets the decoder work at the very end of a stream, where fewer
  * bits than the table width may remain.
  *
- * Preconditions: <lengths> holds <symbols> entries, all of them <= 15. The
- * table is assumed to be USLZ_FAST_SIZE entries long.
+ * Preconditions: <lengths> holds <symbols> entries, all of them <= 15, and
+ * <table> is (1 << tbits) entries long.
  */
 static void gen_fast_table(unsigned int symbols, const unsigned char *lengths,
                            uint16_t *table, unsigned int tbits)
@@ -255,6 +257,8 @@ static void gen_fast_table(unsigned int symbols, const unsigned char *lengths,
 			table[rev] = (i << 7) | len;
 	}
 }
+
+#endif /* USLZ_FAST_BITS || USLZ_FAST_DBITS */
 
 /* updates crc for the current <state> inflate stream, chooses the proper
  * crc computation function according to the format used in the stream.
@@ -401,6 +405,8 @@ static inline int gethuff_fixed(const unsigned char **in_ptr, const unsigned cha
 	return 1;
 }
 
+#if USLZ_FAST_BITS || USLZ_FAST_DBITS
+
 /* Decodes one symbol using the direct lookup <table>, which must have been
  * filled by gen_fast_table().
  *
@@ -460,6 +466,8 @@ static inline int gethuff_fast(const unsigned char **in_ptr, const unsigned char
 	*var = entry >> 7;
 	return 1;
 }
+
+#endif /* USLZ_FAST_BITS || USLZ_FAST_DBITS */
 
 /* reverses bits in 5bits len <v> input and returns the new value.
  * ie: 01100 becomes 00110. Bits 5-7 are ignored.
@@ -820,10 +828,14 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 		 * Its cost is paid once per block and amortised over the many
 		 * thousands of symbols a block holds.
 		 */
+#if USLZ_FAST_BITS
 		gen_fast_table(state->literal_count, state->literal_len,
 		               state->fast_lit, USLZ_FAST_BITS);
+#endif
+#if USLZ_FAST_DBITS
 		gen_fast_table(state->distance_count, state->distance_len,
 		               state->fast_dist, USLZ_FAST_DBITS);
+#endif
 	}
 	/* else Static tables: we don't need to generate literal / distance table
 	 * because we directly use gethuff_fixed().
@@ -850,6 +862,7 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 				goto out_of_data;
 		}
 		else {
+#if USLZ_FAST_BITS
 			/* <huff_index> being non-zero means a tree walk was
 			 * interrupted by a lack of data and has to be resumed;
 			 * the fast path cannot be used then, as some bits of
@@ -864,6 +877,7 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 			if (!ret)
 				goto out_of_data;
 			if (ret < 0)
+#endif
 				GETHUFF(state->symbol, state->literal_table);
 		}
 
@@ -918,6 +932,7 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 			num_bits -= 5;
 		}
 		else {
+#if USLZ_FAST_DBITS
 			int ret = -1;
 
 			if (!state->huff_index)
@@ -927,6 +942,7 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 			if (!ret)
 				goto out_of_data;
 			if (ret < 0)
+#endif
 				GETHUFF(state->symbol, state->distance_table);
 		}
 

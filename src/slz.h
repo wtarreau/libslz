@@ -230,19 +230,51 @@ enum uslz_stream_state {
 	USLZ_ST_CHECK_CKSUM,
 };
 
-/* Width of the direct lookup table used to decode dynamic huffman codes.
- * Codes longer than that are decoded by walking the tree instead. 9 bits is
- * what covers the vast majority of the codes in practice while keeping the
- * table small enough to stay in L1.
+/* Width, in bits, of the direct lookup tables used to decode dynamic huffman
+ * codes: one for the literal/length alphabet, one for the distance alphabet.
+ * A code no longer than the table is decoded in a single load, a longer one
+ * falls back to walking the tree, which costs one dependent load per bit.
+ *
+ * Each table costs (1 << bits) * 2 bytes in *every* stream state, so this is
+ * a direct trade between memory and decoding speed, to be made against the
+ * embedding application:
+ *
+ *     bits    table     covers (measured on a gzip-compressed silesia)
+ *      0        0 B     nothing, always walk the tree
+ *      6      128 B     96.9% of the distance codes
+ *      7      256 B     99.0% of the distance codes
+ *      8      512 B     81.2% of the literal/length codes
+ *      9     1024 B     94.4% of the literal/length codes
+ *     10     2048 B     98.9% of the literal/length codes
+ *     11     4096 B     99.7% of the literal/length codes
+ *
+ * Setting a width to 0 removes the corresponding table from the state
+ * entirely, along with the code that uses it: the decoder is then exactly
+ * what it was before the tables existed, and costs no extra memory at all.
+ * That is the right setting for an application holding many concurrent
+ * streams and decompressing rarely; a command line tool decompressing one
+ * stream as fast as possible wants the opposite.
+ *
+ * Both default to a middle ground and can be overridden from the build, for
+ * instance with:
+ *
+ *     make USR_CFLAGS="-DUSLZ_FAST_BITS=0 -DUSLZ_FAST_DBITS=0"
+ *
+ * They change the size of struct uslz_stream, so like PRECOMPUTE_TABLES they
+ * have to be defined identically when building the library and when building
+ * anything that instantiates a stream.
  */
+#ifndef USLZ_FAST_BITS
 #define USLZ_FAST_BITS 9
-#define USLZ_FAST_SIZE (1 << USLZ_FAST_BITS)
+#endif
 
-/* Same for the distance alphabet, which only has 30 symbols and much shorter
- * codes, so a narrower table already covers almost everything.
- */
+#ifndef USLZ_FAST_DBITS
 #define USLZ_FAST_DBITS 7
-#define USLZ_FAST_DSIZE (1 << USLZ_FAST_DBITS)
+#endif
+
+#if USLZ_FAST_BITS > 15 || USLZ_FAST_DBITS > 15
+#error "USLZ_FAST_BITS and USLZ_FAST_DBITS must not exceed 15, the longest deflate code"
+#endif
 
 /* decompression state */
 struct uslz_stream {
@@ -302,16 +334,20 @@ struct uslz_stream {
 	 */
 	short literal_table[288*2-2];
 
+#if USLZ_FAST_BITS
 	/* Direct lookup table for the literal/length alphabet, indexed by the
 	 * next USLZ_FAST_BITS bits of the stream. Same layout as
 	 * fixed_huff_dec_table: the symbol in the upper bits and the code
 	 * length in the low 4 bits, a length of zero meaning the code is
 	 * longer than the table and literal_table[] has to be walked.
 	 */
-	uint16_t fast_lit[USLZ_FAST_SIZE];
+	uint16_t fast_lit[1 << USLZ_FAST_BITS];
+#endif
 
+#if USLZ_FAST_DBITS
 	/* same for the distance alphabet */
-	uint16_t fast_dist[USLZ_FAST_DSIZE];
+	uint16_t fast_dist[1 << USLZ_FAST_DBITS];
+#endif
 
 	union {
 		/* Code-to-symbol conversion table for the alphabet used for
