@@ -214,13 +214,13 @@ static int gen_huffman_table(unsigned int symbols,
  * table is assumed to be USLZ_FAST_SIZE entries long.
  */
 static void gen_fast_table(unsigned int symbols, const unsigned char *lengths,
-                           uint16_t *table)
+                           uint16_t *table, unsigned int tbits)
 {
 	unsigned short next_code[16];
 	unsigned short count[16];
 	unsigned int i, len, code;
 
-	memset(table, 0, USLZ_FAST_SIZE * sizeof(*table));
+	memset(table, 0, (1U << tbits) * sizeof(*table));
 	memset(count, 0, sizeof(count));
 
 	for (i = 0; i < symbols; i++)
@@ -245,13 +245,13 @@ static void gen_fast_table(unsigned int symbols, const unsigned char *lengths,
 		 * ones too long for the table still consume code space.
 		 */
 		code = next_code[len]++;
-		if (len > USLZ_FAST_BITS)
+		if (len > tbits)
 			continue;
 
 		/* codes appear bit-reversed in the accumulator */
 		rev = (unsigned short)rev_short(code, len);
 		step = 1U << len;
-		for (; rev < USLZ_FAST_SIZE; rev += step)
+		for (; rev < (1U << tbits); rev += step)
 			table[rev] = (i << 7) | len;
 	}
 }
@@ -411,15 +411,16 @@ static inline int gethuff_fixed(const unsigned char **in_ptr, const unsigned cha
  */
 static inline int gethuff_fast(const unsigned char **in_ptr, const unsigned char *in_top,
                                unsigned char *num_bits, uint64_t *bit_accum,
-                               unsigned int *var, const uint16_t *table)
+                               unsigned int *var, const uint16_t *table,
+                               unsigned int tbits)
 {
 	uint64_t accum = *bit_accum;
 	unsigned int bits = *num_bits;
 	unsigned int entry, len;
 
 	while (1) {
-		if (bits >= USLZ_FAST_BITS) {
-			entry = table[accum & (USLZ_FAST_SIZE - 1)];
+		if (bits >= tbits) {
+			entry = table[accum & ((1U << tbits) - 1)];
 			break;
 		}
 
@@ -820,7 +821,9 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 		 * thousands of symbols a block holds.
 		 */
 		gen_fast_table(state->literal_count, state->literal_len,
-		               state->fast_lit);
+		               state->fast_lit, USLZ_FAST_BITS);
+		gen_fast_table(state->distance_count, state->distance_len,
+		               state->fast_dist, USLZ_FAST_DBITS);
 	}
 	/* else Static tables: we don't need to generate literal / distance table
 	 * because we directly use gethuff_fixed().
@@ -856,7 +859,8 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 
 			if (!state->huff_index)
 				ret = gethuff_fast(&in_ptr, in_top, &num_bits, &bit_accum,
-				                   &state->symbol, state->fast_lit);
+				                   &state->symbol, state->fast_lit,
+				                   USLZ_FAST_BITS);
 			if (!ret)
 				goto out_of_data;
 			if (ret < 0)
@@ -913,8 +917,18 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 			bit_accum >>= 5;
 			num_bits -= 5;
 		}
-		else
-			GETHUFF(state->symbol, state->distance_table);
+		else {
+			int ret = -1;
+
+			if (!state->huff_index)
+				ret = gethuff_fast(&in_ptr, in_top, &num_bits, &bit_accum,
+				                   &state->symbol, state->fast_dist,
+				                   USLZ_FAST_DBITS);
+			if (!ret)
+				goto out_of_data;
+			if (ret < 0)
+				GETHUFF(state->symbol, state->distance_table);
+		}
 
 		if (state->symbol <= 3)
 			state->distance = state->symbol + 1;

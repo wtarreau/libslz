@@ -238,6 +238,12 @@ enum uslz_stream_state {
 #define USLZ_FAST_BITS 9
 #define USLZ_FAST_SIZE (1 << USLZ_FAST_BITS)
 
+/* Same for the distance alphabet, which only has 30 symbols and much shorter
+ * codes, so a narrower table already covers almost everything.
+ */
+#define USLZ_FAST_DBITS 7
+#define USLZ_FAST_DSIZE (1 << USLZ_FAST_DBITS)
+
 /* decompression state */
 struct uslz_stream {
 	enum uslz_stream_state state;         /* parsing state, USLZ_ST_* */
@@ -303,6 +309,9 @@ struct uslz_stream {
 	 * longer than the table and literal_table[] has to be walked.
 	 */
 	uint16_t fast_lit[USLZ_FAST_SIZE];
+
+	/* same for the distance alphabet */
+	uint16_t fast_dist[USLZ_FAST_DSIZE];
 
 	union {
 		/* Code-to-symbol conversion table for the alphabet used for
