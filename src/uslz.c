@@ -737,15 +737,15 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 
  state_READ_CODE_LENGTHS:
 		while (state->counter < state->codelen_count) {
-			GETBITS(3, state->codelen_len[codelen_order[state->counter]]);
+			GETBITS(3, state->hdr.codelen_len[codelen_order[state->counter]]);
 			state->counter++;
 		}
 		for (; state->counter < 19; state->counter++)
-			state->codelen_len[codelen_order[state->counter]] = 0;
+			state->hdr.codelen_len[codelen_order[state->counter]] = 0;
 
 		/* Generate the code length Huffman table. */
-		if (!gen_huffman_table(19, state->codelen_len, 0,
-		                       state->codelen_table)) {
+		if (!gen_huffman_table(19, state->hdr.codelen_len, 0,
+		                       state->hdr.codelen_table)) {
 			err_code = USLZ_DECODE_E_GEN_HUFF;
 			goto error_return;
 		}
@@ -768,7 +768,7 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 				/* Get the next value and/or repeat count from the
 				 * bitstream.
 				 */
-				GETHUFF(state->symbol, state->codelen_table);
+				GETHUFF(state->symbol, state->hdr.codelen_table);
 				if (state->symbol < 16) {
 					/* Literal bit length. */
 					state->last_value = state->symbol;

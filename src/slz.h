@@ -332,7 +332,23 @@ struct uslz_stream {
 	 * uses a 288-symbol alphabet with two unused symbols, so we reserve
 	 * enough space for that alphabet.
 	 */
-	short literal_table[288*2-2];
+	/* literal_table is only written once the whole code length list has
+	 * been read, and the codelen_* fields used to read it are dead from
+	 * that point on, so they share its storage. This saves ~90 bytes per
+	 * stream, but be careful, nothing may read hdr.codelen_* after
+	 * gen_huffman_table() has been called on the literal alphabet for
+	 * the current block.
+	 */
+	union {
+		short literal_table[288*2-2];
+		struct {
+			short codelen_table[19*2-2];  /* code-to-symbol table for the
+			                               * code length alphabet, same
+			                               * format as literal_table
+			                               */
+			unsigned char codelen_len[19];/* code length per codelen symbol */
+		} hdr;
+	};
 
 #if USLZ_FAST_BITS
 	/* Direct lookup table for the literal/length alphabet, indexed by the
@@ -366,9 +382,6 @@ struct uslz_stream {
 			char gzip_flags;
 		} hdr_detect;
 	};
-	short codelen_table[19*2-2];          /* Code-to-symbol conversion table for the alphabet
-	                                       * used for code lengths.
-	                                       */
 	unsigned int literal_count;           /* number of literal codes in the Huffman table
 	                                       * (HLIT in RFC 1951)
 	                                       */
@@ -381,7 +394,6 @@ struct uslz_stream {
 	                                       */
 	unsigned char literal_len[288];       /* code length for the symbol in literal_table */
 	unsigned char distance_len[32];       /* code length for the symbol in distance table */
-	unsigned char codelen_len[19];        /* code length for the symbol in codelen table */
 };
 
 /* list of possible return values for uslz_decode() */
