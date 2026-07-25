@@ -230,6 +230,14 @@ enum uslz_stream_state {
 	USLZ_ST_CHECK_CKSUM,
 };
 
+/* Width of the direct lookup table used to decode dynamic huffman codes.
+ * Codes longer than that are decoded by walking the tree instead. 9 bits is
+ * what covers the vast majority of the codes in practice while keeping the
+ * table small enough to stay in L1.
+ */
+#define USLZ_FAST_BITS 9
+#define USLZ_FAST_SIZE (1 << USLZ_FAST_BITS)
+
 /* decompression state */
 struct uslz_stream {
 	enum uslz_stream_state state;         /* parsing state, USLZ_ST_* */
@@ -287,6 +295,15 @@ struct uslz_stream {
 	 * enough space for that alphabet.
 	 */
 	short literal_table[288*2-2];
+
+	/* Direct lookup table for the literal/length alphabet, indexed by the
+	 * next USLZ_FAST_BITS bits of the stream. Same layout as
+	 * fixed_huff_dec_table: the symbol in the upper bits and the code
+	 * length in the low 4 bits, a length of zero meaning the code is
+	 * longer than the table and literal_table[] has to be walked.
+	 */
+	uint16_t fast_lit[USLZ_FAST_SIZE];
+
 	union {
 		/* Code-to-symbol conversion table for the alphabet used for
 		 * distances.  This alphabet consists of 32 symbols, 2 of

@@ -197,6 +197,65 @@ static int gen_huffman_table(unsigned int symbols,
 	return 1;
 }
 
+/*
+ * gen_fast_table: fill the direct lookup <table> from the code lengths in
+ * <lengths>, for an alphabet of <symbols> symbols. Entries have the same
+ * layout as fixed_huff_dec_table[]: the symbol in the upper bits and the code
+ * length in the low 4 bits. Codes longer than USLZ_FAST_BITS are left at zero
+ * and are decoded by walking the tree built by gen_huffman_table() instead.
+ *
+ * Each code is replicated over every combination of the bits above it, so
+ * that a lookup performed with fewer than USLZ_FAST_BITS bits still finds it,
+ * provided the length found is not larger than the number of bits available.
+ * That is what lets the decoder work at the very end of a stream, where fewer
+ * bits than the table width may remain.
+ *
+ * Preconditions: <lengths> holds <symbols> entries, all of them <= 15. The
+ * table is assumed to be USLZ_FAST_SIZE entries long.
+ */
+static void gen_fast_table(unsigned int symbols, const unsigned char *lengths,
+                           uint16_t *table)
+{
+	unsigned short next_code[16];
+	unsigned short count[16];
+	unsigned int i, len, code;
+
+	memset(table, 0, USLZ_FAST_SIZE * sizeof(*table));
+	memset(count, 0, sizeof(count));
+
+	for (i = 0; i < symbols; i++)
+		count[lengths[i]]++;
+
+	/* first code of each length, as specified in rfc1951 3.2.2 */
+	count[0] = 0;
+	code = 0;
+	for (len = 1; len < 16; len++) {
+		code = (code + count[len - 1]) << 1;
+		next_code[len] = code;
+	}
+
+	for (i = 0; i < symbols; i++) {
+		unsigned int rev, step;
+
+		len = lengths[i];
+		if (!len)
+			continue;
+
+		/* codes are assigned sequentially within a length, and the
+		 * ones too long for the table still consume code space.
+		 */
+		code = next_code[len]++;
+		if (len > USLZ_FAST_BITS)
+			continue;
+
+		/* codes appear bit-reversed in the accumulator */
+		rev = (unsigned short)rev_short(code, len);
+		step = 1U << len;
+		for (; rev < USLZ_FAST_SIZE; rev += step)
+			table[rev] = (i << 7) | len;
+	}
+}
+
 /* updates crc for the current <state> inflate stream, chooses the proper
  * crc computation function according to the format used in the stream.
  */
@@ -339,6 +398,65 @@ static inline int gethuff_fixed(const unsigned char **in_ptr, const unsigned cha
 	*bit_accum = bit_follow >> (fixed_huff_dec_table[idx] & 0xF);
 	*var = fixed_huff_dec_table[idx] >> 7;
 
+	return 1;
+}
+
+/* Decodes one symbol using the direct lookup <table>, which must have been
+ * filled by gen_fast_table().
+ *
+ * Returns 1 when a symbol was decoded and stored in <var>, 0 if more input
+ * data is needed, and -1 when the code is longer than the table, in which
+ * case no bit was consumed from the accumulator and the caller has to fall
+ * back to gethuff().
+ */
+static inline int gethuff_fast(const unsigned char **in_ptr, const unsigned char *in_top,
+                               unsigned char *num_bits, uint64_t *bit_accum,
+                               unsigned int *var, const uint16_t *table)
+{
+	uint64_t accum = *bit_accum;
+	unsigned int bits = *num_bits;
+	unsigned int entry, len;
+
+	while (1) {
+		if (bits >= USLZ_FAST_BITS) {
+			entry = table[accum & (USLZ_FAST_SIZE - 1)];
+			break;
+		}
+
+		/* Not enough bits for a full lookup. The table being padded,
+		 * looking it up with what we have is still valid as long as it
+		 * lands on a code no longer than that; otherwise we need more
+		 * data to tell.
+		 */
+		entry = table[accum & ((1U << bits) - 1)];
+		len = entry & 0xF;
+		if (len && len <= bits)
+			break;
+
+		if (*in_ptr >= in_top) {
+			*num_bits = bits;
+			*bit_accum = accum;
+			return 0;
+		}
+		accum |= (uint64_t)(*in_ptr)[0] << bits;
+		bits += 8;
+		(*in_ptr)++;
+	}
+
+	len = entry & 0xF;
+	if (!len) {
+		/* too long for the table: hand the refilled accumulator back
+		 * untouched so that the tree walk starts on the first bit of
+		 * the code.
+		 */
+		*num_bits = bits;
+		*bit_accum = accum;
+		return -1;
+	}
+
+	*num_bits = bits - len;
+	*bit_accum = accum >> len;
+	*var = entry >> 7;
 	return 1;
 }
 
@@ -694,6 +812,15 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 			err_code = USLZ_DECODE_E_GEN_HUFF;
 			goto error_return;
 		}
+
+		/* The tree above can decode any code but costs one dependent
+		 * load per bit. Add a direct lookup table for the literal and
+		 * length codes, which is where most of the symbols are read.
+		 * Its cost is paid once per block and amortised over the many
+		 * thousands of symbols a block holds.
+		 */
+		gen_fast_table(state->literal_count, state->literal_len,
+		               state->fast_lit);
 	}
 	/* else Static tables: we don't need to generate literal / distance table
 	 * because we directly use gethuff_fixed().
@@ -719,8 +846,22 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 			if (!gethuff_fixed(&in_ptr, in_top, &num_bits, &bit_accum, &state->symbol))
 				goto out_of_data;
 		}
-		else
-			GETHUFF(state->symbol, state->literal_table);
+		else {
+			/* <huff_index> being non-zero means a tree walk was
+			 * interrupted by a lack of data and has to be resumed;
+			 * the fast path cannot be used then, as some bits of
+			 * the code have already been consumed.
+			 */
+			int ret = -1;
+
+			if (!state->huff_index)
+				ret = gethuff_fast(&in_ptr, in_top, &num_bits, &bit_accum,
+				                   &state->symbol, state->fast_lit);
+			if (!ret)
+				goto out_of_data;
+			if (ret < 0)
+				GETHUFF(state->symbol, state->literal_table);
+		}
 
 		/* If the symbol is a literal, add it to the buffer and continue
 		 * with the next code.
