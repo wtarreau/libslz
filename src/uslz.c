@@ -583,6 +583,23 @@ static inline uint8_t rbit5(uint8_t v)
 #define R_MATCH  1
 #define R_UNCOMP 2
 
+/* Tells the compiler which of the fixed and dynamic huffman paths to lay out
+ * as the fallthrough one. slz only ever emits fixed huffman blocks, and that
+ * is the primary use case for this decoder, hence the default. Set to 0 to
+ * leave the choice to the compiler, or to 2 to favour dynamic blocks.
+ */
+#ifndef USLZ_EXPECT_FIXED
+#define USLZ_EXPECT_FIXED 1
+#endif
+
+#if USLZ_EXPECT_FIXED == 1
+#  define BLOCK_IS_FIXED(t) __builtin_expect((t), 1)
+#elif USLZ_EXPECT_FIXED == 2
+#  define BLOCK_IS_FIXED(t) __builtin_expect((t), 0)
+#else
+#  define BLOCK_IS_FIXED(t) (t)
+#endif
+
 #define CASE_STATE(s)  case USLZ_ST_##s: goto state_##s
 
 /* main decoding function for inflate API, takes <state> stream as parameter
@@ -614,6 +631,10 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 	 * buffer is valid history for the distances.
 	 */
 	int wrapped = dec_total >= out_max;
+	/* invariant for the whole block, but re-read from the state on every
+	 * symbol otherwise, as the loop body is not hoistable.
+	 */
+	int fixed_block = state->block_type != 2;
 	int resume = R_SYMBOL;
 	unsigned int remain;
 	unsigned int len;
@@ -667,6 +688,7 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 		state->flags |= USLZ_FL_FINAL;
 
 	state->block_type >>= 1;
+	fixed_block = state->block_type != 2;
 
 	/* Check for blocks with an invalid block code. */
 	if (state->block_type == 3) {
@@ -883,7 +905,7 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 		}
 
 		/* Read a compressed symbol from the block. */
-		if (state->block_type != 2) {
+		if (BLOCK_IS_FIXED(fixed_block)) {
 			/* fixed huffman */
 			if (!gethuff_fixed(&in_ptr, in_top, &num_bits, &bit_accum, &state->symbol))
 				goto out_of_data;
@@ -950,7 +972,7 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 		state->state = USLZ_ST_READ_DISTANCE;
 
  state_READ_DISTANCE:
-		if (state->block_type != 2) {
+		if (BLOCK_IS_FIXED(fixed_block)) {
 			/* static huffman opti, read the distance directly in the the bit accum */
 			if (num_bits < 5 && !bit_accumulate(&in_ptr, in_top, &num_bits, &bit_accum))
 				goto out_of_data;
