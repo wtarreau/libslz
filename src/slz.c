@@ -490,36 +490,21 @@ static void copy_lit_huff(struct slz_stream *strm, const unsigned char *buf, uin
 	} while (pos < len);
 }
 
-/* sets <count> BYTES to -32769 in <refs> so that any uninitialized entry will
- * verify (pos-last-1 >= 32768) and be ignored. <count> must be a multiple of
- * 128 bytes and <refs> must be at least one count in length. It's supposed to
- * be applied to 64-bit aligned data exclusively, which makes it slightly
- * faster than the regular memset() since no alignment check is performed.
+/* Marks all <count> bytes worth of entries in <refs> as unusable, so that any
+ * entry not written since is rejected by the (pos - last - 1 >= 32768) test in
+ * slz_rfc1951_encode(). <count> is in bytes and <refs> must be at least that
+ * large.
+ *
+ * The byte value is not arbitrary. It has to leave a <pos> field that reads as
+ * "far in the past" for every possible <pos>, on 32-bit as well, where that
+ * subtraction is done on 32 bits. 0xFF wouldn't work. 0xFE gives 0xFEFEFEFE,
+ * hence pos + 0x01010101, which is above 32768 and does not wrap for any
+ * realistic input length. Note that the use of memset() here is intentional
+ * as it was measured to be faster on modern libcs than an unrolled loop.
  */
 static void reset_refs(union ref *refs, long count)
 {
-	/* avoid a shift/mask by casting to void* */
-	union ref *end = (void *)refs + count;
-
-	do {
-		refs[ 0].by64 = -32769;
-		refs[ 1].by64 = -32769;
-		refs[ 2].by64 = -32769;
-		refs[ 3].by64 = -32769;
-		refs[ 4].by64 = -32769;
-		refs[ 5].by64 = -32769;
-		refs[ 6].by64 = -32769;
-		refs[ 7].by64 = -32769;
-		refs[ 8].by64 = -32769;
-		refs[ 9].by64 = -32769;
-		refs[10].by64 = -32769;
-		refs[11].by64 = -32769;
-		refs[12].by64 = -32769;
-		refs[13].by64 = -32769;
-		refs[14].by64 = -32769;
-		refs[15].by64 = -32769;
-		refs += 16;
-	} while (refs < end);
+	memset(refs, 0xFE, count);
 }
 
 /* Number of bits wasted by the 9-bit literals above which it becomes
