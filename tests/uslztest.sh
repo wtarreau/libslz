@@ -83,6 +83,53 @@ sys.stdout.buffer.write(h+body+struct.pack("<II",zlib.crc32(d)&0xffffffff,len(d)
 	done
 done
 
+# the same streams again, but telling the decoder which envelope to expect
+# through uslz_init_fmt() rather than letting it detect one. For raw deflate
+# this is the only reliable way, see the trap stream below.
+for n in text noncomp rep44 rand40k; do
+	for spec in "raw 1" "gz9 2" "zlib 3"; do
+		set -- $spec
+		f="$T/$n.$1"
+		[ -s "$f" ] || continue
+		for chunk in 1 7 8192; do
+			total=$((total + 1))
+			"$T/uslztest" 32768 $chunk $2 < "$f" > "$T/out" 2>"$T/err"
+			if [ $? -ne 0 ] || ! cmp -s "$T/ref/$n" "$T/out"; then
+				echo "FAIL forced-fmt $n.$1 chunk=$chunk: $(cat "$T/err")"
+				fail=$((fail + 1))
+			fi
+		done
+	done
+done
+
+# announcing an envelope the stream does not carry must be refused, not
+# silently decoded as something else
+for spec in "text.raw 2" "text.raw 3" "text.gz9 3" "text.zlib 2"; do
+	set -- $spec
+	total=$((total + 1))
+	"$T/uslztest" 32768 8192 $2 < "$T/$1" > /dev/null 2>&1
+	[ $? -eq 1 ] || { echo "FAIL forced-fmt $1 as $2 was not refused"; fail=$((fail + 1)); }
+done
+
+# A raw deflate stream whose first two bytes happen to form a valid zlib
+# header: autodetection cannot get this right, forcing the format must.
+python3 -c '
+import sys
+payload = bytes(range(29))
+out = bytearray([0x08])                  # BFINAL=0 BTYPE=00, padding bit 3 set
+out += len(payload).to_bytes(2, "little")
+out += (~len(payload) & 0xFFFF).to_bytes(2, "little")
+out += payload
+out += bytes([0x03, 0x00])               # final fixed block, immediate EOB
+sys.stdout.buffer.write(bytes(out))
+open("'"$T"'/trap.ref", "wb").write(payload)' > "$T/trap.deflate"
+total=$((total + 1))
+"$T/uslztest" 32768 8192 1 < "$T/trap.deflate" > "$T/out" 2>/dev/null
+if [ $? -ne 0 ] || ! cmp -s "$T/trap.ref" "$T/out"; then
+	echo "FAIL zlib-looking raw deflate stream not decoded with a forced format"
+	fail=$((fail + 1))
+fi
+
 # multi-member gzip: concatenated members are a single valid gzip stream
 # (that is what "gzip -c a b > ab.gz" and most log rotators produce), and
 # the decoder is expected to return the concatenation of all of them.

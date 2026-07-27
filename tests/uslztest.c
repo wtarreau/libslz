@@ -4,7 +4,10 @@
  *
  * It is built and driven by tests/uslztest.sh.
  *
- * usage: uslztest [ring_size] [in_chunk]
+ * usage: uslztest [ring_size] [in_chunk] [format]
+ *
+ * <format> selects uslz_init_fmt() instead of uslz_init(): 1 = raw deflate,
+ * 2 = gzip, 3 = zlib. Anything else, or absent, means autodetection.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,8 +22,9 @@ int main(int argc, char **argv)
 	struct uslz_stream state;
 	long ring = argc > 1 ? atol(argv[1]) : 32768;
 	long chunk = argc > 2 ? atol(argv[2]) : 8192;
+	int fmt = argc > 3 ? atoi(argv[3]) : 0;
 	long in_len = 0, ofs = 0;
-	int complete = 0;
+	int complete = 0, ret;
 	uint32_t crc = 0;
 
 	if (ring > (long)sizeof(obuf) || chunk > (long)sizeof(inbuf))
@@ -42,7 +46,16 @@ int main(int argc, char **argv)
 		in_len += ret;
 	}
 
-	if (!uslz_init(&state, obuf, ring)) {
+	if (fmt == 1)
+		ret = uslz_init_fmt(&state, obuf, ring, SLZ_FMT_DEFLATE);
+	else if (fmt == 2)
+		ret = uslz_init_fmt(&state, obuf, ring, SLZ_FMT_GZIP);
+	else if (fmt == 3)
+		ret = uslz_init_fmt(&state, obuf, ring, SLZ_FMT_ZLIB);
+	else
+		ret = uslz_init(&state, obuf, ring);
+
+	if (!ret) {
 		fprintf(stderr, "init failed\n");
 		return 2;
 	}
