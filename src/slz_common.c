@@ -27,11 +27,14 @@
 #include "tables.h"
 
 /* Detect PCLMULQDQ at build time for CRC calculation, unless SLZ_NO_PCLMUL
- * is set to disable it.
+ * is set to disable it. In order to also support older CPUs, we'll also
+ * detect it at run time on supported compilers.
  */
-#if !defined(SLZ_NO_PCLMUL) && (defined(__SSE4_1__) && defined(__PCLMUL__))
+#if !defined(SLZ_NO_PCLMUL) && (defined(__SSE4_1__) && defined(__PCLMUL__)) && \
+    (defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 6))
 #define SLZ_USE_PCLMUL
 #include <immintrin.h>
+static int slz_have_pclmul = 0;
 #endif
 
 /*
@@ -279,7 +282,7 @@ static uint32_t crc32_pclmul(uint32_t crc, const unsigned char *buf, int len)
 uint32_t slz_crc32_by4(uint32_t crc, const unsigned char *buf, int len)
 {
 #if defined(SLZ_USE_PCLMUL)
-	if (__builtin_expect(len >= 16, 1))
+	if (__builtin_expect(slz_have_pclmul && len >= 16, 1))
 		return crc32_pclmul(crc, buf, len);
 #endif
 	return crc32_by4_tab(crc, buf, len);
@@ -410,5 +413,9 @@ static void __slz_common_initialize(void)
 {
 #if !defined(__ARM_FEATURE_CRC32)
 	__slz_make_crc_table(); // used by both slz and uslz
+#endif
+#if defined(SLZ_USE_PCLMUL)
+	slz_have_pclmul = __builtin_cpu_supports("pclmul") &&
+	                  __builtin_cpu_supports("sse4.1");
 #endif
 }
