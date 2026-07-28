@@ -26,11 +26,11 @@
 #include "slz-prv.h"
 #include "tables.h"
 
-/* Detect PCLMULQDQ at build time for CRC calculation, unless SLZ_NO_PCLMUL
- * is set to disable it. In order to also support older CPUs, we'll also
- * detect it at run time on supported compilers.
+/* We'll tentatively use PCLMULQDQ for CRC calculation on x86_64 CPUs even if
+ * not enabled at build time, unless SLZ_NO_PCLMUL is set to disable it. This
+ * is done by detecting its support at boot time on supported compilers.
  */
-#if !defined(SLZ_NO_PCLMUL) && (defined(__SSE4_1__) && defined(__PCLMUL__)) && \
+#if !defined(SLZ_NO_PCLMUL) && (defined(__x86_64__)) && \
     (defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 6))
 #define SLZ_USE_PCLMUL
 #include <immintrin.h>
@@ -207,6 +207,7 @@ static uint32_t crc32_by4_tab(uint32_t crc, const unsigned char *buf, int len)
  * which is much higher than its throughput, is not what limits the loop. They
  * are combined at the end by folding each into the next by 16 bytes.
  */
+__attribute__((target("pclmul,sse4.1"))) /* pretend -mpclmul -msse4.1 was passed */
 static uint32_t crc32_pclmul(uint32_t crc, const unsigned char *buf, int len)
 {
 	/* x^159 and x^95 : fold by 16 bytes */
