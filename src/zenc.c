@@ -71,7 +71,7 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    "  -0         disable compression, only uses output format\n"
 	    "  -1         compress faster\n"
 	    "  -2         compress better\n"
-	    "  -3 .. -9   compress even better [default]\n"
+	    "  -3 .. -9   compress even better [default=3]\n"
 	    "  -b <size>  only use <size> bytes from the input file\n"
 	    "  -B         use buffered mode instead of mmap (uses less memory)\n"
 	    "  -c         send output to stdout [default]\n"
@@ -201,6 +201,12 @@ int main(int argc, char **argv)
 		block_size *= 4; // 128 kB
 	if (level > 2)
 		block_size *= 8; // 1 MB
+	if (level > 3)
+		block_size *= 8; // 8 MB
+	if (level > 4)
+		block_size *= 8; // 64 MB
+	if (level > 5)
+		block_size *= 8; // 512 MB
 
 	outbsize = 2 * block_size; // allows to pack more than one full output at each round
 	outbuf = calloc(1, outbsize + 4096);
