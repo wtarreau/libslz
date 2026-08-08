@@ -83,6 +83,14 @@ static uint32_t fh_dist_table[32768];
 # define SLZ_DIRECT_ENQUEUE56 0
 #endif
 
+/* Enables growing a match backwards over the literals that are still pending,
+ * see slz_rfc1951_encode(). Costs a little CPU on every match and gains about
+ * 1% of output.
+ */
+#ifndef SLZ_BACKWARD_MATCH
+# define SLZ_BACKWARD_MATCH 1
+#endif
+
 /* Log2 of the size of the hash table used for the references table. */
 #ifndef SLZ_HASH_BITS
 # define SLZ_HASH_BITS 13
@@ -697,7 +705,7 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 	unsigned long pos = 0;
 	unsigned long last;
 	uint32_t word = 0;
-	long mlen;
+	long mlen, back = 0;
 	uint32_t h;
 	uint64_t ent;
 
@@ -804,8 +812,50 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 		if ((unsigned long)(pos - last - 1) >= 32768)
 			goto send_as_lit;
 
+#if SLZ_BACKWARD_MATCH
+		/* Compare queued literals in case the previous ones were not
+		 * found due to hash collisions but still match. We don't go
+		 * further than 8 bytes so that we can find them in a single
+		 * 64-bit comparison. On aligned-only machines we read one byte
+		 * at a time, as it is expected to be cheaper than composing an
+		 * unaligned int and manually doing a ctzll() on it. Tests have
+		 * shown that there's little to gain past 8 bytes, and anyway
+		 * the total match length will be bounded by 258. BTW we only
+		 * consider cases where last >= 8 because this guarantees that
+		 * we can access both the searched sequence and the match found
+		 * on a wole word at once. It may miss some rare matches on the
+		 * edge of the buffer that we don't care about.
+		 *
+		 * It's worth noting that we *do not* fixup <bit9> if a match
+		 * is found, as this would be too complicated and counter-
+		 * productive. This means that literals that were finally
+		 * encoded might still count towards the budget limit, but this
+		 * is not dramatic and keeps us on the safe side.
+		 *
+		 * The result of the search is to only touch <back> that will be
+		 * used all along in all operations. Multiple attempts have shown
+		 * that it's both easier and faster this way than changing then
+		 * rolling back offsets when we finally give up and send_as_lit.
+		 */
+		back = 0;
+		if (__builtin_expect(plit != 0 && last >= 8, 1)) {
+			long bmax = (plit < 8) ? plit : 8;
+
+#if defined(UNALIGNED_LE_OK) && defined(__SIZEOF_LONG__) && __SIZEOF_LONG__ >= 8
+			uint64_t x = *(uint64_t *)&in[pos - 8] ^ *(uint64_t *)&in[last - 8];
+
+			back = x ? (__builtin_clzll(x) >> 3) : 8;
+			if (back > bmax)
+				back = bmax;
+#else
+			while (back < bmax && in[pos - back - 1] == in[last - back - 1])
+				back++;
+#endif
+		}
+#endif
+
 		/* Note: cannot encode a length larger than 258 bytes */
-		mlen = memmatch(in + pos + 4, in + last + 4, (rem > 258 ? 258 : rem) - 4) + 4;
+		mlen = memmatch(in + pos + 4, in + last + 4, (rem > 258 ? 258 : rem) - 4 - back) + 4 + back;
 
 		/* found a matching entry */
 
@@ -872,6 +922,11 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 		    (dist & 0x1f) + (code >> 16) + SLZ_SWITCH_COST > 8 * mlen)
 			goto send_as_lit;
 
+		/* OK now we're certain to use the match, we must rewind the
+		 * literals that are part of the match.
+		 */
+		plit -= back;
+
 		/* first, copy pending literals */
 		if (plit) {
 			/* Huffman encoding requires 9 bits for octets 144..255, so this
@@ -885,9 +940,9 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 			 * only those sent in huffman mode add to the debt.
 			 */
 			if (bit9 >= SLZ_SWITCH_COST || strm->debt >= SLZ_MAX_DEBT)
-				copy_lit(strm, in + pos - plit, plit, 1);
+				copy_lit(strm, in + pos - back - plit, plit, 1);
 			else {
-				copy_lit_huff(strm, in + pos - plit, plit, 1);
+				copy_lit_huff(strm, in + pos - back - plit, plit, 1);
 				strm->debt += bit9;
 			}
 
@@ -936,8 +991,8 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 		strm->debt = (code > 8 * (uint32_t)mlen) ? code - 8 * (uint32_t)mlen : 0;
 
 		bit9 = 0;
-		rem -= mlen;
-		pos += mlen;
+		rem -= mlen - back;
+		pos += mlen - back;
 
 #ifndef UNALIGNED_FASTER
 		/* same as before the loop, this is only used when continuing
