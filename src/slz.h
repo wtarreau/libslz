@@ -95,6 +95,8 @@ struct slz_stream {
  * When enabling direct queuing via SLZ_DIRECT_ENQUEUE24, the 3 bytes following
  * the end of the buffer may be written to, and the caller must take that into
  * account by allocating a buffer that is at least 3 bytes larger than needed.
+ * And when using SLZ_DIRECT_ENQUEUE56, it's up to 7 extra bytes that may be
+ * needed.
  */
 
 /* Functions specific to rfc1951 (deflate) */

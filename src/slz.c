@@ -35,10 +35,23 @@
 static uint32_t fh_dist_table[32768];
 #endif // ifndef PRECOMPUTE_TABLES
 
-/* directly write 32 bits at a time to output for up to 24 bits, may write past
- * the end of the buffer by up to 3 bytes. The caller must leave provision for
- * this.
+/* The enqueue functions have two possible implementations. The default one
+ * only writes to the output buffer once it holds a whole store's worth of
+ * bits, which costs a test but never writes a byte it does not advance over.
+ * The "direct" one, selected by these macros, stores unconditionally and then
+ * advances by however many whole bytes the queue turned out to hold, leaving
+ * fewer than 8 bits behind. That saves a branch, and requires the caller to
+ * leave room past the output pointer for the widest store used (3 bytes for
+ * enqueue24() and enqueue8(), 7 for enqueue56()), since the bytes beyond the
+ * advance are rewritten by the next call. They're only usable for unaligned
+ * little endian archs and generally work better on modern x86_64. Tests show
+ * that x86_64 and arm64 benefit greatly from this.
+ *
+ * SLZ_DIRECT_ENQUEUE56 goes further by writing a whole length+distance pair in
+ * a single operation instead of two.
  */
+
+/* directly write 32 bits at a time to output for up to 24 bits */
 #ifndef SLZ_DIRECT_ENQUEUE24
 # define SLZ_DIRECT_ENQUEUE24 0
 #endif
@@ -46,6 +59,11 @@ static uint32_t fh_dist_table[32768];
 /* directly write 8 bits at a time to the output */
 #ifndef SLZ_DIRECT_ENQUEUE8
 # define SLZ_DIRECT_ENQUEUE8 0
+#endif
+
+/* directly write 64 bits at a tome to output for up to 56 bits */
+#ifndef SLZ_DIRECT_ENQUEUE56
+# define SLZ_DIRECT_ENQUEUE56 0
 #endif
 
 /* The direct enqueue8() writes a single byte, which is only enough because it
@@ -57,6 +75,12 @@ static uint32_t fh_dist_table[32768];
 #if SLZ_DIRECT_ENQUEUE8 && !SLZ_DIRECT_ENQUEUE24 && \
     defined(USE_64BIT_QUEUE) && defined(UNALIGNED_LE_OK)
 # error "SLZ_DIRECT_ENQUEUE8 requires SLZ_DIRECT_ENQUEUE24 on this platform"
+#endif
+
+/* enqueue56() needs a 64-bit queue and unaligned little-endian stores. */
+#if SLZ_DIRECT_ENQUEUE56 && !(defined(USE_64BIT_QUEUE) && defined(UNALIGNED_LE_OK))
+# undef SLZ_DIRECT_ENQUEUE56
+# define SLZ_DIRECT_ENQUEUE56 0
 #endif
 
 /* Log2 of the size of the hash table used for the references table. */
@@ -359,6 +383,29 @@ static inline void enqueue8(struct slz_stream *strm, uint32_t x, uint32_t xbits)
 }
 #else
 #define enqueue8 enqueue24
+#endif
+
+#if SLZ_DIRECT_ENQUEUE56
+/* Enqueues code <x> of <xbits> bits (LSB aligned) and stores the low 8 bytes
+ * of the queue, then advances over the whole bytes it holds. <xbits> plus
+ * whatever was already queued must stay below 64, and the caller must leave 8
+ * bytes of room past strm->outbuf rather than the 4 the other enqueues need.
+ * It exists to send a length code and the distance code that follows it in one
+ * go, which is at most 31 bits: 7 or 8 for the length code plus up to 5 extra,
+ * then 5 for the distance code plus up to 13 extra.
+ */
+static inline void enqueue56(struct slz_stream *strm, uint64_t x, uint32_t xbits)
+{
+	uint64_t queue = strm->queue + (x << strm->qbits);
+	uint32_t qbits = strm->qbits + xbits;
+
+	*(uint64_t *)strm->outbuf = queue;
+	queue >>= qbits & ~7U;
+
+	strm->queue = queue;
+	strm->outbuf += qbits >> 3;
+	strm->qbits = qbits & 7;
+}
 #endif
 
 /* flush the queue and align to next byte */
@@ -854,10 +901,20 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 		}
 
 		/* copy the length first */
+#if SLZ_DIRECT_ENQUEUE56
+		/* the length code and the distance code that follows it total
+		 * 31 bits at most, which one enqueue can take in a single
+		 * shift-or-store instead of two
+		 */
+		enqueue56(strm, (uint64_t)(code & 0xFFFF) |
+		                ((uint64_t)(dist >> 5) << (code >> 16)),
+		          (code >> 16) + (dist & 0x1f));
+#else
 		enqueue24(strm, code & 0xFFFF, code >> 16);
 
 		/* in fixed huffman mode, dist is fixed 5 bits */
 		enqueue24(strm, dist >> 5, dist & 0x1f);
+#endif
 
 		/* <bit9> only measures the current group of literals, which is
 		 * what the decisions above compare against, and it restarts
