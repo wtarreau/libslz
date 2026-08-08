@@ -43,6 +43,22 @@ static uint32_t fh_dist_table[32768];
 # define SLZ_DIRECT_ENQUEUE24 0
 #endif
 
+/* directly write 8 bits at a time to the output */
+#ifndef SLZ_DIRECT_ENQUEUE8
+# define SLZ_DIRECT_ENQUEUE8 0
+#endif
+
+/* The direct enqueue8() writes a single byte, which is only enough because it
+ * assumes fewer than 8 bits were already queued. That holds for every enqueue
+ * variant except the conditional 64-bit enqueue24(), which deliberately lets
+ * up to 31 bits accumulate before storing. Combining the two would advance the
+ * output pointer over bytes that were never written.
+ */
+#if SLZ_DIRECT_ENQUEUE8 && !SLZ_DIRECT_ENQUEUE24 && \
+    defined(USE_64BIT_QUEUE) && defined(UNALIGNED_LE_OK)
+# error "SLZ_DIRECT_ENQUEUE8 requires SLZ_DIRECT_ENQUEUE24 on this platform"
+#endif
+
 /* Log2 of the size of the hash table used for the references table. */
 #ifndef SLZ_HASH_BITS
 # define SLZ_HASH_BITS 13
@@ -326,7 +342,24 @@ static inline void enqueue24(struct slz_stream *strm, uint64_t x, uint32_t xbits
 #endif
 }
 
+/* enqueue code x of <xbits> bits (at most 8) and copy complete bytes into out
+ * buf. X must not contain non-zero bits above xbits.
+ */
+#if SLZ_DIRECT_ENQUEUE8
+static inline void enqueue8(struct slz_stream *strm, uint32_t x, uint32_t xbits)
+{
+	uint64_t queue = strm->queue + ((uint64_t)x << strm->qbits);
+	uint32_t qbits = strm->qbits + xbits;
+
+	*strm->outbuf = queue;
+	strm->outbuf += qbits >= 8;
+	queue >>= qbits & 8;
+	strm->queue = queue;
+	strm->qbits = qbits & 7;
+}
+#else
 #define enqueue8 enqueue24
+#endif
 
 /* flush the queue and align to next byte */
 static inline void flush_bits(struct slz_stream *strm)
@@ -349,11 +382,13 @@ static inline void flush_bits(struct slz_stream *strm)
 	if (strm->qbits > 8)
 		*strm->outbuf++ = strm->queue >> 8;
 
+#if !SLZ_DIRECT_ENQUEUE8
 	if (strm->qbits > 16)
 		*strm->outbuf++ = strm->queue >> 16;
 
 	if (strm->qbits > 24)
 		*strm->outbuf++ = strm->queue >> 24;
+#endif
 #endif
 
 	strm->queue = 0;
@@ -418,6 +453,14 @@ static inline void enqueue8(struct slz_stream *strm, uint32_t x, uint32_t xbits)
 	uint32_t queue = strm->queue + (x << strm->qbits);
 	uint32_t qbits = strm->qbits + xbits;
 
+#if SLZ_DIRECT_ENQUEUE8
+	*strm->outbuf = queue;
+	strm->outbuf += qbits >= 8;
+	queue >>= qbits & 8;
+	strm->queue = queue;
+	strm->qbits = qbits & 7;
+	return;
+#endif
 	if (__builtin_expect((signed)(qbits - 8) >= 0, 1)) {
 		qbits -= 8;
 		*strm->outbuf++ = queue;
@@ -434,8 +477,10 @@ static inline void flush_bits(struct slz_stream *strm)
 	if (strm->qbits > 0)
 		*strm->outbuf++ = strm->queue;
 
+#if !SLZ_DIRECT_ENQUEUE8
 	if (strm->qbits > 8)
 		*strm->outbuf++ = strm->queue >> 8;
+#endif
 
 	strm->queue = 0;
 	strm->qbits = 0;
