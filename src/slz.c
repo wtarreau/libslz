@@ -36,7 +36,9 @@ static uint32_t fh_dist_table[32768];
 #endif // ifndef PRECOMPUTE_TABLES
 
 /* Log2 of the size of the hash table used for the references table. */
-#define HASH_BITS 13
+#ifndef SLZ_HASH_BITS
+# define SLZ_HASH_BITS 13
+#endif
 
 /* First, RFC1951-specific declarations and extracts from the RFC.
  *
@@ -187,18 +189,22 @@ static inline uint32_t slz_hash(uint32_t a)
 	// 32 bit mode (e.g. armv7 compiler building for armv8
 	__asm__ volatile("crc32w %0,%0,%1" : "+r"(a) : "r"(0));
 #  endif
-	return a >> (32 - HASH_BITS);
 #elif defined(__SSE4_2__) && defined(USE_CRC32C_HASH)
 	// SSE 4.2 offers CRC32C which is a bit slower than the multiply
 	// but provides a slightly smoother hash
 	__asm__ volatile("crc32l %1,%0" : "+r"(a) : "r"(0));
-	return a >> (32 - HASH_BITS);
 #elif defined(HAVE_FAST_MULT)
-	// optimal factor for HASH_BITS=12 and HASH_BITS=13 among 48k tested: 0x1af42f
-	return (a * 0x1af42f) >> (32 - HASH_BITS);
+	// optimal factor for SLZ_HASH_BITS=12 and SLZ_HASH_BITS=13 among 48k tested: 0x1af42f
+	a = (a * 0x1af42f); // 12: 44.12, 13: 43.35
+	//return (a * 0x1aaee3) >> (32 - SLZ_HASH_BITS); // 12: 44.14, 13: 43.34
+	//return (a * 0x1aae0b) >> (32 - SLZ_HASH_BITS); // 12: 44.15, 13: 43.35, -30k
+	//return (a * 0x17e7bd) >> (32 - SLZ_HASH_BITS); // 12: 44.15, 13: 43.36
+	//return (a * 0xaae7b) >> (32 - SLZ_HASH_BITS); // 12: 44.22, 13:43.35, -1k
+	//return (a * 0xaaec3) >> (32 - SLZ_HASH_BITS); // 12: 44.20, 13: 43.35, -10k // 275659647
 #else
-	return ((a << 19) + (a << 6) - a) >> (32 - HASH_BITS);
+	a = ((a << 19) + (a << 6) - a);
 #endif
+	return a >> (32 - SLZ_HASH_BITS);
 }
 
 /* This function compares buffers <a> and <b> and reads 32 or 64 bits at a time
@@ -569,7 +575,7 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 	uint32_t plit = 0;
 	uint32_t bit9 = 0;
 	uint32_t dist, code;
-	union ref refs[1 << HASH_BITS];
+	union ref refs[1 << SLZ_HASH_BITS];
 
 	if (!strm->level) {
 		/* force to send as literals (eg to preserve CPU) */
