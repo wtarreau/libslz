@@ -35,6 +35,14 @@
 static uint32_t fh_dist_table[32768];
 #endif // ifndef PRECOMPUTE_TABLES
 
+/* directly write 32 bits at a time to output for up to 24 bits, may write past
+ * the end of the buffer by up to 3 bytes. The caller must leave provision for
+ * this.
+ */
+#ifndef SLZ_DIRECT_ENQUEUE24
+# define SLZ_DIRECT_ENQUEUE24 0
+#endif
+
 /* Log2 of the size of the hash table used for the references table. */
 #ifndef SLZ_HASH_BITS
 # define SLZ_HASH_BITS 13
@@ -290,13 +298,22 @@ static inline long memmatch(const unsigned char *a, const unsigned char *b, long
 
 /* enqueue code x of <xbits> bits (LSB aligned, at most 24) and copy complete
  * 32-bit words into output buffer. X must not contain non-zero bits above
- * xbits.
+ * xbits. Note that the function may write up to 3 extra bytes since it may
+ * write 32 bits even if only 8 are needed.
  */
 static inline void enqueue24(struct slz_stream *strm, uint64_t x, uint32_t xbits)
 {
 	uint64_t queue = strm->queue + (x << strm->qbits);
 	uint32_t qbits = strm->qbits + xbits;
 
+#if SLZ_DIRECT_ENQUEUE24
+	*(uint32_t *)strm->outbuf = queue;
+	queue >>= qbits & ~7U;
+
+	strm->queue = queue;
+	strm->outbuf += qbits >> 3;
+	strm->qbits = qbits & 7;
+#else
 	if (__builtin_expect(qbits >= 32, 1)) {
 		*(uint32_t *)strm->outbuf = queue;
 		queue >>= 32;
@@ -306,6 +323,7 @@ static inline void enqueue24(struct slz_stream *strm, uint64_t x, uint32_t xbits
 
 	strm->queue = queue;
 	strm->qbits = qbits;
+#endif
 }
 
 #define enqueue8 enqueue24
@@ -333,13 +351,30 @@ static inline void flush_bits(struct slz_stream *strm)
 
 /* enqueue code x of <xbits> bits (LSB aligned, at most 24) and copy complete
  * bytes into out buf. X must not contain non-zero bits above xbits. Prefer
- * enqueue8() when xbits is known for being 8 or less.
+ * enqueue8() when xbits is known for being 8 or less. Note that the function
+ * may write up to 3 extra bytes since it may write 32 bits even if only 8 are
+ * needed.
  */
 static void enqueue24(struct slz_stream *strm, uint32_t x, uint32_t xbits)
 {
 	uint32_t queue = strm->queue + (x << strm->qbits);
 	uint32_t qbits = strm->qbits + xbits;
 
+#if SLZ_DIRECT_ENQUEUE24
+#ifndef UNALIGNED_LE_OK
+	strm->outbuf[0] = queue;
+	strm->outbuf[1] = queue >> 8;
+	strm->outbuf[2] = queue >> 16;
+	strm->outbuf[3] = queue >> 24;
+#else
+	*(uint32_t *)strm->outbuf = queue;
+#endif
+	queue >>= qbits & ~7U;
+	strm->outbuf += qbits >> 3;
+	strm->qbits = qbits & 7;
+	strm->queue = queue;
+	return;
+#endif
 	if (qbits >= 16) {
 #ifndef UNALIGNED_LE_OK
 		strm->outbuf[0] = queue;

@@ -90,6 +90,13 @@ struct slz_stream {
 	uint32_t ilen;
 };
 
+/* Note about output buffer sizing: encode functions below do not take an
+ * output len, instead the caller must provide a "large enough" output buffer.
+ * When enabling direct queuing via SLZ_DIRECT_ENQUEUE24, the 3 bytes following
+ * the end of the buffer may be written to, and the caller must take that into
+ * account by allocating a buffer that is at least 3 bytes larger than needed.
+ */
+
 /* Functions specific to rfc1951 (deflate) */
 void slz_prepare_dist_table(); /* obsolete, not needed anymore */
 long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsigned char *in, long ilen, int more);
