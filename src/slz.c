@@ -93,6 +93,14 @@ static uint32_t fh_dist_table[32768];
 # define SLZ_INSERT_SKIPPED 1
 #endif
 
+/* Skip large non-compressible areas and send them as literals to avoid wasting
+ * CPU trying to compress them. It's faster on incompressible data, at the cost
+ * of a slightly reduced compression ratio.
+ */
+#ifndef SLZ_LITERAL_SKIP
+# define SLZ_LITERAL_SKIP 0
+#endif
+
 /* Enables growing a match backwards over the literals that are still pending,
  * see slz_rfc1951_encode(). Costs a little CPU on every match and gains about
  * 1% of output.
@@ -741,6 +749,9 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 	uint32_t h;
 	uint64_t ent;
 
+#if SLZ_LITERAL_SKIP
+	long skip_ratio = 1;
+#endif
 	uint32_t plit = 0;
 	uint32_t bit9 = 0;
 	uint32_t dist, code;
@@ -837,6 +848,25 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 			plit++;
 			bit9 += ((unsigned char)word >= 144);
 			pos++;
+
+#if SLZ_LITERAL_SKIP
+			/* Incompressible data: once enough literals have accumulated
+			 * without a single match, stop looking for a while and just
+			 * dump what follows as literal blocks, doubling the amount
+			 * skipped each time so that a long incompressible block
+			 * costs less and less to walk over. A match resets it.
+			 */
+			if (plit >= 4096) {
+				long skip = rem >= skip_ratio * 4096 ? skip_ratio * 4096 : rem;
+				skip_ratio *= 2;
+
+				copy_lit(strm, in + pos - plit, plit + skip, more || skip < rem);
+				pos += skip;
+				rem -= skip;
+				plit = 0;
+				continue;
+			}
+#endif
 			continue;
 		}
 
@@ -981,6 +1011,9 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 			plit = 0;
 		}
 
+#if SLZ_LITERAL_SKIP
+		skip_ratio = 1;
+#endif
 		/* use mode 01 - fixed huffman */
 		if (strm->state == SLZ_ST_EOB) {
 			strm->state = SLZ_ST_FIXED;
