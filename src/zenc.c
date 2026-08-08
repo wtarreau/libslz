@@ -34,6 +34,7 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <sys/user.h>
 #include <fcntl.h>
 #include "slz.h"
@@ -110,6 +111,10 @@ int main(int argc, char **argv)
 	unsigned long long totout = 0;
 	int buffer_mode = 0;
 	int loops = 1;
+	int round = 0;          /* index of the pass being run */
+	int timed_round;        /* index of the pass the measurement starts on */
+	struct timeval tv_beg, tv_end;
+	unsigned long long timed_in = 0;
 	int console = 1;
 	int level   = 3;
 	int verbose = 0;
@@ -302,7 +307,20 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* When looping, the first pass is not measured: it is the one that
+	 * faults the input in and warms the caches, and counting it would
+	 * report the cost of the I/O rather than that of the compression.
+	 * A single pass is measured as-is, there is nothing else to report.
+	 */
+	timed_round = (loops > 1);
+	gettimeofday(&tv_beg, NULL); /* in case no pass runs at all, eg -l 0 */
+
 	while (loops--) {
+		if (round == timed_round) {
+			timed_in = totin;
+			gettimeofday(&tv_beg, NULL);
+		}
+
 		slz_init(&strm, !!level, format);
 
 		outblen = ofs = 0;
@@ -375,10 +393,23 @@ int main(int argc, char **argv)
 			/* this is a seeked file, let's rewind it now */
 			lseek(fd, 0, SEEK_SET);
 		}
+		round++;
 	}
-	if (verbose)
-		fprintf(stderr, "totin=%llu totout=%llu ratio=%.2f%% crc32=%08x\n",
-		        totin, totout, totout * 100.0 / totin, strm.crc32);
+	gettimeofday(&tv_end, NULL);
+
+	if (verbose) {
+		/* <timed_in> holds the input already compressed when the clock
+		 * was started, so the difference is what the measured passes
+		 * went through. MB/s are decimal megabytes per second.
+		 */
+		double sec = (tv_end.tv_sec  - tv_beg.tv_sec) +
+		             (tv_end.tv_usec - tv_beg.tv_usec) / 1000000.0;
+		unsigned long long done = totin - timed_in;
+
+		fprintf(stderr, "totin=%llu totout=%llu ratio=%.2f%% crc32=%08x time=%.3fs %.1fMB/s\n",
+		        totin, totout, totout * 100.0 / totin, strm.crc32,
+		        sec, sec > 0.0 ? done / sec / 1000000.0 : 0.0);
+	}
 
 	return error;
 }
