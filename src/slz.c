@@ -373,7 +373,7 @@ static inline void enqueue24(struct slz_stream *strm, uint64_t x, uint32_t xbits
 	uint32_t qbits = strm->qbits + xbits;
 
 #if SLZ_DIRECT_ENQUEUE24
-	*(uint32_t *)strm->outbuf = queue;
+	write_le32(strm->outbuf, queue);
 	queue >>= qbits & ~7U;
 
 	strm->queue = queue;
@@ -381,7 +381,7 @@ static inline void enqueue24(struct slz_stream *strm, uint64_t x, uint32_t xbits
 	strm->qbits = qbits & 7;
 #else
 	if (__builtin_expect(qbits >= 32, 1)) {
-		*(uint32_t *)strm->outbuf = queue;
+		write_le32(strm->outbuf, queue);
 		queue >>= 32;
 		qbits -= 32;
 		strm->outbuf += 4;
@@ -484,14 +484,7 @@ static void enqueue24(struct slz_stream *strm, uint32_t x, uint32_t xbits)
 	uint32_t qbits = strm->qbits + xbits;
 
 #if SLZ_DIRECT_ENQUEUE24
-#ifndef UNALIGNED_LE_OK
-	strm->outbuf[0] = queue;
-	strm->outbuf[1] = queue >> 8;
-	strm->outbuf[2] = queue >> 16;
-	strm->outbuf[3] = queue >> 24;
-#else
-	*(uint32_t *)strm->outbuf = queue;
-#endif
+	write_le32(strm->outbuf, queue);
 	queue >>= qbits & ~7U;
 	strm->outbuf += qbits >> 3;
 	strm->qbits = qbits & 7;
@@ -499,12 +492,7 @@ static void enqueue24(struct slz_stream *strm, uint32_t x, uint32_t xbits)
 	return;
 #endif
 	if (qbits >= 16) {
-#ifndef UNALIGNED_LE_OK
-		strm->outbuf[0] = queue;
-		strm->outbuf[1] = queue >> 8;
-#else
-		*(uint16_t *)strm->outbuf = queue;
-#endif
+		write_le16(strm->outbuf, queue);
 		strm->outbuf += 2;
 		queue >>= 16;
 		qbits -= 16;
@@ -574,18 +562,14 @@ static inline void copy_8b(struct slz_stream *strm, uint32_t x)
 /* only valid if buffer is already aligned */
 static inline void copy_16b(struct slz_stream *strm, uint32_t x)
 {
-	strm->outbuf[0] = x;
-	strm->outbuf[1] = x >> 8;
+	write_le16(strm->outbuf, x);
 	strm->outbuf += 2;
 }
 
 /* only valid if buffer is already aligned */
 static inline void copy_32b(struct slz_stream *strm, uint32_t x)
 {
-	strm->outbuf[0] = x;
-	strm->outbuf[1] = x >> 8;
-	strm->outbuf[2] = x >> 16;
-	strm->outbuf[3] = x >> 24;
+	write_le32(strm->outbuf, x);
 	strm->outbuf += 4;
 }
 
@@ -624,8 +608,7 @@ static void copy_lit(struct slz_stream *strm, const void *buf, uint32_t len, int
 
 		enqueue8(strm, !(more || len), 3); // BFINAL = !more ; BTYPE = 00
 		flush_bits(strm);
-		copy_16b(strm, len2);  // len2
-		copy_16b(strm, ~len2); // nlen2
+		copy_32b(strm, (~len2 << 16) + len2);
 		memcpy(strm->outbuf, buf, len2);
 		buf += len2;
 		strm->outbuf += len2;
