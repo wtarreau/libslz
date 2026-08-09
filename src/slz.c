@@ -750,7 +750,7 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 	uint64_t ent;
 
 #if SLZ_LITERAL_SKIP
-	long skip_ratio = 1;
+	long skip_ratio = 0;
 #endif
 	uint32_t plit = 0;
 	uint32_t bit9 = 0;
@@ -856,10 +856,10 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 			 * skipped each time so that a long incompressible block
 			 * costs less and less to walk over. A match resets it.
 			 */
-			if (plit >= 4096) {
+			if (plit >= 2048) {
 				long skip = rem >= skip_ratio * 4096 ? skip_ratio * 4096 : rem;
-				skip_ratio *= 2;
 
+				skip_ratio = (skip_ratio * 2 + 1) & 7; // capped exponential: 0,1,3,7 and stays at 7
 				copy_lit(strm, in + pos - plit, plit + skip, more || skip < rem);
 				pos += skip;
 				rem -= skip;
@@ -1012,7 +1012,7 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 		}
 
 #if SLZ_LITERAL_SKIP
-		skip_ratio = 1;
+		skip_ratio = 0;
 #endif
 		/* use mode 01 - fixed huffman */
 		if (strm->state == SLZ_ST_EOB) {
