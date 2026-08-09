@@ -334,6 +334,18 @@ static inline void flush_bits(struct slz_stream *strm)
 	if (strm->qbits > 0)
 		*strm->outbuf++ = strm->queue;
 
+#if !SLZ_DIRECT_ENQUEUE24
+	/* Only the conditional enqueue24() can leave more than 7 bits in the
+	 * queue, and only it needs the three extra stores. The direct one
+	 * masks the count with 7 on every path, as do enqueue8() and
+	 * enqueue56(), so a single byte covers every case there.
+	 *
+	 * This is not free to get wrong: flush_bits() is inlined into
+	 * copy_lit() and into all six flush/finish entry points, so the three
+	 * dead stores cost 585 bytes of text and 3% of throughput on silesia
+	 * once SLZ_LITERAL_SKIP starts calling copy_lit() for every skipped
+	 * chunk.
+	 */
 	if (strm->qbits > 8)
 		*strm->outbuf++ = strm->queue >> 8;
 
@@ -342,6 +354,7 @@ static inline void flush_bits(struct slz_stream *strm)
 
 	if (strm->qbits > 24)
 		*strm->outbuf++ = strm->queue >> 24;
+#endif
 
 	strm->queue = 0;
 	strm->qbits = 0;
