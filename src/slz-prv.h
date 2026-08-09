@@ -95,6 +95,34 @@
 })
 
 
+/* writes an unaligned 32-bit word in little endian order */
+static inline void write_le32(void *p, uint32_t v)
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	union {  uint32_t u32; } __attribute__((packed)) *u = p;
+	u->u32 = v;
+#else
+	uint8_t *u8 = p;
+	u8[0] = v;
+	u8[1] = v >> 8;
+	u8[2] = v >> 16;
+	u8[3] = v >> 24;
+#endif
+}
+
+/* writes an unaligned 16-bit word in little order */
+static inline void write_le16(void *p, uint16_t v)
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	union {  uint16_t u16; } __attribute__((packed)) *u = p;
+	u->u16 = v;
+#else
+	uint8_t *u8 = p;
+	u8[0] = v;
+	u8[1] = v >> 8;
+#endif
+}
+
 /* uses the most suitable crc32 function to update crc on <buf, len> */
 static inline uint32_t update_crc(uint32_t crc, const void *buf, int len)
 {
