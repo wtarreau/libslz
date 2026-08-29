@@ -623,7 +623,7 @@ static void copy_lit(struct slz_stream *strm, const void *buf, uint32_t len, int
  * SLZ_LITERAL_SKIP with limited literal lengths. <more> indicates that there
  * are data past buf + <len>. Only supports fixed encoding.
  */
-__attribute__((always_inline)) inline
+__attribute__((unused))
 static void copy_lit_small(struct slz_stream *strm, const void *buf, uint32_t len, int more)
 {
 	if (strm->state != SLZ_ST_EOB)
@@ -862,10 +862,11 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 			 * costs less and less to walk over. A match resets it.
 			 */
 			if (plit >= 2048) {
+				/* be careful: plit+skip must never be >= 65535 */
 				long skip = rem >= skip_ratio * 4096 ? skip_ratio * 4096 : rem;
 
 				skip_ratio = (skip_ratio * 2 + 1) & 7; // capped exponential: 0,1,3,7 and stays at 7
-				copy_lit(strm, in + pos - plit, plit + skip, more || skip < rem);
+				copy_lit_small(strm, in + pos - plit, plit + skip, more || skip < rem);
 				pos += skip;
 				rem -= skip;
 				plit = 0;
@@ -1114,8 +1115,13 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 		else
 			cost = (strm->state == SLZ_ST_EOB) ? SLZ_LAST_COST_EOB : SLZ_LAST_COST;
 
-		if (bit9 >= cost || strm->debt >= SLZ_MAX_DEBT)
+		if (bit9 >= cost || strm->debt >= SLZ_MAX_DEBT) {
+#if SLZ_LITERAL_SKIP
+			copy_lit_small(strm, in + pos - plit, plit, more);
+#else
 			copy_lit(strm, in + pos - plit, plit, more);
+#endif
+		}
 		else
 			copy_lit_huff(strm, in + pos - plit, plit, more);
 
