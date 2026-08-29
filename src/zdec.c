@@ -66,9 +66,10 @@ int main(int argc, char **argv)
 	unsigned char *obuf, *inbuf;
 	const char *file = NULL;
 	struct uslz_stream state;
+	unsigned long long decoded_total = 0;
+	unsigned long long tot_in = 0;
 	long ring_size = MIN_RING;
 	long in_size = 8192;
-	long decoded_total;
 	int test_only = 0;
 	int verbose = 0;
 	int format = -1;       /* -1 = detect */
@@ -146,8 +147,6 @@ int main(int argc, char **argv)
 			exit(1);
 		}
 
-		decoded_total = 0;
-
 		if (format < 0)
 			ret = uslz_init(&state, obuf, ring_size);
 		else
@@ -183,6 +182,7 @@ int main(int argc, char **argv)
 			case USLZ_DECODE_OUT_OF_SPACE:
 			case USLZ_DECODE_OUT_OF_DATA:
 				decoded_total += decoded_len;
+				tot_in += consumed;
 
 				while (!test_only && decoded_len) {
 					long wret = write(1, decoded, decoded_len);
@@ -212,9 +212,11 @@ int main(int argc, char **argv)
 				exit(1);
 			}
 		}
+	}
 
-		if (verbose)
-			fprintf(stderr, "totout=%ld\n", decoded_total);
+	if (verbose) {
+		fprintf(stderr, "totin=%llu totout=%llu\n",
+		        tot_in, decoded_total);
 	}
 	return 0;
 }
