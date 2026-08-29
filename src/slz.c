@@ -330,7 +330,7 @@ static inline long memmatch(const unsigned char *a, const unsigned char *b, long
 
 		xor = *(uint16_t *)&a[len] ^ *(uint16_t *)&b[len];
 		if (xor)
-			return len + (__builtin_ctz(xor) >> 3);
+			return len + !(uint8_t)xor;
 		len += 2;
 	}
 
