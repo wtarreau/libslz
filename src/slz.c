@@ -870,7 +870,7 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 		 * rolling back offsets when we finally give up and send_as_lit.
 		 */
 		back = 0;
-		if (__builtin_expect(plit != 0 && last >= 8, 1)) {
+		if (plit != 0 && last >= 8) {
 			long bmax = (plit < 8) ? plit : 8;
 
 #if defined(UNALIGNED_LE_OK) && defined(__SIZEOF_LONG__) && __SIZEOF_LONG__ >= 8
