@@ -292,47 +292,51 @@ static inline long memmatch(const unsigned char *a, const unsigned char *b, long
 	long len = 0;
 
 #ifdef UNALIGNED_LE_OK
-	unsigned long xor;
 
 	while (len + 2 * (long)sizeof(long) - 1 < max) {
+		unsigned long xor;
+
 		xor = *(unsigned long *)&a[len] ^ *(unsigned long *)&b[len];
 		if (xor)
-			goto end;
+			return len + (__builtin_ctzl(xor) >> 3);
 		len += (long)sizeof(long);
 
 		xor = *(unsigned long *)&a[len] ^ *(unsigned long *)&b[len];
 		if (xor)
-			goto end;
+			return len + (__builtin_ctzl(xor) >> 3);
 		len += (long)sizeof(long);
 	}
 
 	if (len + (long)sizeof(long) - 1 < max) {
+		unsigned long xor;
+
 		xor = *(unsigned long *)&a[len] ^ *(unsigned long *)&b[len];
 		if (xor)
-			goto end;
+			return len + (__builtin_ctzl(xor) >> 3);
 		len += (long)sizeof(long);
 	}
 
 	if (sizeof(long) > 4 && len + 3 < max) {
+		uint32_t xor;
+
 		xor = *(uint32_t *)&a[len] ^ *(uint32_t *)&b[len];
 		if (xor)
-			goto end;
+			return len + (__builtin_ctz(xor) >> 3);
 		len += 4;
 	}
 
 	if (len + 1 < max) {
+		uint16_t xor;
+
 		xor = *(uint16_t *)&a[len] ^ *(uint16_t *)&b[len];
 		if (xor)
-			goto end;
+			return len + (__builtin_ctz(xor) >> 3);
 		len += 2;
 	}
 
 	if (len < max && a[len] == b[len])
 		len++;
 	return len;
-
- end:
-	return len + (__builtin_ctzl((unsigned long)xor) >> 3);
 
 #else // UNALIGNED_LE_OK
 	/* This is the generic version for big endian or unaligned-incompatible
