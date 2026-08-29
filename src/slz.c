@@ -294,27 +294,26 @@ static inline long memmatch(const unsigned char *a, const unsigned char *b, long
 #ifdef UNALIGNED_LE_OK
 	unsigned long xor;
 
-	while (1) {
-		if ((long)(len + 2 * sizeof(long)) > max) {
-			while (len < max) {
-				if (a[len] != b[len])
-					break;
-				len++;
-			}
-			return len;
-		}
-
+	while ((long)(len + 2 * sizeof(long)) <= max) {
 		xor = *(long *)&a[len] ^ *(long *)&b[len];
 		if (xor)
-			break;
+			goto end;
 		len += sizeof(long);
 
 		xor = *(long *)&a[len] ^ *(long *)&b[len];
 		if (xor)
-			break;
+			goto end;
 		len += sizeof(long);
 	}
 
+	while (len < max) {
+		if (a[len] != b[len])
+			break;
+		len++;
+	}
+	return len;
+
+ end:
 #if defined(__x86_64__) || defined(__i386__) || defined(__i486__) || defined(__i586__) || defined(__i686__)
 	/* x86 has bsf. We know that xor is non-null here */
 	asm("bsf %1,%0\n" : "=r"(xor) : "0" (xor));
