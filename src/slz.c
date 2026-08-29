@@ -295,19 +295,19 @@ static inline long memmatch(const unsigned char *a, const unsigned char *b, long
 	unsigned long xor;
 
 	while (len + 2 * (long)sizeof(long) - 1 < max) {
-		xor = *(long *)&a[len] ^ *(long *)&b[len];
+		xor = *(unsigned long *)&a[len] ^ *(unsigned long *)&b[len];
 		if (xor)
 			goto end;
 		len += (long)sizeof(long);
 
-		xor = *(long *)&a[len] ^ *(long *)&b[len];
+		xor = *(unsigned long *)&a[len] ^ *(unsigned long *)&b[len];
 		if (xor)
 			goto end;
 		len += (long)sizeof(long);
 	}
 
 	if (len + (long)sizeof(long) - 1 < max) {
-		xor = *(long *)&a[len] ^ *(long *)&b[len];
+		xor = *(unsigned long *)&a[len] ^ *(unsigned long *)&b[len];
 		if (xor)
 			goto end;
 		len += (long)sizeof(long);
