@@ -83,6 +83,16 @@ static uint32_t fh_dist_table[32768];
 # define SLZ_DIRECT_ENQUEUE56 0
 #endif
 
+/* Also indexes the positions covered by the beginning of a match. This is quite
+ * important for example on HTML or other streams with lots of varying prefixes,
+ * especially when combined with the backwards match, because otherwise a likely
+ * repeating element will not be indexed, and when the window advances, its ref
+ * is likely to disappear, causing the next one to experience a miss.
+ */
+#ifndef SLZ_INSERT_SKIPPED
+# define SLZ_INSERT_SKIPPED 1
+#endif
+
 /* Enables growing a match backwards over the literals that are still pending,
  * see slz_rfc1951_encode(). Costs a little CPU on every match and gains about
  * 1% of output.
@@ -659,6 +669,28 @@ static void reset_refs(union ref *refs, long count)
 	memset(refs, 0xFE, count);
 }
 
+/* Inserts position <p> of input buffer <in> into the reference table <refs>.
+ * Reads the 4 bytes at in[p], so the caller must guarantee that in[p + 3] is
+ * within the input buffer.
+ */
+static inline void insert_ref(union ref *refs, const unsigned char *in, unsigned long p)
+{
+#ifdef UNALIGNED_LE_OK
+	uint32_t w = *(uint32_t *)&in[p];
+#else
+	uint32_t w = ((uint32_t)in[p]) | ((uint32_t)in[p + 1] << 8) |
+	             ((uint32_t)in[p + 2] << 16) | ((uint32_t)in[p + 3] << 24);
+#endif
+	uint32_t h = slz_hash(w);
+
+	if (sizeof(long) >= 8)
+		refs[h].by64 = ((uint64_t)p) + ((uint64_t)w << 32);
+	else {
+		refs[h].by32.pos = p;
+		refs[h].by32.word = w;
+	}
+}
+
 /* Number of bits wasted by the 9-bit literals above which it becomes
  * preferable to send the pending literals as a stored block. It corresponds to
  * the cost of leaving the fixed huffman encoding and coming back to it: EOB
@@ -993,6 +1025,21 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 		bit9 = 0;
 		rem -= mlen - back;
 		pos += mlen - back;
+
+#if SLZ_INSERT_SKIPPED
+		/* try to index the matched entry to improve the likelyhood
+		 * that a similar sequence will be a hit next time. Note that
+		 * after all we don't really need 6 here, 4 are enough since
+		 * we start counting after the end of the match, but keeping
+		 * a value higher than the loop's condition prevents the
+		 * compiler from moving the code around and slowing it down.
+		 */
+		if (__builtin_expect(rem >= 6, 1)) {
+			insert_ref(refs, in, pos - mlen + 3);
+			insert_ref(refs, in, pos - mlen + 2);
+			insert_ref(refs, in, pos - mlen + 1);
+		}
+#endif // SLZ_INSERT_SKIPPED
 
 #ifndef UNALIGNED_FASTER
 		/* same as before the loop, this is only used when continuing
