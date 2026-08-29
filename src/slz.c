@@ -617,6 +617,27 @@ static void copy_lit(struct slz_stream *strm, const void *buf, uint32_t len, int
 	strm->state = more ? SLZ_ST_EOB : SLZ_ST_DONE;
 }
 
+/* copies <len> litterals from <buf>. at once. <len> must not be null and must
+ * be lower than or equal to 65535, which can be guaranteed when using
+ * SLZ_LITERAL_SKIP with limited literal lengths. <more> indicates that there
+ * are data past buf + <len>. Only supports fixed encoding.
+ */
+__attribute__((always_inline)) inline
+static void copy_lit_small(struct slz_stream *strm, const void *buf, uint32_t len, int more)
+{
+	if (strm->state != SLZ_ST_EOB)
+		send_eob(strm);
+
+	strm->state = more ? SLZ_ST_EOB : SLZ_ST_DONE;
+
+	enqueue8(strm, !more, 3); // BFINAL = !more ; BTYPE = 00
+	flush_bits(strm);
+	copy_16b(strm, len);
+	copy_16b(strm, ~len);
+	memcpy(strm->outbuf, buf, len);
+	strm->outbuf += len;
+}
+
 /* copies <len> litterals from <buf>. <more> indicates that there are data past
  * buf + <len>. <len> must not be null.
  */
