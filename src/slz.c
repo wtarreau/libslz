@@ -294,33 +294,33 @@ static inline long memmatch(const unsigned char *a, const unsigned char *b, long
 #ifdef UNALIGNED_LE_OK
 	unsigned long xor;
 
-	while ((long)(len + 2 * sizeof(long)) <= max) {
+	while (len + 2 * (long)sizeof(long) - 1 < max) {
 		xor = *(long *)&a[len] ^ *(long *)&b[len];
 		if (xor)
 			goto end;
-		len += sizeof(long);
+		len += (long)sizeof(long);
 
 		xor = *(long *)&a[len] ^ *(long *)&b[len];
 		if (xor)
 			goto end;
-		len += sizeof(long);
+		len += (long)sizeof(long);
 	}
 
-	if ((long)(len + sizeof(long)) <= max) {
+	if (len + (long)sizeof(long) - 1 < max) {
 		xor = *(long *)&a[len] ^ *(long *)&b[len];
 		if (xor)
 			goto end;
-		len += sizeof(long);
+		len += (long)sizeof(long);
 	}
 
-	if (sizeof(long) > 4 && (long)(len + 4) <= max) {
+	if (sizeof(long) > 4 && len + 3 < max) {
 		xor = *(uint32_t *)&a[len] ^ *(uint32_t *)&b[len];
 		if (xor)
 			goto end;
 		len += 4;
 	}
 
-	if ((long)(len + 2) <= max) {
+	if (len + 1 < max) {
 		xor = *(uint16_t *)&a[len] ^ *(uint16_t *)&b[len];
 		if (xor)
 			goto end;
@@ -335,7 +335,7 @@ static inline long memmatch(const unsigned char *a, const unsigned char *b, long
 #if defined(__x86_64__) || defined(__i386__) || defined(__i486__) || defined(__i586__) || defined(__i686__)
 	/* x86 has bsf. We know that xor is non-null here */
 	asm("bsf %1,%0\n" : "=r"(xor) : "0" (xor));
-	return len + xor / 8;
+	return len + (long)(xor / 8);
 #else
 	if (sizeof(long) > 4 && !(xor & 0xffffffff)) {
 		/* This code is optimized out on 32-bit archs, but we still
