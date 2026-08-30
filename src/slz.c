@@ -612,17 +612,15 @@ static void copy_lit(struct slz_stream *strm, const void *buf, uint32_t len, int
 {
 	uint32_t len2;
 
+	if (strm->state != SLZ_ST_EOB)
+		send_eob(strm);
+
 	do {
 		len2 = len;
 		if (__builtin_expect(len2 > 65535, 0))
 			len2 = 65535;
 
 		len -= len2;
-
-		if (strm->state != SLZ_ST_EOB)
-			send_eob(strm);
-
-		strm->state = (more || len) ? SLZ_ST_EOB : SLZ_ST_DONE;
 
 		enqueue8(strm, !(more || len), 3); // BFINAL = !more ; BTYPE = 00
 		flush_bits(strm);
@@ -631,7 +629,9 @@ static void copy_lit(struct slz_stream *strm, const void *buf, uint32_t len, int
 		memcpy(strm->outbuf, buf, len2);
 		buf += len2;
 		strm->outbuf += len2;
-	} while (len);
+	} while (__builtin_expect(len, 0));
+
+	strm->state = more ? SLZ_ST_EOB : SLZ_ST_DONE;
 }
 
 /* copies <len> litterals from <buf>. <more> indicates that there are data past
