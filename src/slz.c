@@ -364,8 +364,10 @@ static inline void enqueue8(struct slz_stream *strm, uint32_t x, uint32_t xbits)
 /* flush the queue and align to next byte */
 static inline void flush_bits(struct slz_stream *strm)
 {
-	if (strm->qbits > 0)
-		*strm->outbuf++ = strm->queue;
+	if (!strm->qbits)
+		return;
+
+	*strm->outbuf++ = strm->queue;
 
 #if !SLZ_DIRECT_ENQUEUE24
 	/* Only the conditional enqueue24() can leave more than 7 bits in the
@@ -474,8 +476,10 @@ static inline void enqueue8(struct slz_stream *strm, uint32_t x, uint32_t xbits)
 /* align to next byte */
 static inline void flush_bits(struct slz_stream *strm)
 {
-	if (strm->qbits > 0)
-		*strm->outbuf++ = strm->queue;
+	if (!strm->qbits)
+		return;
+
+	*strm->outbuf++ = strm->queue;
 
 #if !SLZ_DIRECT_ENQUEUE8
 	if (strm->qbits > 8)
