@@ -406,9 +406,10 @@ int main(int argc, char **argv)
 		             (tv_end.tv_usec - tv_beg.tv_usec) / 1000000.0;
 		unsigned long long done = totin - timed_in;
 
-		fprintf(stderr, "totin=%llu totout=%llu ratio=%.2f%% crc32=%08x time=%.3fs %.1fMB/s\n",
+		fprintf(stderr, "totin=%llu totout=%llu ratio=%.2f%% crc32=%08x time=%.3fs %.1fMB/s saving %.1fMB/s\n",
 		        totin, totout, totout * 100.0 / totin, strm.crc32,
-		        sec, sec > 0.0 ? done / sec / 1000000.0 : 0.0);
+		        sec, sec > 0.0 ? done / sec / 1000000.0 : 0.0,
+		        (sec > 0.0 ? done / sec / 1000000.0 : 0.0) * (1.0 - (double)totout / totin));
 	}
 
 	return error;
