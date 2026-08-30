@@ -592,6 +592,7 @@ static inline void send_eob(struct slz_stream *strm)
 /* copies <len> litterals from <buf>. <more> indicates that there are data past
  * buf + <len>. <len> must not be null.
  */
+__attribute__((unused))
 static void copy_lit(struct slz_stream *strm, const void *buf, uint32_t len, int more)
 {
 	uint32_t len2;
