@@ -53,17 +53,25 @@ static uint32_t fh_dist_table[32768];
 
 /* directly write 32 bits at a time to output for up to 24 bits */
 #ifndef SLZ_DIRECT_ENQUEUE24
-# define SLZ_DIRECT_ENQUEUE24 0
+# if defined(UNALIGNED_LE_OK)
+#  define SLZ_DIRECT_ENQUEUE24 1
+# else
+#  define SLZ_DIRECT_ENQUEUE24 0
+# endif
 #endif
 
 /* directly write 8 bits at a time to the output */
 #ifndef SLZ_DIRECT_ENQUEUE8
-# define SLZ_DIRECT_ENQUEUE8 0
+# define SLZ_DIRECT_ENQUEUE8 SLZ_DIRECT_ENQUEUE24
 #endif
 
 /* directly write 64 bits at a tome to output for up to 56 bits */
 #ifndef SLZ_DIRECT_ENQUEUE56
-# define SLZ_DIRECT_ENQUEUE56 0
+# if defined(USE_64BIT_QUEUE) && defined(UNALIGNED_LE_OK)
+#  define SLZ_DIRECT_ENQUEUE56 1
+# else
+#  define SLZ_DIRECT_ENQUEUE56 0
+# endif
 #endif
 
 /* The direct enqueue8() writes a single byte, which is only enough because it
