@@ -599,8 +599,8 @@ static void copy_lit(struct slz_stream *strm, const void *buf, uint32_t len, int
 
 		len -= len2;
 
-		enqueue8(strm, !(more || len), 3); // BFINAL = !more ; BTYPE = 00
-		flush_bits(strm);
+		/* wire BFINAL (!more), BTYPE (00) and round to the next byte boundary */
+		enqueue24(strm, !(more || len), 3 + ((5 - strm->qbits) & 7));
 		copy_32b(strm, (~len2 << 16) + len2);
 		memcpy(strm->outbuf, buf, len2);
 		buf += len2;
@@ -623,8 +623,8 @@ static void copy_lit_small(struct slz_stream *strm, const void *buf, uint32_t le
 
 	strm->state = more ? SLZ_ST_EOB : SLZ_ST_DONE;
 
-	enqueue8(strm, !more, 3); // BFINAL = !more ; BTYPE = 00
-	flush_bits(strm);
+	/* wire BFINAL (!more), BTYPE (00) and round to the next byte boundary */
+	enqueue24(strm, !more, 3 + ((5 - strm->qbits) & 7));
 	copy_16b(strm, len);
 	copy_16b(strm, ~len);
 	memcpy(strm->outbuf, buf, len);
