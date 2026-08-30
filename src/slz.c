@@ -1004,7 +1004,11 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 			 * only those sent in huffman mode add to the debt.
 			 */
 			if (bit9 >= SLZ_SWITCH_COST || strm->debt >= SLZ_MAX_DEBT)
+#if SLZ_LITERAL_SKIP
+				copy_lit_small(strm, in + pos - back - plit, plit, 1);
+#else
 				copy_lit(strm, in + pos - back - plit, plit, 1);
+#endif
 			else {
 				copy_lit_huff(strm, in + pos - back - plit, plit, 1);
 				strm->debt += bit9;
