@@ -360,7 +360,7 @@ static inline long memmatch(const unsigned char *a, const unsigned char *b, long
 #endif
 }
 
-#if defined(__SIZEOF_LONG__) && (__SIZEOF_LONG__ - 0 > 4) && defined(UNALIGNED_LE_OK)
+#if defined(__SIZEOF_LONG__) && (__SIZEOF_LONG__ - 0 > 4)
 
 /* enqueue code x of <xbits> bits (LSB aligned, at most 24) and copy complete
  * 32-bit words into output buffer. X must not contain non-zero bits above
@@ -470,7 +470,7 @@ static inline void flush_bits(struct slz_stream *strm)
 	strm->qbits = 0;
 }
 
-#else /* non-64 bit or aligned or big endian */
+#else /* non-64 bit */
 
 /* enqueue code x of <xbits> bits (LSB aligned, at most 24) and copy complete
  * bytes into out buf. X must not contain non-zero bits above xbits. Prefer
