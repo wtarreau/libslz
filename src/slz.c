@@ -618,13 +618,17 @@ static void copy_lit(struct slz_stream *strm, const void *buf, uint32_t len, int
 __attribute__((unused))
 static void copy_lit_small(struct slz_stream *strm, const void *buf, uint32_t len, int more)
 {
-	if (strm->state != SLZ_ST_EOB)
-		send_eob(strm);
+	int eob_shift = (strm->state == SLZ_ST_EOB) ? 0 : 7;
 
+	/* explanation: if there is no EOB yet, we have to send one.
+	 * It's 0 encoded over 7 bits. Then we have to copy !more into BFINAL
+	 * (one bit), and 00 in btype (two bits). Finally we pad to the next
+	 * byte. So we add 0 or 7 bits for EOB, followed by 3 then by 0 to 7
+	 * bits for alignment. That's 3 to 17 bits.
+	 */
+	enqueue24(strm, (!more) << eob_shift, 3 + eob_shift + (7 & -(3 + eob_shift + strm->qbits))); // EOB + BFINAL + BTYPE
 	strm->state = more ? SLZ_ST_EOB : SLZ_ST_DONE;
 
-	/* wire BFINAL (!more), BTYPE (00) and round to the next byte boundary */
-	enqueue24(strm, !more, 3 + ((5 - strm->qbits) & 7));
 	copy_16b(strm, len);
 	copy_16b(strm, ~len);
 	memcpy(strm->outbuf, buf, len);
