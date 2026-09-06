@@ -106,7 +106,7 @@ static uint32_t fh_dist_table[32768];
  * of a slightly reduced compression ratio.
  */
 #ifndef SLZ_LITERAL_SKIP
-# define SLZ_LITERAL_SKIP 0
+# define SLZ_LITERAL_SKIP 1
 #endif
 
 /* Enables growing a match backwards over the literals that are still pending,
