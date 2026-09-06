@@ -319,7 +319,7 @@ static inline long memmatch(const unsigned char *a, const unsigned char *b, long
 		len += (long)sizeof(long);
 	}
 
-	if (len + (long)sizeof(long) - 1 < max) {
+	while (len + (long)sizeof(long) - 1 < max) {
 		unsigned long xor;
 
 		xor = *(unsigned long *)&a[len] ^ *(unsigned long *)&b[len];
