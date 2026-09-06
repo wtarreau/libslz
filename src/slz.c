@@ -103,10 +103,11 @@ static uint32_t fh_dist_table[32768];
 
 /* Enables growing a match backwards over the literals that are still pending,
  * see slz_rfc1951_encode(). Costs a little CPU on every match and gains about
- * 1% of output.
+ * 1% of output. Tests show that matching up to 2 bytes brings almost optimal
+ * results at minimal extra cost.
  */
 #ifndef SLZ_BACKWARD_MATCH
-# define SLZ_BACKWARD_MATCH 1
+# define SLZ_BACKWARD_MATCH 2
 #endif
 
 /* Log2 of the size of the hash table used for the references table. */
@@ -972,23 +973,42 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 		 * that it's both easier and faster this way than changing then
 		 * rolling back offsets when we finally give up and send_as_lit.
 		 */
-		if (__no_builtin_expect(plit != 0, 1) && last >= 8) {
-			long bmax = (plit < 8) ? plit : 8;
+		if (__no_builtin_expect(plit != 0, 1) && last >= MAX_C(sizeof(long), SLZ_BACKWARD_MATCH)) {
+			long bmax = MIN(plit, SLZ_BACKWARD_MATCH);
 			long back = 0;
 
 			if (bmax > 258 - mlen)
 				bmax = 258 - mlen;
 
-#if defined(UNALIGNED_LE_OK) && defined(__SIZEOF_LONG__) && __SIZEOF_LONG__ >= 8
-			uint64_t x = *(uint64_t *)&in[pos - 8] ^ *(uint64_t *)&in[last - 8];
-
-			back = x ? (__builtin_clzll(x) >> 3) : 8;
-			if (back > bmax)
-				back = bmax;
-#else
-			while (back < bmax && in[pos - back - 1] == in[last - back - 1])
-				back++;
+#if defined(UNALIGNED_LE_OK)
+			if (SLZ_BACKWARD_MATCH == 2) { // 43.32%, best speed vs savings
+				uint16_t x = *(uint16_t *)&in[pos - 2] ^ *(uint16_t *)&in[last - 2];
+				back = x & 0xff00 ? 0 : x ? 1 : 2;
+				if (back > bmax)
+					back = bmax;
+			} else if (SLZ_BACKWARD_MATCH == 3 || SLZ_BACKWARD_MATCH == 4) { // 32 bits: 43.31% or 43.30%
+				uint32_t x = *(uint32_t *)&in[pos - 4] ^ *(uint32_t *)&in[last - 4];
+				back = x & 0xffff0000u ?
+					x & 0xff000000u ? 0 : 1 :
+					x & 0xffffff00u ? 2 :
+					x ? 3 : SLZ_BACKWARD_MATCH; // 3 or 4, test eliminated at 3
+				if (back > bmax)
+					back = bmax;
+			} else if (SLZ_BACKWARD_MATCH == 8) { // 64 bits: 43.30%
+				uint64_t x = *(uint64_t *)&in[pos - 8] ^ *(uint64_t *)&in[last - 8];
+				back = x ? (__builtin_clzll(x) >> 3) : 8;
+				if (back > bmax)
+					back = bmax;
+			} else
 #endif
+			if (SLZ_BACKWARD_MATCH == 1) { // single-byte match: 43.39%
+				if (in[pos - 1] == in[last - 1])
+					back++;
+			}
+			else { /* unaligned not supported or match != 1/2/3/4/8 */
+				while (back < bmax && in[pos - back - 1] == in[last - back - 1])
+					back++;
+			}
 
 			if (back) {
 				/* OK now we're certain to use the match, we must rewind the
@@ -1010,7 +1030,7 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 				code = len_fh[mlen];
 			}
 		}
-#endif
+#endif // SLZ_BACKWARD_MATCH // otherwise 43.83%
 
 		/* first, copy pending literals */
 		if (plit) {
