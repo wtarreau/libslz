@@ -48,6 +48,53 @@
 #define HAVE_FAST_MULT
 #endif
 
+/* returns the max of <a> and <b>, must be constant since evaluated twice */
+#define MIN_C(a, b) ({				\
+	(a < b) ? a : b;			\
+})
+
+/* returns the min of <a> and <b>; both must be of compatible types and are
+ * evaluated exactly once.
+ */
+#define MIN(a, b) ({				\
+	typeof(a) _a = (a);			\
+	typeof(a) _b = (b);			\
+	(_a < _b) ? _a : _b;			\
+})
+
+/* returns the min of <a> and <b>; both cast to type <t>, are evaluated exactly
+ * once.
+ */
+#define MIN_T(t, a, b) ({			\
+	t _a = (t)(a);				\
+	t _b = (t)(b);				\
+	(_a < _b) ? _a : _b;			\
+})
+
+/* returns the max of <a> and <b>, must be constant since evaluated twice */
+#define MAX_C(a, b) ({				\
+	(a > b) ? a : b;			\
+})
+
+/* returns the max of <a> and <b>; both must be of compatible types and are
+ * evaluated exactly once.
+ */
+#define MAX(a, b) ({				\
+	typeof(a) _a = (a);			\
+	typeof(a) _b = (b);			\
+	(_a > _b) ? _a : _b;			\
+})
+
+/* returns the max of <a> and <b>; both cast to type <t>, are evaluated exactly
+ * once.
+ */
+#define MAX_T(t, a, b) ({			\
+	t _a = (t)(a);				\
+	t _b = (t)(b);				\
+	(_a > _b) ? _a : _b;			\
+})
+
+
 /* uses the most suitable crc32 function to update crc on <buf, len> */
 static inline uint32_t update_crc(uint32_t crc, const void *buf, int len)
 {
