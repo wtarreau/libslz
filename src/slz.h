@@ -310,8 +310,8 @@ struct uslz_stream {
 		 */
 		struct {
 			unsigned char buf[10];
+			unsigned char gzip_flags;
 			int buf_len;
-			char gzip_flags;
 		} hdr_detect;
 	};
 	short codelen_table[19*2-2];          /* Code-to-symbol conversion table for the alphabet
