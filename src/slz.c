@@ -593,35 +593,6 @@ static inline void send_eob(struct slz_stream *__restrict strm)
 	enqueue8(strm, 0, 7); // direct encoding of 256 = EOB (cf RFC1951)
 }
 
-/* copies <len> litterals from <buf>. <more> indicates that there are data past
- * buf + <len>. <len> must not be null.
- */
-__attribute__((unused))
-static void copy_lit(struct slz_stream *__restrict strm, const void *buf, uint32_t len, int more)
-{
-	uint32_t len2;
-
-	if (strm->state != SLZ_ST_EOB)
-		send_eob(strm);
-
-	do {
-		len2 = len;
-		if (__builtin_expect(len2 > 65535, 0))
-			len2 = 65535;
-
-		len -= len2;
-
-		/* wire BFINAL (!more), BTYPE (00) and round to the next byte boundary */
-		enqueue24(strm, !(more || len), 3 + ((5 - strm->qbits) & 7));
-		copy_32b(strm, (~len2 << 16) + len2);
-		memcpy(strm->outbuf, buf, len2);
-		buf += len2;
-		strm->outbuf += len2;
-	} while (__builtin_expect(len, 0));
-
-	strm->state = more ? SLZ_ST_EOB : SLZ_ST_DONE;
-}
-
 /* copies <len> litterals from <buf>. at once. <len> must not be null and must
  * be lower than or equal to 65535, which can be guaranteed when using
  * SLZ_LITERAL_SKIP with limited literal lengths. <more> indicates that there
@@ -645,6 +616,40 @@ static void copy_lit_small(struct slz_stream *__restrict strm, const void *buf, 
 	copy_16b(strm, ~len);
 	memcpy(strm->outbuf, buf, len);
 	strm->outbuf += len;
+}
+
+/* copies <len> litterals from <buf>. <more> indicates that there are data past
+ * buf + <len>. <len> must not be null.
+ */
+__attribute__((unused))
+static void copy_lit(struct slz_stream *__restrict strm, const void *buf, uint32_t len, int more)
+{
+	uint32_t len2;
+
+	if (len <= 65535)
+		return copy_lit_small(strm, buf, len, more);
+
+	if (strm->state != SLZ_ST_EOB)
+		send_eob(strm);
+
+	len2 = 65535;
+	len -= len2;
+
+	do {
+		/* wire BFINAL (!more), BTYPE (00) and round to the next byte boundary */
+		enqueue24(strm, !(more || len), 3 + ((5 - strm->qbits) & 7));
+		copy_32b(strm, (~len2 << 16) + len2);
+		memcpy(strm->outbuf, buf, len2);
+		buf += len2;
+		strm->outbuf += len2;
+		len2 = len;
+		if (__builtin_expect(len2 > 65535, 0))
+			len2 = 65535;
+
+		len -= len2;
+	} while (__builtin_expect(len2, 0));
+
+	strm->state = more ? SLZ_ST_EOB : SLZ_ST_DONE;
 }
 
 /* copies <len> litterals from <buf>. <more> indicates that there are data past
