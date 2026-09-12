@@ -867,25 +867,32 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, 
 			bit9 += ((unsigned char)word >= 144);
 			pos++;
 
-#if SLZ_LITERAL_SKIP
 			/* Incompressible data: once enough literals have accumulated
 			 * without a single match, stop looking for a while and just
 			 * dump what follows as literal blocks, doubling the amount
 			 * skipped each time so that a long incompressible block
 			 * costs less and less to walk over. A match resets it.
 			 */
-			if (plit >= 2048) {
-				/* be careful: plit+skip must never be >= 65535 */
-				long skip = rem >= skip_ratio * 4096 ? skip_ratio * 4096 : rem;
+			if (!(plit & 2047)) {
+#if !SLZ_LITERAL_SKIP
+				if (__builtin_expect(plit == 0x8000, 1)) {
+					copy_lit_small(strm, in + pos - plit, plit, more);
+					plit = 0;
+				}
+#else
+				{
+					/* be careful: plit+skip must never be >= 65535 */
+					long skip = rem >= skip_ratio * 4096 ? skip_ratio * 4096 : rem;
 
-				skip_ratio = (skip_ratio * 2 + 1) & 7; // capped exponential: 0,1,3,7 and stays at 7
-				copy_lit_small(strm, in + pos - plit, plit + skip, more || skip < rem);
-				pos += skip;
-				rem -= skip;
-				plit = 0;
+					skip_ratio = (skip_ratio * 2 + 1) & 7; // capped exponential: 0,1,3,7 and stays at 7
+					copy_lit_small(strm, in + pos - plit, plit + skip, more || skip < rem);
+					pos += skip;
+					rem -= skip;
+					plit = 0;
+				}
+#endif
 				continue;
 			}
-#endif
 			continue;
 		}
 
@@ -1058,11 +1065,7 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, 
 			 * only those sent in huffman mode add to the debt.
 			 */
 			if (bit9 >= SLZ_SWITCH_COST || strm->debt >= SLZ_MAX_DEBT)
-#if SLZ_LITERAL_SKIP
 				copy_lit_small(strm, in + pos - plit, plit, 1);
-#else
-				copy_lit(strm, in + pos - plit, plit, 1);
-#endif
 			else {
 				copy_lit_huff(strm, in + pos - plit, plit, 1);
 				strm->debt += bit9;
@@ -1166,13 +1169,8 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, 
 		else
 			cost = (strm->state == SLZ_ST_EOB) ? SLZ_LAST_COST_EOB : SLZ_LAST_COST;
 
-		if (bit9 >= cost || strm->debt >= SLZ_MAX_DEBT) {
-#if SLZ_LITERAL_SKIP
+		if (bit9 >= cost || strm->debt >= SLZ_MAX_DEBT)
 			copy_lit_small(strm, in + pos - plit, plit, more);
-#else
-			copy_lit(strm, in + pos - plit, plit, more);
-#endif
-		}
 		else
 			copy_lit_huff(strm, in + pos - plit, plit, more);
 
