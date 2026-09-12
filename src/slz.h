@@ -80,8 +80,9 @@ struct slz_stream {
 	uint32_t qbits; /* number of bits in queue, < 8 on 32-bit, < 32 on 64-bit */
 	unsigned char *outbuf; /* set by encode() */
 	uint16_t state; /* one of slz_state */
-	uint8_t level:1; /* 0 = no compression, 1 = compression */
+	uint8_t unused:2; /* free for future use */
 	uint8_t format:2; /* SLZ_FMT_* */
+	uint8_t level:4;  /* 0 = no compression, 1..15 = compression */
 	uint8_t debt;    /* number of bits by which the fixed huffman encoding is
 	                  * currently behind the equivalent stored blocks, see
 	                  * SLZ_MAX_DEBT in slz.c

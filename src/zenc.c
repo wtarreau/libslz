@@ -71,7 +71,7 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    "The following arguments are supported :\n"
 	    "  -0         disable compression, only uses output format\n"
 	    "  -1         compress faster (default)\n"
-	    "  -2..9      compress better\n"
+	    "  -2..15     compress better\n"
 	    "  -k <size>  block size in kB (default: 1024)\n"
 	    "  -b <size>  only use <size> bytes from the input file\n"
 	    "  -B         use buffered mode instead of mmap (uses less memory)\n"
@@ -132,7 +132,7 @@ int main(int argc, char **argv)
 			break;
 
 		if (argv[0][0] == '-' && argv[0][1] >= '0' && argv[0][1] <= '9')
-			level = argv[0][1] - '0';
+			level = atoi(argv[0] + 1);
 
 		else if (strcmp(argv[0], "-b") == 0) {
 			if (argc < 2)
@@ -319,7 +319,7 @@ int main(int argc, char **argv)
 			gettimeofday(&tv_beg, NULL);
 		}
 
-		slz_init(&strm, !!level, format);
+		slz_init(&strm, level, format);
 
 		outblen = ofs = 0;
 		do {

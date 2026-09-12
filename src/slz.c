@@ -1180,13 +1180,13 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, 
 
 /* Initializes stream <strm> for use with raw deflate (rfc1951). The CRC is
  * unused but set to zero. The compression level passed in <level> is set. This
- * value can only be 0 (no compression) or 1 (compression) and other values
- * will lead to unpredictable behaviour. The function always returns 0.
+ * value will be capped between 0 (no compression) and 15 (max compression).
+ * The function always returns 0.
  */
 int slz_rfc1951_init(struct slz_stream *strm, int level)
 {
 	strm->state = SLZ_ST_EOB; // no header
-	strm->level = level;
+	strm->level = MIN(MAX(level, 0), 15);
 	strm->format = SLZ_FMT_DEFLATE;
 	strm->crc32 = 0;
 	strm->ilen  = 0;
@@ -1431,14 +1431,14 @@ long slz_rfc1952_encode(struct slz_stream *strm, unsigned char *out, const unsig
 }
 
 /* Initializes stream <strm> for use with the gzip format (rfc1952). The
- * compression level passed in <level> is set. This value can only be 0 (no
- * compression) or 1 (compression) and other values will lead to unpredictable
- * behaviour. The function always returns 0.
+ * compression level passed in <level> is set. This value will be capped
+ * between 0 (no compression) and 15 (max compression). The function always
+ * returns 0.
  */
 int slz_rfc1952_init(struct slz_stream *strm, int level)
 {
 	strm->state  = SLZ_ST_INIT;
-	strm->level  = level;
+	strm->level  = MIN(MAX(level, 0), 15);
 	strm->format = SLZ_FMT_GZIP;
 	strm->crc32  = 0;
 	strm->ilen   = 0;
@@ -1642,14 +1642,14 @@ long slz_rfc1950_encode(struct slz_stream *strm, unsigned char *out, const unsig
 }
 
 /* Initializes stream <strm> for use with the zlib format (rfc1950). The
- * compression level passed in <level> is set. This value can only be 0 (no
- * compression) or 1 (compression) and other values will lead to unpredictable
- * behaviour. The function always returns 0.
+ * compression level passed in <level> is set. This value will be capped
+ * between 0 (no compression) and 15 (max compression). The function always
+ * returns 0.
  */
 int slz_rfc1950_init(struct slz_stream *strm, int level)
 {
 	strm->state  = SLZ_ST_INIT;
-	strm->level  = level;
+	strm->level  = MIN(MAX(level, 0), 15);
 	strm->format = SLZ_FMT_ZLIB;
 	strm->crc32  = 1; // rfc1950/zlib starts with initial crc=1
 	strm->ilen   = 0;
