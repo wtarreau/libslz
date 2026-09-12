@@ -70,9 +70,9 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    "\n"
 	    "The following arguments are supported :\n"
 	    "  -0         disable compression, only uses output format\n"
-	    "  -1         compress faster\n"
-	    "  -2         compress better\n"
-	    "  -3 .. -9   compress even better [default=3]\n"
+	    "  -1         compress faster (default)\n"
+	    "  -2..9      compress better\n"
+	    "  -k <size>  block size in kB (default: 1024)\n"
 	    "  -b <size>  only use <size> bytes from the input file\n"
 	    "  -B         use buffered mode instead of mmap (uses less memory)\n"
 	    "  -c         send output to stdout [default]\n"
@@ -105,7 +105,7 @@ int main(int argc, char **argv)
 	off_t ofs;
 	size_t outblen;
 	size_t outbsize;
-	size_t block_size;
+	size_t block_size = 1048576;
 	size_t mapsize = 0;
 	unsigned long long totin = 0;
 	unsigned long long totout = 0;
@@ -116,7 +116,7 @@ int main(int argc, char **argv)
 	struct timeval tv_beg, tv_end;
 	unsigned long long timed_in = 0;
 	int console = 1;
-	int level   = 3;
+	int level   = 1;
 	int verbose = 0;
 	int test    = 0;
 	int format  = SLZ_FMT_GZIP;
@@ -138,6 +138,16 @@ int main(int argc, char **argv)
 			if (argc < 2)
 				usage(name, 1);
 			toread = strtoll(argv[1], NULL, 0);
+			argv++;
+			argc--;
+		}
+
+		else if (strcmp(argv[0], "-k") == 0) {
+			if (argc < 2)
+				usage(name, 1);
+			block_size = strtoll(argv[1], NULL, 0) * 1024;
+			if (block_size < 1024)
+				block_size = 1024; // 1 kB min
 			argv++;
 			argc--;
 		}
@@ -200,18 +210,6 @@ int main(int argc, char **argv)
 
 	slz_make_crc_table();
 	slz_prepare_dist_table();
-
-	block_size = 32768;
-	if (level > 1)
-		block_size *= 4; // 128 kB
-	if (level > 2)
-		block_size *= 8; // 1 MB
-	if (level > 3)
-		block_size *= 8; // 8 MB
-	if (level > 4)
-		block_size *= 8; // 64 MB
-	if (level > 5)
-		block_size *= 8; // 512 MB
 
 	outbsize = 2 * block_size; // allows to pack more than one full output at each round
 	outbuf = calloc(1, outbsize + 4096);
