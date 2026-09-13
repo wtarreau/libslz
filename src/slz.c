@@ -371,7 +371,7 @@ static inline long memmatch(const unsigned char *a, const unsigned char *b, long
  * xbits. Note that the function may write up to 3 extra bytes since it may
  * write 32 bits even if only 8 are needed.
  */
-static inline void enqueue24(struct slz_stream *strm, uint64_t x, uint32_t xbits)
+static inline void enqueue24(struct slz_stream *__restrict strm, uint64_t x, uint32_t xbits)
 {
 	uint64_t queue = strm->queue + (x << strm->qbits);
 	uint32_t qbits = strm->qbits + xbits;
@@ -400,7 +400,7 @@ static inline void enqueue24(struct slz_stream *strm, uint64_t x, uint32_t xbits
  * buf. X must not contain non-zero bits above xbits.
  */
 #if SLZ_DIRECT_ENQUEUE8
-static inline void enqueue8(struct slz_stream *strm, uint32_t x, uint32_t xbits)
+static inline void enqueue8(struct slz_stream *__restrict strm, uint32_t x, uint32_t xbits)
 {
 	uint64_t queue = strm->queue + ((uint64_t)x << strm->qbits);
 	uint32_t qbits = strm->qbits + xbits;
@@ -424,7 +424,7 @@ static inline void enqueue8(struct slz_stream *strm, uint32_t x, uint32_t xbits)
  * go, which is at most 31 bits: 7 or 8 for the length code plus up to 5 extra,
  * then 5 for the distance code plus up to 13 extra.
  */
-static inline void enqueue56(struct slz_stream *strm, uint64_t x, uint32_t xbits)
+static inline void enqueue56(struct slz_stream *__restrict strm, uint64_t x, uint32_t xbits)
 {
 	uint64_t queue = strm->queue + (x << strm->qbits);
 	uint32_t qbits = strm->qbits + xbits;
@@ -439,7 +439,7 @@ static inline void enqueue56(struct slz_stream *strm, uint64_t x, uint32_t xbits
 #endif
 
 /* flush the queue and align to next byte */
-static inline void flush_bits(struct slz_stream *strm)
+static inline void flush_bits(struct slz_stream *__restrict strm)
 {
 	if (!strm->qbits)
 		return;
@@ -482,7 +482,7 @@ static inline void flush_bits(struct slz_stream *strm)
  * may write up to 3 extra bytes since it may write 32 bits even if only 8 are
  * needed.
  */
-static void enqueue24(struct slz_stream *strm, uint32_t x, uint32_t xbits)
+static void enqueue24(struct slz_stream *__restrict strm, uint32_t x, uint32_t xbits)
 {
 	uint32_t queue = strm->queue + (x << strm->qbits);
 	uint32_t qbits = strm->qbits + xbits;
@@ -515,7 +515,7 @@ static void enqueue24(struct slz_stream *strm, uint32_t x, uint32_t xbits)
 /* enqueue code x of <xbits> bits (at most 8) and copy complete bytes into
  * out buf. X must not contain non-zero bits above xbits.
  */
-static inline void enqueue8(struct slz_stream *strm, uint32_t x, uint32_t xbits)
+static inline void enqueue8(struct slz_stream *__restrict strm, uint32_t x, uint32_t xbits)
 {
 	uint32_t queue = strm->queue + (x << strm->qbits);
 	uint32_t qbits = strm->qbits + xbits;
@@ -539,7 +539,7 @@ static inline void enqueue8(struct slz_stream *strm, uint32_t x, uint32_t xbits)
 }
 
 /* align to next byte */
-static inline void flush_bits(struct slz_stream *strm)
+static inline void flush_bits(struct slz_stream *__restrict strm)
 {
 	if (!strm->qbits)
 		return;
@@ -558,27 +558,27 @@ static inline void flush_bits(struct slz_stream *strm)
 
 
 /* only valid if buffer is already aligned */
-static inline void copy_8b(struct slz_stream *strm, uint32_t x)
+static inline void copy_8b(struct slz_stream *__restrict strm, uint32_t x)
 {
 	*strm->outbuf++ = x;
 }
 
 /* only valid if buffer is already aligned */
-static inline void copy_16b(struct slz_stream *strm, uint32_t x)
+static inline void copy_16b(struct slz_stream *__restrict strm, uint32_t x)
 {
 	write_le16(strm->outbuf, x);
 	strm->outbuf += 2;
 }
 
 /* only valid if buffer is already aligned */
-static inline void copy_32b(struct slz_stream *strm, uint32_t x)
+static inline void copy_32b(struct slz_stream *__restrict strm, uint32_t x)
 {
 	write_le32(strm->outbuf, x);
 	strm->outbuf += 4;
 }
 
 /* Using long because faster on 64-bit (can save one shift) */
-static inline void send_huff(struct slz_stream *strm, unsigned long code)
+static inline void send_huff(struct slz_stream *__restrict strm, unsigned long code)
 {
 	uint32_t bits;
 
@@ -588,7 +588,7 @@ static inline void send_huff(struct slz_stream *strm, unsigned long code)
 	enqueue24(strm, code, bits);
 }
 
-static inline void send_eob(struct slz_stream *strm)
+static inline void send_eob(struct slz_stream *__restrict strm)
 {
 	enqueue8(strm, 0, 7); // direct encoding of 256 = EOB (cf RFC1951)
 }
@@ -597,7 +597,7 @@ static inline void send_eob(struct slz_stream *strm)
  * buf + <len>. <len> must not be null.
  */
 __attribute__((unused))
-static void copy_lit(struct slz_stream *strm, const void *buf, uint32_t len, int more)
+static void copy_lit(struct slz_stream *__restrict strm, const void *buf, uint32_t len, int more)
 {
 	uint32_t len2;
 
@@ -628,7 +628,7 @@ static void copy_lit(struct slz_stream *strm, const void *buf, uint32_t len, int
  * are data past buf + <len>. Only supports fixed encoding.
  */
 __attribute__((unused))
-static void copy_lit_small(struct slz_stream *strm, const void *buf, uint32_t len, int more)
+static void copy_lit_small(struct slz_stream *__restrict strm, const void *buf, uint32_t len, int more)
 {
 	int eob_shift = (strm->state == SLZ_ST_EOB) ? 0 : 7;
 
@@ -650,7 +650,7 @@ static void copy_lit_small(struct slz_stream *strm, const void *buf, uint32_t le
 /* copies <len> litterals from <buf>. <more> indicates that there are data past
  * buf + <len>. <len> must not be null.
  */
-static void copy_lit_huff(struct slz_stream *strm, const unsigned char *buf, uint32_t len, int more)
+static void copy_lit_huff(struct slz_stream *__restrict strm, const unsigned char *buf, uint32_t len, int more)
 {
 	uint32_t pos;
 
@@ -752,7 +752,7 @@ static inline void insert_ref(union ref *refs, const unsigned char *in, unsigned
  * is responsible for ensuring there is enough room in the output buffer for
  * this. The amount of output bytes is returned, and no CRC is computed.
  */
-long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsigned char *in, long ilen, int more)
+long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
 {
 	long rem = ilen;
 	unsigned long pos = 0;
