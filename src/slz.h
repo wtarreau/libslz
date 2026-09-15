@@ -250,14 +250,80 @@ enum uslz_stream_state {
 	USLZ_ST_CHECK_CKSUM,
 };
 
-/* Width, in bits, of the direct lookup table used to decode the dynamic
- * literal/length codes. A code no longer than the table is decoded in a
- * single load, a longer one falls back to walking the tree, which costs one
- * dependent load per bit. The table costs (1 << bits) * 2 bytes in every
- * stream state, and a width of zero removes it along with the code that uses
- * it.
+/* Width, in bits, of the direct lookup tables used to decode dynamic huffman
+ * codes: one for the literal/length alphabet, one for the distance alphabet.
+ * A code no longer than the table is decoded in a single load, a longer one
+ * falls back to walking the tree, which costs one dependent load per bit.
+ * Each table costs (1 << bits) * 2 bytes in *every* stream state, so this is
+ * a direct trade between memory and decoding speed. Setting a width to zero
+ * removes the corresponding table from the state along with the code that
+ * uses it, which is the right thing for an application holding many
+ * mostly-idle streams.
+ *
+ * These are deliberately not build options. They set the size and the layout
+ * of struct uslz_stream, which is exported and instantiated by the calling
+ * application, so a -D reaching only one of the two sides would leave the
+ * library and the application disagreeing on the offset of every field past
+ * fast_lit[]: the application would allocate 1568 bytes where the library
+ * writes 2848, and nothing would detect it. Defining them unconditionally is
+ * what prevents this, the definition below wins in every translation unit
+ * that includes this file and a -D trying to change them only earns a
+ * redefinition warning. The values can still be changed, but only here, and
+ * doing so requires rebuilding the library *and* everything that instantiates
+ * a stream.
+ *
+ * The performance below was measured on 8 different machines decoding a
+ * silesia.tar compressed by gzip, with various combinations of literal length
+ * bits and distance bits. The tests were lacking several optimizations that
+ * were later added, so the numbers are off compared to current code, but their
+ * ratios are still correct. The rates are expressed in MB/s of output stream
+ * after decompression:
+ *
+ *   lit/dist  state    arl  spr sklx 7800 7v13 5105 atom   n1
+ *     0/0     1728 B   237  186  178  232  174  124   50  124
+ *     0/7     1984 B   285  223  199  282  206  144   56  143
+ *     9/0     2752 B   379  286  313  329  239  175   66  182
+ *     8/6     2368 B   433  342  323  378  273  190   69  198
+ *     9/7     3008 B   508  402  381  419  303  222   76  229
+ *    10/7     4032 B   547  437  403  445  324  238   78  245  <= current
+ *    11/7     6080 B   556  446  409  451  325  245   79  250
+ *
+ * It's important not to forget that decompressing gzip requires to keep a
+ * 32 kB sliding window, so the real sizes are those obtained by adding
+ * 32768 to the values above. Once taken into account, and measures reported
+ * as extra percentages compared to 0/0, the best choices appear more clearly:
+ *
+ *   lit/dist   memory    arl   spr  sklx  7800  7v13  5105  atom    n1
+ *   0/0      34496 B    237   186   178   232   174   124    50   124  MB/s
+ *   0/7        +0.7%   +20%  +20%  +12%  +21%  +18%  +17%  +11%  +15%
+ *   9/0        +3.0%   +60%  +54%  +76%  +42%  +37%  +41%  +32%  +46%
+ *   8/6        +1.9%   +83%  +84%  +82%  +63%  +57%  +54%  +37%  +59%
+ *   9/7        +3.7%  +114% +117% +115%  +80%  +74%  +80%  +52%  +84%
+ *   10/7       +6.7%  +131% +135% +127%  +92%  +86%  +93%  +56%  +97%  <= current
+ *   11/7      +12.6%  +135% +140% +130%  +94%  +87%  +98%  +58% +101%
+ *
+ * Each step then costs a few percent of the per-stream footprint and buys
+ * tens of points on that scale, until it stops:
+ *
+ *     8/6 -> 9/7     memory +1.8%    speed +14 to +33 points
+ *     9/7 -> 10/7    memory +2.9%    speed  +5 to +18 points
+ *    10/7 -> 11/7    memory +5.6%    speed  +1 to  +5 points
+ *
+ * 10/7 is where the curve bends, and that is what is set below: against no
+ * table at all it buys between 56% (the Atom) and 135% (the Sapphire Rapids)
+ * on a dynamic stream for 6.7% more memory per stream, while the step past it
+ * costs twice as much memory for a tenth of the speed.
+ *
+ * An embedded application that decodes nothing but slz output is the
+ * exception: those streams never look these tables up, so it can set both
+ * widths to zero and get the 2304 bytes back.
  */
 #define USLZ_FAST_BITS 10
+#define USLZ_FAST_DBITS 7
+
+#if USLZ_FAST_BITS > 15 || USLZ_FAST_DBITS > 15
+#error "USLZ_FAST_BITS and USLZ_FAST_DBITS must not exceed 15, the longest deflate code"
+#endif
 
 /* decompression state */
 struct uslz_stream {
@@ -323,6 +389,9 @@ struct uslz_stream {
 	 * longer than the table and literal_table[] has to be walked.
 	 */
 	uint16_t fast_lit[1 << USLZ_FAST_BITS];
+
+	/* same for the distance alphabet */
+	uint16_t fast_dist[1 << USLZ_FAST_DBITS];
 
 	union {
 		/* Code-to-symbol conversion table for the alphabet used for

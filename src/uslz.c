@@ -939,6 +939,10 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 		if (USLZ_FAST_BITS)
 			gen_fast_table(state->literal_count, state->literal_len,
 			               state->fast_lit, USLZ_FAST_BITS);
+
+		if (USLZ_FAST_DBITS)
+			gen_fast_table(state->distance_count, state->distance_len,
+			               state->fast_dist, USLZ_FAST_DBITS);
 	}
 	/* else Static tables: we don't need to generate literal / distance table
 	 * because we directly use gethuff_fixed().
@@ -1071,8 +1075,19 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 			bit_accum >>= 5;
 			num_bits -= 5;
 		}
-		else
-			GETHUFF(state->symbol, state->distance_table);
+		else {
+			/* same fast path as for the literal codes above */
+			int ret = -1;
+
+			if (USLZ_FAST_DBITS && !state->huff_index)
+				ret = gethuff_fast(&in_ptr, in_top, &num_bits, &bit_accum,
+				                   &state->symbol, state->fast_dist,
+				                   USLZ_FAST_DBITS);
+			if (!ret)
+				goto out_of_data;
+			if (ret < 0)
+				GETHUFF(state->symbol, state->distance_table);
+		}
 
 		if (state->symbol <= 3)
 			state->distance = state->symbol + 1;
