@@ -876,7 +876,7 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, 
 			if (!(plit & 2047)) {
 #if !SLZ_LITERAL_SKIP
 				if (__builtin_expect(plit == 0x8000, 1)) {
-					copy_lit_small(strm, in + pos - plit, plit, more);
+					copy_lit_small(strm, in + pos - plit, plit, 1);
 					plit = 0;
 				}
 #else
