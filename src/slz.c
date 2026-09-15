@@ -1024,6 +1024,8 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, 
 			if (SLZ_BACKWARD_MATCH == 1) { // single-byte match: 43.39%
 				if (in[pos - 1] == in[last - 1])
 					back++;
+				if (back > bmax)
+					back = bmax;
 			}
 			else { /* unaligned not supported or match != 1/2/3/4/8 */
 				while (back < bmax && in[pos - back - 1] == in[last - back - 1])
