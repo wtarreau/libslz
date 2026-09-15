@@ -250,6 +250,15 @@ enum uslz_stream_state {
 	USLZ_ST_CHECK_CKSUM,
 };
 
+/* Width, in bits, of the direct lookup table used to decode the dynamic
+ * literal/length codes. A code no longer than the table is decoded in a
+ * single load, a longer one falls back to walking the tree, which costs one
+ * dependent load per bit. The table costs (1 << bits) * 2 bytes in every
+ * stream state, and a width of zero removes it along with the code that uses
+ * it.
+ */
+#define USLZ_FAST_BITS 10
+
 /* decompression state */
 struct uslz_stream {
 	enum uslz_stream_state state;         /* parsing state, USLZ_ST_* */
@@ -307,6 +316,14 @@ struct uslz_stream {
 	 * enough space for that alphabet.
 	 */
 	short literal_table[288*2-2];
+	/* Direct lookup table for the literal/length alphabet, indexed by the
+	 * next USLZ_FAST_BITS bits of the stream. Same layout as
+	 * fixed_huff_dec_table: the symbol in the upper bits and the code
+	 * length in the low 4 bits, a length of zero meaning the code is
+	 * longer than the table and literal_table[] has to be walked.
+	 */
+	uint16_t fast_lit[1 << USLZ_FAST_BITS];
+
 	union {
 		/* Code-to-symbol conversion table for the alphabet used for
 		 * distances.  This alphabet consists of 32 symbols, 2 of
