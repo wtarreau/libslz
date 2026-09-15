@@ -775,12 +775,12 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, 
 	uint32_t dist, code;
 	union ref refs[1 << SLZ_HASH_BITS];
 
-	if (!strm->level) {
+	if (__builtin_expect(!strm->level, 0)) {
 		/* force to send as literals (eg to preserve CPU) */
 		strm->outbuf = out;
-		plit = pos = ilen;
-		bit9 = 52; /* force literal dump */
-		goto final_lit_dump;
+		if (ilen)
+			copy_lit(strm, in, ilen, more);
+		goto leave;
 	}
 
 	reset_refs(refs, sizeof(refs));
@@ -1158,7 +1158,6 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, 
 		} while (--rem);
 	}
 
- final_lit_dump:
 	/* Now copy remaining literals or mark the end. The cost of switching to
 	 * a stored block depends on the current state and on the presence of
 	 * data after these literals, see the SLZ_*_COST definitions above.
@@ -1178,7 +1177,7 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, 
 
 		plit = 0;
 	}
-
+ leave:
 	strm->ilen += ilen;
 	return strm->outbuf - out;
 }
