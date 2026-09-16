@@ -539,6 +539,7 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 	 */
 	if (state->block_type == 0) {
 		num_bits = 0;  /* Skip remaining bits in the previous byte. */
+		bit_accum = 0;
 		state->state = USLZ_ST_UNCOMPRESSED_LEN;
 
  state_UNCOMPRESSED_LEN:
