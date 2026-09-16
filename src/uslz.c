@@ -367,6 +367,81 @@ static inline uint8_t rbit5(uint8_t v)
 
 /* The set of macros below is relevant for uslz_decode_block() function */
 
+/* Fast path for the bit reader. Without it the accumulator is refilled one
+ * byte at a time, each byte costing a test against in_top and a test for
+ * "do I have enough bits yet", both of which depend on the data and are
+ * mispredicted a lot: on a silesia compressed by slz they account for about
+ * half of the branch misses of the whole decoder.
+ *
+ * REFILL() instead brings a whole machine word in with a single unaligned
+ * load and no branch beyond the one checking that the word is readable. It
+ * leaves the accumulator with everything but its low byte valid, that is 56
+ * to 63 bits on a 64-bit platform, which covers the longest symbol any block
+ * type can produce (15 bits of code, 5 of length extra, 15 of distance code
+ * and 13 of distance extra, so 48): one call per symbol is then enough and
+ * every "do I have enough bits" test inside the decoders becomes a test that
+ * is always false, and therefore free. A 32-bit platform only gets 24 to 31
+ * bits, enough for a literal or a length but not always for a whole
+ * length/distance pair, and the readers keep their byte at a time refill for
+ * what a refill did not cover, so they remain correct, they just take that
+ * slower path more often.
+ *
+ * The number of whole bytes the load brought in is written
+ * "num_bits ^ (8 * __SIZEOF_LONG__ - 1)" rather than the subtraction it is
+ * equal to as long as <num_bits> stays below the width of the accumulator,
+ * which it always does here. The compiler cannot know that bound, so the
+ * subtraction makes it emit the constant, a subtraction and a sign extension
+ * of a result it cannot prove positive, where the xor becomes a shift and an
+ * xor on the low byte.
+ *
+ * Bits above <num_bits> are not zero any more after this: the load brings in
+ * up to 7 bytes, 3 on a 32-bit platform, that are not accounted for, and
+ * <in_ptr> is left pointing at them so that the next refill reads them again
+ * and ORs the same values at the same places. That is harmless because every
+ * reader masks what it takes.
+ *
+ * Nothing is ever pushed back to the input: a byte that made it into the
+ * accumulator counts as consumed, exactly as it did when they were pulled in
+ * one at a time, so a caller that is told it has fed us N bytes never has to
+ * present them again. The two places that want bytes rather than bits, a
+ * stored block and the trailer, get back on a byte boundary with ALIGN_BYTE()
+ * and then take those bytes from the accumulator before touching <in_ptr>.
+ *
+ * The only condition is UNALIGNED_LE_OK. A refill of 24 bits is worth having
+ * as much as one of 56: built with -m32 on an x86, it decodes a fixed huffman
+ * stream 26% faster and a dynamic one 8% faster than the byte at a time loop
+ * it replaces, two data dependent branches per byte being what those bits are
+ * traded for.
+ */
+#if defined(UNALIGNED_LE_OK)
+#define REFILL()                                                               \
+	do {                                                                   \
+		if (__builtin_expect(in_top - in_ptr >= __SIZEOF_LONG__, 1)) { \
+			bit_accum |= read_lelong(in_ptr) << num_bits;          \
+			in_ptr += (num_bits ^ (8 * __SIZEOF_LONG__ - 1)) >> 3; \
+			num_bits |= 8 * __SIZEOF_LONG__ - 8;                   \
+		}                                                              \
+	} while (0)
+
+/* Drops the bits left in the byte being read so that the accumulator holds
+ * whole bytes only, and clears whatever REFILL() left above them. <num_bits>
+ * must be below the width of the accumulator here, which REFILL() guarantees.
+ */
+#define ALIGN_BYTE()                                                        \
+	do {                                                                \
+		bit_accum >>= num_bits & 7;                                 \
+		num_bits &= ~7;                                             \
+		bit_accum &= (1UL << num_bits) - 1;                         \
+	} while (0)
+#else
+#define REFILL()     do { } while (0)
+#define ALIGN_BYTE()                                                        \
+	do {                                                                \
+		num_bits = 0;                                               \
+		bit_accum = 0;                                              \
+	} while (0)
+#endif
+
 /* The GETBITS macro retrieves the specified number of bits (n) from
  * the block, returning from the function if no more data is available,
  * and stores the value in the given variable (var).  The number of
@@ -541,8 +616,8 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 	 * buffer.
 	 */
 	if (state->block_type == 0) {
-		num_bits = 0;  /* Skip remaining bits in the previous byte. */
-		bit_accum = 0;
+		/* Skip remaining bits in the previous byte. */
+		ALIGN_BYTE();
 		state->state = USLZ_ST_UNCOMPRESSED_LEN;
 
  state_UNCOMPRESSED_LEN:
@@ -567,6 +642,18 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 			if (out == out_lim) {
 				resume = R_UNCOMP;
 				goto checkpoint;
+			}
+
+			/* bytes already pulled into the accumulator by
+			 * REFILL() come first, <in_ptr> has moved past them.
+			 */
+			if (num_bits >= 8) {
+				*out++ = bit_accum;
+				bit_accum >>= 8;
+				num_bits -= 8;
+				state->nread++;
+				remain--;
+				continue;
 			}
 
 			if (in_ptr >= in_top)
@@ -728,6 +815,9 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 			resume = R_SYMBOL;
 			goto checkpoint;
 		}
+
+		/* one refill per symbol is enough for the longest one */
+		REFILL();
 
 		/* Read a compressed symbol from the block. */
 		if (state->block_type != 2) {
@@ -960,8 +1050,7 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 		 * accumulator for that purpose since it is not used for
 		 * decoding anymore.
 		 */
-		bit_accum = 0;
-		num_bits = 0;
+		ALIGN_BYTE();
 		/* the trailer may well not be available yet, in which case we
 		 * have to be able to come back here on the next call.
 		 */
@@ -975,20 +1064,20 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 			while (num_bits < 32) {
 				if (in_ptr >= in_top)
 					goto out_of_data;
-				/* the cast matters: in_ptr[0] is promoted to a
-				 * signed int, so for the first byte, whose
-				 * shift is 24, any value >= 0x80 would become
-				 * negative and be sign-extended over the upper
-				 * half of the 64-bit accumulator.
+				/* the four bytes are stored big endian while
+				 * the accumulator holds them in the order they
+				 * arrived, hence the swap below.
 				 */
-				bit_accum |= (uint32_t)in_ptr[0] << (24 - num_bits);
+				bit_accum |= (unsigned long)in_ptr[0] << num_bits;
 				in_ptr++;
 				num_bits += 8;
 			}
-			if (state->crc != bit_accum) {
+			if (state->crc != __builtin_bswap32((uint32_t)bit_accum)) {
 				err_code = USLZ_DECODE_E_BAD_CRC;
 				goto error_return;
 			}
+			bit_accum = 0;
+			num_bits = 0;
 		}
 		else if ((state->flags & USLZ_FL_GZIP)) {
 			/* The gzip trailer is 8 bytes: crc32 then isize, both
