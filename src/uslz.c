@@ -423,6 +423,25 @@ static inline uint8_t rbit5(uint8_t v)
 		}                                                              \
 	} while (0)
 
+/* handle up to one literal at output position <ofs>. This may only be used
+ * inside uslz_decode_block() immediately after REFILL() in the loop. The "if"
+ * block is used to automatically adapt to the size of the long and handle
+ * either 2 or 6 symbols at once.
+ */
+#define FIXED_LITERAL(ofs)                                                     \
+	do {                                                                   \
+		if (ofs < __SIZEOF_LONG__ - 2) {                               \
+			unsigned int entry;                                    \
+			entry = fixed_huff_dec_table[bit_accum & 0x1FF];       \
+			bit_accum >>= entry & 0xF;                             \
+			num_bits   -= entry & 0xF;                             \
+			state->symbol = entry >> 7;                            \
+			if (state->symbol >= 256)                              \
+				goto have_symbol;                              \
+			*out++ = state->symbol;                                \
+		}                                                              \
+	} while (0)
+
 /* Drops the bits left in the byte being read so that the accumulator holds
  * whole bytes only, and clears whatever REFILL() left above them. <num_bits>
  * must be below the width of the accumulator here, which REFILL() guarantees.
@@ -821,6 +840,40 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 
 		/* Read a compressed symbol from the block. */
 		if (state->block_type != 2) {
+#if defined(UNALIGNED_LE_OK)
+			/* Literal fast path for fixed huffman blocks, which is
+			 * what slz emits and where three symbols out of four
+			 * are literals. As long as one refill's worth of input
+			 * and as many output bytes as a refill covers are
+			 * available, a literal is one table lookup and one
+			 * store, with none of the per-symbol checks of the
+			 * generic path: a fixed code is at most 9 bits, so a
+			 * refill covers six of them on a 64-bit platform and
+			 * two on a 32-bit one, which is what "__SIZEOF_LONG__
+			 * - 2" counts below. They are decoded with no test on
+			 * the input, and the output room is checked once for
+			 * all of them. The first symbol that is not a literal
+			 * is handed to the generic path below, which still
+			 * does all the checking on lengths and distances.
+			 */
+			while (out_lim - out >= __SIZEOF_LONG__ - 2 &&
+			       in_top - in_ptr >= __SIZEOF_LONG__) {
+				REFILL();
+
+				/* read up to (sizeof(long) - 2) symbols;
+				 * excess calls are ignored on 32-bit machines.
+				 */
+				FIXED_LITERAL(0); FIXED_LITERAL(1);
+				FIXED_LITERAL(2); FIXED_LITERAL(3);
+				FIXED_LITERAL(4); FIXED_LITERAL(5);
+			}
+			/* the loop may have filled the output exactly to the
+			 * limit, and the generic path only checks that before
+			 * decoding, at the top of the loop: go back there.
+			 */
+			if (out == out_lim)
+				continue;
+#endif /* UNALIGNED_LE_OK */
 			/* fixed huffman */
 			if (!gethuff_fixed(&in_ptr, in_top, &num_bits, &bit_accum, &state->symbol))
 				goto out_of_data;
@@ -828,6 +881,7 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 		else
 			GETHUFF(state->symbol, state->literal_table);
 
+ have_symbol:
 		/* If the symbol is a literal, add it to the buffer and continue
 		 * with the next code.
 		 */
