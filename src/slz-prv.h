@@ -95,6 +95,31 @@
 })
 
 
+/* reads an unaligned 32-bit word in little endian order */
+static inline uint32_t read_le32(const void *p)
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	const union {  uint32_t u32; } __attribute__((packed)) *u = p;
+	return u->u32;
+#else
+	const uint8_t *u8 = p;
+	return (uint32_t)u8[0] | ((uint32_t)u8[1] << 8) |
+	       ((uint32_t)u8[2] << 16) | ((uint32_t)u8[3] << 24);
+#endif
+}
+
+/* reads an unaligned 64-bit word in little endian order, same as read_le32() */
+static inline uint64_t read_le64(const void *p)
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	const union {  uint64_t u64; } __attribute__((packed)) *u = p;
+	return u->u64;
+#else
+	const uint8_t *u8 = p;
+	return (uint64_t)read_le32(u8) | ((uint64_t)read_le32(u8 + 4) << 32);
+#endif
+}
+
 /* writes an unaligned 32-bit word in little endian order */
 static inline void write_le32(void *p, uint32_t v)
 {
