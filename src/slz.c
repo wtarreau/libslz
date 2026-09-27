@@ -756,12 +756,24 @@ static inline void insert_ref(union ref *refs, const unsigned char *in, unsigned
  * more than its own share, which the following ones will not emit. The caller
  * is responsible for ensuring there is enough room in the output buffer for
  * this. The amount of output bytes is returned, and no CRC is computed.
+ *
+ * Note: this function uses a lot of registers due to local variables that
+ * hold pre-computed values that need to be kept very long. Be extremely
+ * careful when changing anything there, and test again on multiple compiler
+ * versions. For example, when building with avx512f (e.g. -march=native on
+ * Skylake-X and Zen-4+), gcc 13 and 14 tend to move some variables to %xmm0
+ * and to read it back using vmovq multiple times, affecting performance, which
+ * can be recovered using -mno-avx512f (~1-2%). On gcc-15, the performance is
+ * better and that option degrades it by 2% again. gcc-16 is even slightly
+ * better (+0.5%). As a general rule, nothing vectorizes well here, and the
+ * unaligned, short memcpy() calls must not be translated to AVX512 code.
  */
 long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
 {
 	long rem = ilen;
 	unsigned long pos = 0;
 	unsigned long last;
+	const unsigned char *lastp;
 	uint32_t word = 0;
 	long mlen;
 	uint32_t h;
@@ -900,8 +912,11 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, 
 		if ((unsigned long)(pos - last - 1) >= 32768)
 			goto send_as_lit;
 
+		/* faster to keep a copy of this with gcc 13-16 */
+		lastp = in + last;
+
 		/* Note: cannot encode a length larger than 258 bytes */
-		mlen = memmatch(in + pos + 4, in + last + 4, (rem > 258 ? 258 : rem) - 4) + 4;
+		mlen = memmatch(in + pos + 4, lastp + 4, (rem > 258 ? 258 : rem) - 4) + 4;
 
 		/* found a matching entry */
 
@@ -1002,12 +1017,12 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, 
 
 #if defined(UNALIGNED_LE_OK)
 			if (SLZ_BACKWARD_MATCH == 2) { // 43.32%, best speed vs savings
-				uint16_t x = *(uint16_t *)&in[pos - 2] ^ *(uint16_t *)&in[last - 2];
+				uint16_t x = *(uint16_t *)&in[pos - 2] ^ *(uint16_t *)(lastp - 2);
 				back = x & 0xff00 ? 0 : x ? 1 : 2;
 				if (back > bmax)
 					back = bmax;
 			} else if (SLZ_BACKWARD_MATCH == 3 || SLZ_BACKWARD_MATCH == 4) { // 32 bits: 43.31% or 43.30%
-				uint32_t x = *(uint32_t *)&in[pos - 4] ^ *(uint32_t *)&in[last - 4];
+				uint32_t x = *(uint32_t *)&in[pos - 4] ^ *(uint32_t *)(lastp - 4);
 				back = x & 0xffff0000u ?
 					x & 0xff000000u ? 0 : 1 :
 					x & 0xffffff00u ? 2 :
@@ -1015,20 +1030,20 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, 
 				if (back > bmax)
 					back = bmax;
 			} else if (SLZ_BACKWARD_MATCH == 8) { // 64 bits: 43.30%
-				uint64_t x = *(uint64_t *)&in[pos - 8] ^ *(uint64_t *)&in[last - 8];
+				uint64_t x = *(uint64_t *)&in[pos - 8] ^ *(uint64_t *)(lastp - 8);
 				back = x ? (__builtin_clzll(x) >> 3) : 8;
 				if (back > bmax)
 					back = bmax;
 			} else
 #endif
 			if (SLZ_BACKWARD_MATCH == 1) { // single-byte match: 43.39%
-				if (in[pos - 1] == in[last - 1])
+				if (in[pos - 1] == lastp[-1])
 					back++;
 				if (back > bmax)
 					back = bmax;
 			}
 			else { /* unaligned not supported or match != 1/2/3/4/8 */
-				while (back < bmax && in[pos - back - 1] == in[last - back - 1])
+				while (back < bmax && in[pos - back - 1] == lastp[-back - 1])
 					back++;
 			}
 
