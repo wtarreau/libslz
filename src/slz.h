@@ -278,7 +278,7 @@ struct uslz_stream {
 	unsigned int huff_index;              /* current index for pending huffman decoding
 	                                       * attempt
 	                                       */
-	uint64_t bit_accum;                   /* bit accumulator (used by GETBITS() macro) */
+	unsigned long bit_accum;              /* bit accumulator (used by GETBITS() macro) */
 	unsigned int symbol;                  /* symbol code currently being processed */
 	unsigned int last_value;              /* last value read for length / distance table
 	                                       * construction

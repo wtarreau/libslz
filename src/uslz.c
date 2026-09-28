@@ -226,11 +226,12 @@ static inline void uslz_update_crc(struct uslz_stream *state, const unsigned cha
  *
  * Returns 1 on success and 0 if more data is needed.
  */
-static inline int bit_accumulate(const unsigned char **in_ptr, const unsigned char *in_top, unsigned char *num_bits, uint64_t *bit_accum)
+static inline int bit_accumulate(const unsigned char **in_ptr, const unsigned char *in_top,
+                                 unsigned char *num_bits, unsigned long *bit_accum)
 {
 	if (*in_ptr >= in_top)
 		return 0;
-	*bit_accum |= (uint64_t)(*in_ptr)[0] << *num_bits;
+	*bit_accum |= (unsigned long)(*in_ptr)[0] << *num_bits;
 	*num_bits += 8;
 	(*in_ptr)++;
 	return 1;
@@ -247,7 +248,7 @@ static inline int bit_accumulate(const unsigned char **in_ptr, const unsigned ch
  */
 static inline int gethuff(unsigned int *huff_index,
                                              const unsigned char **in_ptr, const unsigned char *in_top,
-                                             unsigned char *num_bits, uint64_t *bit_accum,
+                                             unsigned char *num_bits, unsigned long *bit_accum,
                                              unsigned int *var, short *table)
 {
 	unsigned int index;
@@ -297,7 +298,7 @@ static inline int gethuff(unsigned int *huff_index,
  * needs more input data.
  */
 static inline int gethuff_fixed(const unsigned char **in_ptr, const unsigned char *in_top,
-                                                   unsigned char *num_bits, uint64_t *bit_accum,
+                                                   unsigned char *num_bits, unsigned long *bit_accum,
                                                    unsigned int *var)
 {
 	unsigned long bit_follow;
@@ -369,7 +370,9 @@ static inline uint8_t rbit5(uint8_t v)
 /* The GETBITS macro retrieves the specified number of bits (n) from
  * the block, returning from the function if no more data is available,
  * and stores the value in the given variable (var).  The number of
- * bits to retrieve (n) must be no greater than 32.
+ * bits to retrieve (n) must be no greater than 24, so that the byte at a time
+ * refill cannot overflow even a 32-bit accumulator; the widest used below is
+ * 16.
  */
 #define GETBITS(n,var)                                                              \
 	do {                                                                        \
@@ -377,7 +380,7 @@ static inline uint8_t rbit5(uint8_t v)
 			if (!bit_accumulate(&in_ptr, in_top, &num_bits, &bit_accum))\
 				goto out_of_data;                                   \
 		}                                                                   \
-		var = bit_accum & ((1ULL << n) - 1);                                \
+		var = bit_accum & ((1UL << n) - 1);                                 \
 		bit_accum >>= n;                                                    \
 		num_bits -= n;                                                      \
 	} while (0)
@@ -468,7 +471,7 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 	unsigned char *out = out_base + dec_total % out_max;
 	unsigned char *crc_ptr = out;
 	unsigned char *out_lim;
-	uint64_t bit_accum = state->bit_accum;
+	unsigned long bit_accum = state->bit_accum;
 	unsigned char num_bits = state->num_bits;
 	/* whether the ring already wrapped once, i.e. whether the whole
 	 * buffer is valid history for the distances.
@@ -998,7 +1001,9 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 			while (num_bits < 64) {
 				if (in_ptr >= in_top)
 					goto out_of_data;
-				bit_accum |= (uint64_t)in_ptr[0] << num_bits;
+				if (__SIZEOF_LONG__ > 4 ||
+				    num_bits < 8 * __SIZEOF_LONG__)
+					bit_accum |= (unsigned long)in_ptr[0] << num_bits;
 				in_ptr++;
 				num_bits += 8;
 			}
@@ -1086,7 +1091,7 @@ static int uslz_next_member(struct uslz_stream *state)
 			 */
 			return 0;
 		}
-		state->bit_accum |= (uint64_t)state->in_ptr[0] << state->num_bits;
+		state->bit_accum |= (unsigned long)state->in_ptr[0] << state->num_bits;
 		state->in_ptr += 1;
 		state->num_bits += 8;
 	}
