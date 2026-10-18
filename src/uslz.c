@@ -331,7 +331,7 @@ static inline int gethuff_fixed(const unsigned char **in_ptr, const unsigned cha
 			 * length to prevent mismatch.
 			 */
 			idx = (bit_follow & ((1 << bits) - 1));
-			if ((fixed_huff_dec_table[idx] & 0xF) > bits) {
+			if ((fixed_huff_dec_table[idx] & 0x3F) > bits) {
 				/* no match found with <bits>, so there must be
 				 * data available for reading (errors appart)
 				 * Since we already have 7 bits and a refill is
@@ -348,8 +348,8 @@ static inline int gethuff_fixed(const unsigned char **in_ptr, const unsigned cha
 		}
 		break;
 	}
-	*num_bits = bits - (fixed_huff_dec_table[idx] & 0xF);
-	*bit_accum = bit_follow >> (fixed_huff_dec_table[idx] & 0xF);
+	*num_bits = bits - (fixed_huff_dec_table[idx] & 0x3F);
+	*bit_accum = bit_follow >> (fixed_huff_dec_table[idx] & 0x3F);
 	*var = fixed_huff_dec_table[idx] >> 7;
 
 	return 1;
@@ -426,18 +426,21 @@ static inline uint8_t rbit5(uint8_t v)
 /* handle up to one literal at output position <ofs>. This may only be used
  * inside uslz_decode_block() immediately after REFILL() in the loop. The "if"
  * block is used to automatically adapt to the size of the long and handle
- * either 2 or 6 symbols at once.
+ * either 2 or 6 symbols at once. Note that num_bits may contain bit 7 set and
+ * will need to be masked before being consumed at the end of the calls.
  */
 #define FIXED_LITERAL(ofs)                                                     \
 	do {                                                                   \
 		if (ofs < __SIZEOF_LONG__ - 2) {                               \
 			unsigned int entry;                                    \
 			entry = fixed_huff_dec_table[bit_accum & 0x1FF];       \
-			bit_accum >>= entry & 0xF;                             \
-			num_bits   -= entry & 0xF;                             \
+			bit_accum >>= entry & 0x3F;                            \
+			num_bits   -= entry;                                   \
 			state->symbol = entry >> 7;                            \
-			if (state->symbol >= 256)                              \
+			if (state->symbol >= 256) {                            \
+				num_bits &= 0x3F;                              \
 				goto have_symbol;                              \
+			}                                                      \
 			*out++ = state->symbol;                                \
 		}                                                              \
 	} while (0)
@@ -866,6 +869,7 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 				FIXED_LITERAL(0); FIXED_LITERAL(1);
 				FIXED_LITERAL(2); FIXED_LITERAL(3);
 				FIXED_LITERAL(4); FIXED_LITERAL(5);
+				num_bits &= 0x3F;
 			}
 			/* the loop may have filled the output exactly to the
 			 * limit, and the generic path only checks that before
@@ -1788,16 +1792,17 @@ static inline void __uslz_prepare_fixed_huff_dec_table(void)
 	 *
 	 * symbols and len are stored on 16bits unsigned integers. We use exactly 512 indexes
 	 * (from 0 to 511 which is 9 bits maximal value) as static encoding is performed using
-	 * at most 9 bits:
+	 * at most 9 bits. Len is stored on 6 bits so that the compiler knows it can drop the
+	 * mask when using them for a shift on archs that mask upper bits in shift counts.
 	 *
 	 * Each value in the array is stored this way:
 	 *
 	 *    9 bits for the symbol (A)
-	 *    3 unused bits
-	 *    4 bits for the len (B)
+	 *    1 unused bit
+	 *    6 bits for the len (B), only 4 of which are set
 	 *
 	 * ie:
-	 *      AAAAAAAA AXXXBBBB
+	 *      AAAAAAAA AXBBBBBB
 	 */
 
 	// we revese the codes in order to directly compare them as they appear
