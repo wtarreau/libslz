@@ -189,7 +189,7 @@ static inline uint32_t rbit5(uint32_t v)
  * <len> bits long. The function might work with more than 9 bits in certain
  * cases with no guarantees, so don't go over 9.
  */
-static inline uint32_t rbit9(uint32_t input, char len)
+static inline uint32_t rbit9(uint32_t input, int len)
 {
 #if defined(__aarch64__) || defined(__arm__)
 	/* ARM has a fast rbit instruction */
@@ -198,16 +198,11 @@ static inline uint32_t rbit9(uint32_t input, char len)
 	return input;
 
 #else /* not arm */
-	uint32_t ret = 0;
-
-	while (len) {
-		ret <<= 1;
-		ret |= (input & 1);
-		input >>= 1;
-		len--;
-	}
-
-	return ret;
+	uint32_t h, l;
+	h = input >> 5;
+	l = input;
+	h = rbit5(h); l = rbit5(l);
+	return ((l << 5) | h) >> (10 - len); /* new_h = [rev(l):5][rev(h):5] */
 #endif
 }
 
