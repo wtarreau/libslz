@@ -167,10 +167,23 @@ static inline uint32_t update_crc(uint32_t crc, const void *buf, int len)
 /* reverses bits in 5bits len <v> input and returns the new value.
  * ie: 01100 becomes 00110. Bits 5 and above are ignored.
  */
+#if defined(__aarch64__) || defined(__arm__)
+
+/* ARM has a fast rbit instruction */
+static inline uint32_t rbit5(uint32_t v)
+{
+       __asm__ ("rbit %w0, %w0" : "+r" (v));
+       return v >> 27;
+}
+
+#else /* not arm */
+
 #define rbit5(v) ({                                                             \
 	typeof(v) _v = (v);                                                     \
 	((0xf7b3d591e6a2c480ULL >> ((_v & 0x1e) * 2)) & 0xf) + ((_v & 1) << 4); \
 })
+
+#endif
 
 /* helper function to reverse bits in <input> which is expected to be
  * <len> bits long.
