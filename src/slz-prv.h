@@ -164,6 +164,15 @@ static inline uint32_t update_crc(uint32_t crc, const void *buf, int len)
 	return slz_crc32_by4(crc, buf, len);
 }
 
+/* reverses bits in 5bits len <v> input and returns the new value.
+ * ie: 01100 becomes 00110. Bits 5-7 are ignored.
+ */
+static inline uint8_t rbit5(uint8_t v)
+{
+	v = ((0xf7b3d591e6a2c480ULL >> ((v & 0x1e) * 2)) & 0xf) + ((v & 1) << 4);
+	return v;
+}
+
 /* helper function to reverse bits in <input> which is expected to be
  * <len> bits long.
  */

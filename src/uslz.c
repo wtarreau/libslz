@@ -355,16 +355,6 @@ static inline int gethuff_fixed(const unsigned char **in_ptr, const unsigned cha
 	return 1;
 }
 
-/* reverses bits in 5bits len <v> input and returns the new value.
- * ie: 01100 becomes 00110. Bits 5-7 are ignored.
- */
-static inline uint8_t rbit5(uint8_t v)
-{
-	v = ((0xf7b3d591e6a2c480ULL >> ((v & 0x1e) * 2)) & 0xf) + ((v & 1) << 4);
-	return v;
-}
-
-
 /* The set of macros below is relevant for uslz_decode_block() function */
 
 /* Fast path for the bit reader. Without it the accumulator is refilled one
