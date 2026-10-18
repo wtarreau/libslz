@@ -185,12 +185,13 @@ static inline uint32_t rbit5(uint32_t v)
 
 #endif
 
-/* helper function to reverse bits in <input> which is expected to be
- * <len> bits long.
+/* helper function to reverse up to 9 bits in <input> which is expected to be
+ * <len> bits long. The function might work with more than 9 bits in certain
+ * cases with no guarantees, so don't go over 9.
  */
-static inline short rev_short(short input, int len)
+static inline uint32_t rbit9(uint32_t input, char len)
 {
-	short ret = 0;
+	uint32_t ret = 0;
 
 	while (len) {
 		ret <<= 1;

@@ -261,7 +261,7 @@ static void gen_fast_table(unsigned int symbols, const unsigned char *lengths,
 			continue;
 
 		/* codes appear bit-reversed in the accumulator */
-		rev = (unsigned short)rev_short(code, len);
+		rev = rbit9(code, len);
 		step = 1U << len;
 		for (; rev < (1U << tbits); rev += step)
 			table[rev] = (i << 7) | len;
@@ -1941,41 +1941,41 @@ static inline void __uslz_prepare_fixed_huff_dec_table(void)
 	 */
 
 	// we revese the codes in order to directly compare them as they appear
-	// in the bit accumulator in huffman decoding func using rev_short(), the
+	// in the bit accumulator in huffman decoding func using rbit9(), the
 	// RFC doesn't specify bit order is inverted but this is the only way this
 	// works in practise.
 	while (it <= 143) {
 		// 00110000X through 10111111X
-		fixed_huff_dec_table[rev_short((0x30 + it), 8) | 0x100] = it << 7;      // symbol
-		fixed_huff_dec_table[rev_short((0x30 + it), 8) | 0x100] |= 8;           // len
-		fixed_huff_dec_table[rev_short((0x30 + it), 8)] = it << 7;              // symbol
-		fixed_huff_dec_table[rev_short((0x30 + it), 8)] |= 8;                   // len
+		fixed_huff_dec_table[rbit9((0x30 + it), 8) | 0x100] = it << 7;      // symbol
+		fixed_huff_dec_table[rbit9((0x30 + it), 8) | 0x100] |= 8;           // len
+		fixed_huff_dec_table[rbit9((0x30 + it), 8)] = it << 7;              // symbol
+		fixed_huff_dec_table[rbit9((0x30 + it), 8)] |= 8;                   // len
 		it += 1;
 	}
 	while (it <= 255) {
 		// 110010000 through 111111111
-		fixed_huff_dec_table[rev_short(0x190 + it - 144, 9)] = it << 7;         // symbol
-		fixed_huff_dec_table[rev_short(0x190 + it - 144, 9)] |= 9;              // len
+		fixed_huff_dec_table[rbit9(0x190 + it - 144, 9)] = it << 7;         // symbol
+		fixed_huff_dec_table[rbit9(0x190 + it - 144, 9)] |= 9;              // len
 		it += 1;
 	}
 	while (it <= 279) {
 		// 0000000XX through 0010111XX
-		fixed_huff_dec_table[rev_short((0x0 + it - 256), 7)] = it << 7;         // symbol
-		fixed_huff_dec_table[rev_short((0x0 + it - 256), 7)] |= 7;              // len
-		fixed_huff_dec_table[rev_short((0x0 + it - 256), 7) | 0x80] = it << 7;  // symbol
-		fixed_huff_dec_table[rev_short((0x0 + it - 256), 7) | 0x80] |= 7;       // len
-		fixed_huff_dec_table[rev_short((0x0 + it - 256), 7) | 0x100] = it << 7; // symbol
-		fixed_huff_dec_table[rev_short((0x0 + it - 256), 7) | 0x100] |= 7;      // len
-		fixed_huff_dec_table[rev_short((0x0 + it - 256), 7) | 0x180] = it << 7; // symbol
-		fixed_huff_dec_table[rev_short((0x0 + it - 256), 7) | 0x180] |= 7;      // len
+		fixed_huff_dec_table[rbit9((0x0 + it - 256), 7)] = it << 7;         // symbol
+		fixed_huff_dec_table[rbit9((0x0 + it - 256), 7)] |= 7;              // len
+		fixed_huff_dec_table[rbit9((0x0 + it - 256), 7) | 0x80] = it << 7;  // symbol
+		fixed_huff_dec_table[rbit9((0x0 + it - 256), 7) | 0x80] |= 7;       // len
+		fixed_huff_dec_table[rbit9((0x0 + it - 256), 7) | 0x100] = it << 7; // symbol
+		fixed_huff_dec_table[rbit9((0x0 + it - 256), 7) | 0x100] |= 7;      // len
+		fixed_huff_dec_table[rbit9((0x0 + it - 256), 7) | 0x180] = it << 7; // symbol
+		fixed_huff_dec_table[rbit9((0x0 + it - 256), 7) | 0x180] |= 7;      // len
 		it += 1;
 	}
 	while (it <= 287) {
 		// 11000000X through 11000111X
-		fixed_huff_dec_table[rev_short((0xC0 + it - 280), 8)] = it << 7;         // symbol
-		fixed_huff_dec_table[rev_short((0xC0 + it - 280), 8)] |= 8;              // len
-		fixed_huff_dec_table[rev_short((0xC0 + it - 280), 8) | 0x100] = it << 7; // symbol
-		fixed_huff_dec_table[rev_short((0xC0 + it - 280), 8) | 0x100] |= 8;      // len
+		fixed_huff_dec_table[rbit9((0xC0 + it - 280), 8)] = it << 7;         // symbol
+		fixed_huff_dec_table[rbit9((0xC0 + it - 280), 8)] |= 8;              // len
+		fixed_huff_dec_table[rbit9((0xC0 + it - 280), 8) | 0x100] = it << 7; // symbol
+		fixed_huff_dec_table[rbit9((0xC0 + it - 280), 8) | 0x100] |= 8;      // len
 		it += 1;
 	}
 #endif
