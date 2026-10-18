@@ -165,13 +165,12 @@ static inline uint32_t update_crc(uint32_t crc, const void *buf, int len)
 }
 
 /* reverses bits in 5bits len <v> input and returns the new value.
- * ie: 01100 becomes 00110. Bits 5-7 are ignored.
+ * ie: 01100 becomes 00110. Bits 5 and above are ignored.
  */
-static inline uint8_t rbit5(uint8_t v)
-{
-	v = ((0xf7b3d591e6a2c480ULL >> ((v & 0x1e) * 2)) & 0xf) + ((v & 1) << 4);
-	return v;
-}
+#define rbit5(v) ({                                                             \
+	typeof(v) _v = (v);                                                     \
+	((0xf7b3d591e6a2c480ULL >> ((_v & 0x1e) * 2)) & 0xf) + ((_v & 1) << 4); \
+})
 
 /* helper function to reverse bits in <input> which is expected to be
  * <len> bits long.
