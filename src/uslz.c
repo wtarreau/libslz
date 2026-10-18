@@ -313,6 +313,7 @@ static inline int gethuff(unsigned int *huff_index,
 	unsigned int index;
 	unsigned int bits;
 	unsigned long bit_follow;
+	int ret = 0;
 
 	index = *huff_index;
 	bits = *num_bits;
@@ -320,14 +321,10 @@ static inline int gethuff(unsigned int *huff_index,
 
 	for (;;) {
 		if (bits == 0) {
-			if (*in_ptr >= in_top) {
-				*num_bits = bits;
-				*bit_accum = bit_follow;
-				*huff_index = index;
-				return 0;
-			}
-			bit_follow |= (unsigned long) (*in_ptr)[0] << bits;
-			bits += 8;
+			if (*in_ptr >= in_top)
+				break;
+			bit_follow |= (unsigned long) (*in_ptr)[0];
+			bits = 8;
 			(*in_ptr)++;
 		}
 
@@ -335,6 +332,9 @@ static inline int gethuff(unsigned int *huff_index,
 		bit_follow >>= 1;
 		bits--;
 		if (table[index] >= 0) {
+			*var = table[index];
+			index = 0;
+			ret = 1;
 			break;
 		}
 		index = ~(table[index]);
@@ -342,10 +342,9 @@ static inline int gethuff(unsigned int *huff_index,
 
 	*num_bits = bits;
 	*bit_accum = bit_follow;
-	*var = table[index];
-	*huff_index = 0;
+	*huff_index = index;
 
-	return 1;
+	return ret;
 }
 
 /* when decoding static/fixed huffman (we must be sure of that before
