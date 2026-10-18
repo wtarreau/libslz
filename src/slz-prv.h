@@ -120,6 +120,16 @@ static inline uint64_t read_le64(const void *p)
 #endif
 }
 
+/* reads an unaligned machine word in little endian order, same as read_le32() */
+static inline unsigned long read_lelong(const void *p)
+{
+#if __SIZEOF_LONG__ > 4
+	return read_le64(p);
+#else
+	return read_le32(p);
+#endif
+}
+
 /* writes an unaligned 32-bit word in little endian order */
 static inline void write_le32(void *p, uint32_t v)
 {
