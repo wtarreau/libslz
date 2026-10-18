@@ -877,6 +877,7 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 
 					do {
 						*dst++ = *src++;
+						__asm__("" : "+r"(dst)); // keep gcc's vectorizer off to save 10% perf
 					} while (--cnt);
 				}
 			}
