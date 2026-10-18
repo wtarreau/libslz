@@ -272,13 +272,13 @@ struct uslz_stream {
 	unsigned long dec_bofs;               /* offset used to read the current decoded block */
 	unsigned long dec_bsize;              /* size of the current decoded block */
 
-	uint64_t bit_accum;                   /* bit accumulator (used by GETBITS() macro) */
 	unsigned char num_bits;               /* number of bits in the accumulator */
 
 	unsigned char block_type;             /* compressed block type */
 	unsigned int huff_index;              /* current index for pending huffman decoding
 	                                       * attempt
 	                                       */
+	uint64_t bit_accum;                   /* bit accumulator (used by GETBITS() macro) */
 	unsigned int symbol;                  /* symbol code currently being processed */
 	unsigned int last_value;              /* last value read for length / distance table
 	                                       * construction
