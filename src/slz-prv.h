@@ -191,6 +191,13 @@ static inline uint32_t rbit5(uint32_t v)
  */
 static inline uint32_t rbit9(uint32_t input, char len)
 {
+#if defined(__aarch64__) || defined(__arm__)
+	/* ARM has a fast rbit instruction */
+	input <<= 32 - len; // align left before reversal
+	__asm__ ("rbit %w0, %w0" : "+r" (input));
+	return input;
+
+#else /* not arm */
 	uint32_t ret = 0;
 
 	while (len) {
@@ -201,6 +208,7 @@ static inline uint32_t rbit9(uint32_t input, char len)
 	}
 
 	return ret;
+#endif
 }
 
 #endif
