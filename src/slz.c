@@ -895,7 +895,13 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 			 * skipped each time so that a long incompressible block
 			 * costs less and less to walk over. A match resets it.
 			 */
-			if (!(plit & 2047)) {
+			if (level >= 3) {
+				if (__builtin_expect(plit == 0x8000, 0)) {
+					copy_lit_small(strm, in + pos - plit, plit, 1);
+					plit = 0;
+				}
+			}
+			else if (!(plit & 2047)) {
 #if !SLZ_LITERAL_SKIP
 				if (__builtin_expect(plit == 0x8000, 1)) {
 					copy_lit_small(strm, in + pos - plit, plit, 1);
@@ -1018,7 +1024,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 		 * that it's both easier and faster this way than changing then
 		 * rolling back offsets when we finally give up and send_as_lit.
 		 */
-		if (__no_builtin_expect(plit != 0, 1) && last >= MAX_C(sizeof(long), SLZ_BACKWARD_MATCH)) {
+		if (level >= 2 && __builtin_expect(plit != 0, 1) && last >= MAX_C(sizeof(long), SLZ_BACKWARD_MATCH)) {
 			long bmax = MIN(plit, SLZ_BACKWARD_MATCH);
 			long back = 0;
 
