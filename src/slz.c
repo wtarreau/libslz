@@ -777,7 +777,8 @@ static inline void insert_ref(union ref *refs, const unsigned char *in, unsigned
  * better (+0.5%). As a general rule, nothing vectorizes well here, and the
  * unaligned, short memcpy() calls must not be translated to AVX512 code.
  */
-long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
+static inline __attribute__((always_inline))
+long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more, int level)
 {
 	long rem = ilen;
 	unsigned long pos = 0;
@@ -1204,6 +1205,34 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, 
  leave:
 	strm->ilen += ilen;
 	return strm->outbuf - out;
+}
+
+static __attribute__((noinline))
+long _slz_rfc1951_encode_lev1(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
+{
+	return _slz_rfc1951_encode(strm, out, in, ilen, more, 1);
+}
+
+static __attribute__((noinline))
+long _slz_rfc1951_encode_lev2(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
+{
+	return _slz_rfc1951_encode(strm, out, in, ilen, more, 2);
+}
+
+static __attribute__((noinline))
+long _slz_rfc1951_encode_lev3(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
+{
+	return _slz_rfc1951_encode(strm, out, in, ilen, more, 3);
+}
+
+long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
+{
+	if (strm->level <= 1)
+		return _slz_rfc1951_encode_lev1(strm, out, in, ilen, more);
+	else if (strm->level <= 2)
+		return _slz_rfc1951_encode_lev2(strm, out, in, ilen, more);
+	else
+		return _slz_rfc1951_encode_lev3(strm, out, in, ilen, more);
 }
 
 /* Initializes stream <strm> for use with raw deflate (rfc1951). The CRC is
