@@ -112,11 +112,12 @@ static uint32_t fh_dist_table[32768];
 /* Enables growing a match backwards over the literals that are still pending,
  * see slz_rfc1951_encode(). Costs a little CPU on every match and gains about
  * 1% of output. Tests show that matching up to 2 bytes brings almost optimal
- * results at minimal extra cost.
+ * results at minimal extra cost, and that compression gains at 1 byte are
+ * higher than the CPU increase they cause, and tend to result in higher
+ * compression speed due to the savings on encoding. The only way to disable
+ * this optimization is to comment out this line.
  */
-#ifndef SLZ_BACKWARD_MATCH
-# define SLZ_BACKWARD_MATCH 8
-#endif
+#define SLZ_BACKWARD_MATCH ((const int[]){ 0, 1, 2, 8 })
 
 /* Log2 of the size of the hash table used for the references table. */
 #ifndef SLZ_HASH_BITS
@@ -1004,7 +1005,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 		    (dist & 0x1f) + (code >> 16) + SLZ_SWITCH_COST > 8 * mlen)
 			goto send_as_lit;
 
-#if SLZ_BACKWARD_MATCH
+#if defined(SLZ_BACKWARD_MATCH)
 		/* Compare queued literals in case the previous ones were not
 		 * found due to hash collisions but still match. We don't go
 		 * further than 8 bytes so that we can find them in a single
@@ -1029,36 +1030,36 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 		 * that it's both easier and faster this way than changing then
 		 * rolling back offsets when we finally give up and send_as_lit.
 		 */
-		if (level >= 2 && __builtin_expect(plit != 0, 1) &&
-		    ((level == 2 && last >= 2) || (level > 2 && last >= MAX_C(sizeof(long), SLZ_BACKWARD_MATCH)))) {
-			long bmax = MIN(plit, SLZ_BACKWARD_MATCH);
+		if (__builtin_expect(plit != 0, 1) &&
+		    (last >= MAX_C(sizeof(long), SLZ_BACKWARD_MATCH[level]))) {
+			long bmax = MIN(plit, 8); // keep it at 8, always faster
 			long back = 0;
 
 			if (bmax > 258 - mlen)
 				bmax = 258 - mlen;
 
 #if defined(UNALIGNED_LE_OK)
-			if (SLZ_BACKWARD_MATCH == 2 || (SLZ_BACKWARD_MATCH >= 2 && level == 2)) { // 43.32%, best speed vs savings
+			if (SLZ_BACKWARD_MATCH[level] == 2) { // 43.32%, best speed vs savings
 				uint16_t x = *(uint16_t *)&in[pos - 2] ^ *(uint16_t *)(lastp - 2);
 				back = x & 0xff00 ? 0 : x ? 1 : 2;
 				if (back > bmax)
 					back = bmax;
-			} else if (SLZ_BACKWARD_MATCH == 3 || SLZ_BACKWARD_MATCH == 4) { // 32 bits: 43.31% or 43.30%
+			} else if (SLZ_BACKWARD_MATCH[level] == 3 || SLZ_BACKWARD_MATCH[level] == 4) { // 32 bits: 43.31% or 43.30%
 				uint32_t x = *(uint32_t *)&in[pos - 4] ^ *(uint32_t *)(lastp - 4);
 				back = x & 0xffff0000u ?
 					x & 0xff000000u ? 0 : 1 :
 					x & 0xffffff00u ? 2 :
-					x ? 3 : SLZ_BACKWARD_MATCH; // 3 or 4, test eliminated at 3
+					x ? 3 : SLZ_BACKWARD_MATCH[level]; // 3 or 4, test eliminated at 3
 				if (back > bmax)
 					back = bmax;
-			} else if (SLZ_BACKWARD_MATCH == 8) { // 64 bits: 43.30%
+			} else if (SLZ_BACKWARD_MATCH[level] == 8) { // 64 bits: 43.30%
 				uint64_t x = *(uint64_t *)&in[pos - 8] ^ *(uint64_t *)(lastp - 8);
 				back = x ? (__builtin_clzll(x) >> 3) : 8;
 				if (back > bmax)
 					back = bmax;
 			} else
 #endif
-			if (SLZ_BACKWARD_MATCH == 1) { // single-byte match: 43.39%
+			if (SLZ_BACKWARD_MATCH[level] == 1) { // single-byte match: 43.39%
 				if (in[pos - 1] == lastp[-1])
 					back++;
 				if (back > bmax)
