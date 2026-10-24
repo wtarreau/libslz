@@ -115,7 +115,7 @@ static uint32_t fh_dist_table[32768];
  * results at minimal extra cost.
  */
 #ifndef SLZ_BACKWARD_MATCH
-# define SLZ_BACKWARD_MATCH 2
+# define SLZ_BACKWARD_MATCH 8
 #endif
 
 /* Log2 of the size of the hash table used for the references table. */
@@ -1029,7 +1029,8 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 		 * that it's both easier and faster this way than changing then
 		 * rolling back offsets when we finally give up and send_as_lit.
 		 */
-		if (level >= 2 && __builtin_expect(plit != 0, 1) && last >= MAX_C(sizeof(long), SLZ_BACKWARD_MATCH)) {
+		if (level >= 2 && __builtin_expect(plit != 0, 1) &&
+		    ((level == 2 && last >= 2) || (level > 2 && last >= MAX_C(sizeof(long), SLZ_BACKWARD_MATCH)))) {
 			long bmax = MIN(plit, SLZ_BACKWARD_MATCH);
 			long back = 0;
 
@@ -1037,7 +1038,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 				bmax = 258 - mlen;
 
 #if defined(UNALIGNED_LE_OK)
-			if (SLZ_BACKWARD_MATCH == 2) { // 43.32%, best speed vs savings
+			if (SLZ_BACKWARD_MATCH == 2 || (SLZ_BACKWARD_MATCH >= 2 && level == 2)) { // 43.32%, best speed vs savings
 				uint16_t x = *(uint16_t *)&in[pos - 2] ^ *(uint16_t *)(lastp - 2);
 				back = x & 0xff00 ? 0 : x ? 1 : 2;
 				if (back > bmax)
