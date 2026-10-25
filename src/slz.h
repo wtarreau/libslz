@@ -77,9 +77,9 @@ struct slz_stream {
 #else
 	uint32_t queue; /* last pending bits, LSB first, faster on 32-bit archs */
 #endif
-	uint32_t qbits; /* number of bits in queue, < 8 on 32-bit, < 32 on 64-bit */
 	unsigned char *outbuf; /* set by encode() */
-	uint16_t state; /* one of slz_state */
+	uint32_t qbits; /* number of bits in queue, < 8 on 32-bit, < 32 on 64-bit */
+	uint32_t state;   /* one of slz_state */
 	uint8_t unused:2; /* free for future use */
 	uint8_t format:2; /* SLZ_FMT_* */
 	uint8_t level:4;  /* 0 = no compression, 1..15 = compression */
