@@ -417,7 +417,7 @@ static inline uint8_t rbit5(uint8_t v)
  * the current checksum batch.
  */
 #define SET_OUT_LIM() do {                                          \
-		unsigned long __room = out_max - 1 - dec_bsize;      \
+		unsigned long __room = out_max - dec_bsize;          \
 		                                                    \
 		out_lim = out_end;                                  \
 		if ((unsigned long)(out_end - crc_ptr) > CRC_BLOCK)  \
@@ -444,6 +444,55 @@ static inline uint8_t rbit5(uint8_t v)
 #define R_UNCOMP 2
 
 #define CASE_STATE(s)  case USLZ_ST_##s: goto state_##s
+
+/* Called when uslz_decode_block() reported a full output. If it was waiting
+ * for a symbol and that symbol is an end of block, the EOB is consumed, the
+ * state is set so that uslz_decode_block() finishes the block when called
+ * again, and non-zero is returned. Otherwise nothing
+ * changes and zero is returned. The EOB emits nothing and must still be
+ * consumed, as well as the trailer that may follow, or a caller whose buffer
+ * is exactly the size of the output would never see the end of the stream.
+ * It is deliberately not done in uslz_decode_block(), where even an out of
+ * line call in the checkpoint costs 2 to 5% on this hot loop by disturbing
+ * its register allocation, and it is kept out of line and holds all the
+ * tests so as to add as little code as possible to uslz_decode().
+ */
+static __attribute__((noinline))
+int uslz_eob_follows(struct uslz_stream *state)
+{
+	const unsigned char *in_ptr = state->in_ptr;
+	unsigned long bit_accum = state->bit_accum;
+	unsigned char num_bits = state->num_bits;
+	unsigned int hi = state->huff_index;
+	unsigned int sym;
+	int ret;
+
+	if (state->dec_bsize < state->out_max || state->state != USLZ_ST_READ_SYMBOL)
+		return 0;
+
+	if (state->block_type != 2)
+		ret = gethuff_fixed(&in_ptr, state->in_top, &num_bits, &bit_accum, &sym);
+	else
+		ret = gethuff(&hi, &in_ptr, state->in_top, &num_bits, &bit_accum, &sym, state->literal_table);
+
+	if (!ret || sym != 256)
+		return 0;
+
+	state->in_ptr = in_ptr;
+	state->bit_accum = bit_accum;
+	state->num_bits = num_bits;
+	state->huff_index = 0;
+	state->symbol = 256;
+
+	/* uslz_decode_block() must now finish the block. Rather than adding a
+	 * state for this, which costs ~1% by moving the hot loop around, we
+	 * resume as a stored block with nothing left to copy, which goes
+	 * straight to the end of the block.
+	 */
+	state->nread = state->len;
+	state->state = USLZ_ST_UNCOMPRESSED_DATA;
+	return 1;
+}
 
 /* main decoding function for inflate API, takes <state> stream as parameter
  * and decode as much data as possible from input data (as long as output
@@ -926,7 +975,7 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 	/* no more room in the decoded block, ask for a drain. The state to
 	 * resume from was set by whoever jumped here.
 	 */
-	if (dec_bsize + 1 >= out_max)
+	if (dec_bsize >= out_max)
 		goto out_of_space;
 
 	SET_OUT_LIM();
@@ -1504,6 +1553,10 @@ enum uslz_decode_ret uslz_decode(struct uslz_stream *state,
 			case USLZ_DECODE_SUCCESS:
 				break;
 			case USLZ_DECODE_OUT_OF_SPACE:
+				/* a full output may only be waiting for an EOB */
+				if (__builtin_expect(uslz_eob_follows(state), 0))
+					continue;
+				goto drain;
 			case USLZ_DECODE_OUT_OF_DATA:
 				goto drain;
 			default:
