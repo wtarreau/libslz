@@ -612,6 +612,12 @@ static void copy_lit_small(struct slz_stream *__restrict strm, const void *buf, 
 	enqueue24(strm, (!more) << eob_shift, 3 + eob_shift + (7 & -(3 + eob_shift + strm->qbits))); // EOB + BFINAL + BTYPE
 	strm->state = more ? SLZ_ST_EOB : SLZ_ST_DONE;
 
+#if !SLZ_DIRECT_ENQUEUE24
+	/* the queue is byte-aligned now, but the conditional 64-bit enqueue24()
+	 * may still hold up to 4 bytes of it that must be written first.
+	 */
+	flush_bits(strm);
+#endif
 	copy_16b(strm, len);
 	copy_16b(strm, ~len);
 	memcpy(strm->outbuf, buf, len);
@@ -638,6 +644,9 @@ static void copy_lit(struct slz_stream *__restrict strm, const void *buf, uint32
 	do {
 		/* wire BFINAL (!more), BTYPE (00) and round to the next byte boundary */
 		enqueue24(strm, !(more || len), 3 + ((5 - strm->qbits) & 7));
+#if !SLZ_DIRECT_ENQUEUE24
+		flush_bits(strm); // see copy_lit_small()
+#endif
 		copy_32b(strm, (~len2 << 16) + len2);
 		memcpy(strm->outbuf, buf, len2);
 		buf += len2;
