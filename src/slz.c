@@ -67,7 +67,7 @@ static uint32_t fh_dist_table[32768];
 
 /* directly write 64 bits at a tome to output for up to 56 bits */
 #ifndef SLZ_DIRECT_ENQUEUE56
-# if defined(USE_64BIT_QUEUE) && defined(UNALIGNED_LE_OK)
+# if defined(__SIZEOF_LONG__) && (__SIZEOF_LONG__ - 0 > 4) && defined(UNALIGNED_LE_OK)
 #  define SLZ_DIRECT_ENQUEUE56 1
 # else
 #  define SLZ_DIRECT_ENQUEUE56 0
@@ -81,12 +81,12 @@ static uint32_t fh_dist_table[32768];
  * output pointer over bytes that were never written.
  */
 #if SLZ_DIRECT_ENQUEUE8 && !SLZ_DIRECT_ENQUEUE24 && \
-    defined(USE_64BIT_QUEUE) && defined(UNALIGNED_LE_OK)
+    defined(__SIZEOF_LONG__) && (__SIZEOF_LONG__ - 0 > 4) && defined(UNALIGNED_LE_OK)
 # error "SLZ_DIRECT_ENQUEUE8 requires SLZ_DIRECT_ENQUEUE24 on this platform"
 #endif
 
 /* enqueue56() needs a 64-bit queue and unaligned little-endian stores. */
-#if SLZ_DIRECT_ENQUEUE56 && !(defined(USE_64BIT_QUEUE) && defined(UNALIGNED_LE_OK))
+#if SLZ_DIRECT_ENQUEUE56 && !(defined(__SIZEOF_LONG__) && (__SIZEOF_LONG__ - 0 > 4) && defined(UNALIGNED_LE_OK))
 # undef SLZ_DIRECT_ENQUEUE56
 # define SLZ_DIRECT_ENQUEUE56 0
 #endif
