@@ -80,6 +80,7 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    "  -l <loops> loop <loops> times over the same file\n"
 	    "  -n         does nothing, just for gzip compatibility\n"
 	    "  -t         test mode: do not emit anything\n"
+	    "  -T         optimize for text contents (html, css, js, json, ...)\n"
 	    "  -v         increase verbosity\n"
 	    "\n"
 	    "  -D         use raw Deflate output format (RFC1951)\n"
@@ -118,6 +119,7 @@ int main(int argc, char **argv)
 	int level   = 2;
 	int verbose = 0;
 	int test    = 0;
+	int ctype   = SLZ_CT_GENERIC;
 	int format  = SLZ_FMT_GZIP;
 	int force   = 0;
 	int fd = 0;
@@ -176,6 +178,9 @@ int main(int argc, char **argv)
 
 		else if (strcmp(argv[0], "-t") == 0)
 			test = 1;
+
+		else if (strcmp(argv[0], "-T") == 0)
+			ctype = SLZ_CT_TEXT;
 
 		else if (strcmp(argv[0], "-v") == 0)
 			verbose++;
@@ -319,6 +324,7 @@ int main(int argc, char **argv)
 		}
 
 		slz_init(&strm, level, format);
+		slz_set_content_type(&strm, ctype);
 
 		outblen = ofs = 0;
 		do {
