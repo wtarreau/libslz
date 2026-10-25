@@ -1186,13 +1186,21 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 				 * ring, which is only valid history once the
 				 * ring has wrapped at least once. This test
 				 * replaces the former distance_avail counter:
-				 * a distance never exceeds 32K and the ring is
-				 * at least that large, so "have we produced at
-				 * least <distance> bytes" is exactly "has the
-				 * ring wrapped, or is the distance within the
-				 * current position".
+				 * "have we produced at least <distance> bytes"
+				 * is exactly "has the ring wrapped, or is the
+				 * distance within the current position", as
+				 * long as the distance doesn't exceed the ring.
+				 * It can only do so with a ring smaller than
+				 * 32K, where such a match would start before
+				 * <out_base>. Testing it here only costs in
+				 * this rarely taken branch. Note the likely()
+				 * test below that proves to improve the perf
+				 * while an unlikely degrades them. This is
+				 * likely due to the short exit path compared
+				 * to the heavier memmove() that's better kept
+				 * away from the rest of the hot path.
 				 */
-				if (!wrapped) {
+				if (__builtin_expect(!wrapped || state->distance > out_max, 1)) {
 					err_code = USLZ_DECODE_E_DISTANCE;
 					goto error_return;
 				}
@@ -1909,10 +1917,11 @@ enum uslz_decode_ret uslz_decode(struct uslz_stream *state,
  * It will be used by slz_inflate as a rotating buffer to decode the stream
  * and allow the caller to read decoded data. As such it is exclusively managed
  * by slz_inflate and must not be modified by the caller, only read from during
- * the whole decoding process. Minimum size should be 32K, because zlib algo
- * specifies that up to 32K bytes distance can be used, thus the inflate API
- * should always be able to go 32K bytes in the past at any time with such a
- * buffer.
+ * the whole decoding process. The size should be at least 32K, because deflate
+ * permits references up to 32K bytes in the past, which a smaller buffer
+ * cannot hold once it has wrapped: such references are then rejected with
+ * USLZ_DECODE_E_DISTANCE, even in a valid stream. A smaller buffer is thus
+ * only suited to a stream whose whole output fits in it.
  *
  * Returns 1 on success and 0 on failure.
  */
@@ -1921,7 +1930,7 @@ int uslz_init(struct uslz_stream *state,
 {
 	struct uslz_stream zero = { 0 };
 
-	if (state == NULL || output_size < 32768 || output_buffer == NULL)
+	if (state == NULL || output_size < 1 || output_buffer == NULL)
 		return 0;
 
 	/* zero out <state> */
