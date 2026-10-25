@@ -895,31 +895,36 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 			 * skipped each time so that a long incompressible block
 			 * costs less and less to walk over. A match resets it.
 			 */
-			if (level >= 3) {
+#if SLZ_LITERAL_SKIP
+			if (level <= 1 && !(plit & 63)) {
+				/* be careful: plit+skip must never be >= 65535 */
+				long skip;
+				skip_ratio = (skip_ratio * 2 + 1) & 255; // capped exponential: 0,1,3,7,... and stays at 255
+				skip = rem >= skip_ratio * 32 ? skip_ratio * 32 : rem;
+				copy_lit_small(strm, in + pos - plit, plit + skip, more || skip < rem);
+				pos += skip;
+				rem -= skip;
+				plit = 0;
+				continue;
+			}
+			else if (level == 2 && !(plit & 2047)) {
+				/* be careful: plit+skip must never be >= 65535 */
+				long skip = rem >= skip_ratio * 4096 ? skip_ratio * 4096 : rem;
+				skip_ratio = (skip_ratio * 2 + 1) & 7; // capped exponential: 0,1,3,7 and stays at 7
+				copy_lit_small(strm, in + pos - plit, plit + skip, more || skip < rem);
+				pos += skip;
+				rem -= skip;
+				plit = 0;
+				continue;
+			}
+			else if (level >= 3) // no literal skip at levels >= 3
+#endif
+			{
+				/* either no literal_skip at build time, or high enough level */
 				if (__builtin_expect(plit == 0x8000, 0)) {
 					copy_lit_small(strm, in + pos - plit, plit, 1);
 					plit = 0;
 				}
-			}
-			else if (!(plit & 2047)) {
-#if !SLZ_LITERAL_SKIP
-				if (__builtin_expect(plit == 0x8000, 1)) {
-					copy_lit_small(strm, in + pos - plit, plit, 1);
-					plit = 0;
-				}
-#else
-				{
-					/* be careful: plit+skip must never be >= 65535 */
-					long skip = rem >= skip_ratio * 4096 ? skip_ratio * 4096 : rem;
-
-					skip_ratio = (skip_ratio * 2 + 1) & 7; // capped exponential: 0,1,3,7 and stays at 7
-					copy_lit_small(strm, in + pos - plit, plit + skip, more || skip < rem);
-					pos += skip;
-					rem -= skip;
-					plit = 0;
-				}
-#endif
-				continue;
 			}
 			continue;
 		}
