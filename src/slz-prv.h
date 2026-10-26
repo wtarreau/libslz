@@ -167,13 +167,19 @@ static inline uint32_t update_crc(uint32_t crc, const void *buf, int len)
 /* reverses bits in 5bits len <v> input and returns the new value.
  * ie: 01100 becomes 00110. Bits 5 and above are ignored.
  */
-#if defined(__aarch64__) || defined(__arm__)
+#if defined(__aarch64__) || defined(__ARM_ARCH_7A__)
 
-/* ARM has a fast rbit instruction */
+/* ARM >= v7 has a fast rbit instruction */
 static inline uint32_t rbit5(uint32_t v)
 {
-       __asm__ ("rbit %w0, %w0" : "+r" (v));
-       return v >> 27;
+#if defined(__ARM_ARCH_ISA_A64)
+	// 64 bit mode
+	__asm__ ("rbit %w0, %w0" : "+r" (v));
+#else
+	// 32 bit mode (e.g. armv7 compiler building for armv8
+	__asm__ ("rbit %0, %0" : "+r" (v));
+#endif
+	return v >> 27;
 }
 
 #else /* not arm */
@@ -191,10 +197,16 @@ static inline uint32_t rbit5(uint32_t v)
  */
 static inline uint32_t rbit9(uint32_t input, int len)
 {
-#if defined(__aarch64__) || defined(__arm__)
-	/* ARM has a fast rbit instruction */
+#if defined(__aarch64__) || defined(__ARM_ARCH_7A__)
+	/* ARM >= v7 has a fast rbit instruction */
 	input <<= 32 - len; // align left before reversal
+#if defined(__ARM_ARCH_ISA_A64)
+	// 64 bit mode
 	__asm__ ("rbit %w0, %w0" : "+r" (input));
+#else
+	// 32 bit mode (e.g. armv7 compiler building for armv8
+	__asm__ ("rbit %0, %0" : "+r" (input));
+#endif
 	return input;
 
 #else /* not arm */
