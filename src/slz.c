@@ -933,7 +933,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 #endif
 			{
 				/* either no literal_skip at build time, or high enough level */
-				if (__builtin_expect(plit == 0x8000, 0)) {
+				if (__builtin_expect(plit == 0xffc0, 0)) {
 					copy_lit_small(strm, in + pos - plit, plit, 1);
 					plit = 0;
 				}
