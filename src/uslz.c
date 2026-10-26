@@ -1524,7 +1524,7 @@ enum uslz_decode_ret uslz_decode(struct uslz_stream *state,
                                  unsigned char **decoded_data, long *decoded_size,
                                  long *consumed_bytes, uint32_t *crc_ret)
 {
-	enum uslz_decode_ret res;
+	enum uslz_decode_ret res = USLZ_DECODE_SUCCESS;
 
 	/* ensure input consistency */
 	if (compressed_data == NULL || compressed_size < 0 ||
