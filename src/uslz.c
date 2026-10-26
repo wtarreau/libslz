@@ -1072,7 +1072,9 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 				GETHUFF(state->symbol, state->literal_table);
 		}
 
+#if defined(UNALIGNED_LE_OK)
  have_symbol:
+#endif /* UNALIGNED_LE_OK */
 		/* If the symbol is a literal, add it to the buffer and continue
 		 * with the next code.
 		 */
