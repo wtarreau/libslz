@@ -811,6 +811,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 	strm->outbuf = out;
 
 #ifndef UNALIGNED_FASTER
+ reload_word:
 	if (rem >= 4)  // <word> is only used inside the loop below, hence the test for >= 4
 		word = ((uint32_t)(unsigned char)in[pos] << 8) + ((uint32_t)(unsigned char)in[pos + 1] << 16) + ((uint32_t)(unsigned char)in[pos + 2] << 24);
 #endif
@@ -906,7 +907,12 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 				pos += skip;
 				rem -= skip;
 				plit = 0;
+# ifndef UNALIGNED_FASTER
+				/* we'll need to update the current word since we skipped some bytes */
+				goto reload_word;
+# else
 				continue;
+# endif
 			}
 			else if (level == 2 && !(plit & 2047)) {
 				/* be careful: plit+skip must never be >= 65535 */
@@ -916,7 +922,12 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 				pos += skip;
 				rem -= skip;
 				plit = 0;
+# ifndef UNALIGNED_FASTER
+				/* we'll need to update the current word since we skipped some bytes */
+				goto reload_word;
+# else
 				continue;
+# endif
 			}
 			else if (level >= 3) // no literal skip at levels >= 3
 #endif
