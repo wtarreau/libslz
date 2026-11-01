@@ -778,6 +778,16 @@ static inline void insert_ref(union ref *refs, const unsigned char *in, unsigned
  * literals into a stored block. Its first reference is then accepted for what
  * it saves by itself, and the switch to fixed huffman is charged when it is
  * performed by that reference, but not when the first literals perform it.
+ *
+ * At level 1, literals are not counted one at a time, which costs too much in
+ * the main loop. Instead, a group of literals sent in fixed huffman mode before
+ * a reference is charged one bit per byte as if all of them took 9 bits, once
+ * the decision to send it in fixed huffman mode is taken. The balance is thus
+ * still an upper bound of the excess, and the group itself, whose decision did
+ * not include it, is shorter than 64 bytes there (longer ones are skipped and
+ * leave as a stored block), so it adds less than 8 bytes to the bound. On real
+ * data, the reference that follows almost always saves more than the charge,
+ * so this rarely changes a decision.
  */
 #define SLZ_MAX_DEBT        200
 #define SLZ_CREDIT           64
@@ -914,7 +924,8 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 		send_as_lit:
 			rem--;
 			plit++;
-			bal += ((unsigned char)word >= 144);
+			if (level >= 2) // level 1 charges whole groups, see SLZ_MAX_DEBT
+				bal += ((unsigned char)word >= 144);
 			pos++;
 
 			/* Incompressible data: once enough literals have accumulated
@@ -1160,8 +1171,11 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 				copy_lit(strm, in + pos - plit, plit, 1);
 				bal = strm->debt;
 			}
-			else
+			else {
+				if (level <= 1)
+					bal += plit; // worst case: all of them take 9 bits
 				copy_lit_huff(strm, in + pos - plit, plit, 1);
+			}
 
 			plit = 0;
 		}
