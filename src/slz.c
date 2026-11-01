@@ -764,7 +764,7 @@ static inline void insert_ref(union ref *refs, const unsigned char *in, unsigned
  * block. Below it, such references are accepted for what they save by
  * themselves, which is better for the ratio. Thus the balance never exceeds
  * SLZ_CREDIT + SLZ_MAX_DEBT + SLZ_SWITCH_COST, which is what bounds the excess
- * of a stream over the same data sent as stored blocks to 32 bytes. In
+ * of a stream over the same data sent as stored blocks to 252 bits. In
  * practice it reaches 154 bits on crafted data and 149 on silesia.tar, where
  * values 100 to 1000 trade a little ratio between levels 2 and 3.
  *
@@ -785,12 +785,16 @@ static inline void insert_ref(union ref *refs, const unsigned char *in, unsigned
  * the decision to send it in fixed huffman mode is taken. The balance is thus
  * still an upper bound of the excess, and the group itself, whose decision did
  * not include it, is shorter than 64 bytes there (longer ones are skipped and
- * leave as a stored block), so it adds less than 8 bytes to the bound. On real
+ * leave as a stored block), so it adds less than 64 bits to the bound, which
+ * is thus 315 bits, published in bytes as SLZ_MAX_DEBT_BYTES in slz.h. On real
  * data, the reference that follows almost always saves more than the charge,
  * so this rarely changes a decision.
  */
 #define SLZ_MAX_DEBT        200
 #define SLZ_CREDIT           64
+
+/* fails to build if SLZ_MAX_DEBT_BYTES doesn't cover the bound above */
+typedef char slz_max_debt_bytes_check[(SLZ_MAX_DEBT_BYTES * 8 >= SLZ_MAX_DEBT + SLZ_SWITCH_COST + 63) ? 1 : -1];
 
 /* Compresses <ilen> bytes from <in> into <out> according to RFC1951. The
  * output result may be up to 5 bytes larger than the input for each 65535
@@ -798,9 +802,13 @@ static inline void insert_ref(union ref *refs, const unsigned char *in, unsigned
  * to BFINAL+EOB encoding (10 bits) when <more> is not set. This is a property
  * of the whole stream, not of each call: since up to 31 bits are retained in
  * the queue from one call to the next, a single call may emit up to 5 bytes
- * more than its own share, which the following ones will not emit. The caller
- * is responsible for ensuring there is enough room in the output buffer for
- * this. The amount of output bytes is returned, and no CRC is computed.
+ * more than its own share, which the following ones will not emit. In
+ * addition, the fixed huffman encoding may be behind the same data sent as
+ * stored blocks by up to SLZ_MAX_DEBT_BYTES, which may all be reached within a
+ * single call, so each call must also have that much room. SLZ_MAX_OVERHEAD()
+ * in slz.h sums all of this. The caller is responsible for ensuring there is
+ * enough room in the output buffer for this. The amount of output bytes is
+ * returned, and no CRC is computed.
  *
  * Note: this function uses a lot of registers due to local variables that
  * hold pre-computed values that need to be kept very long. Be extremely

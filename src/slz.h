@@ -91,8 +91,27 @@ struct slz_stream {
 	uint32_t ilen;
 };
 
+/* Maximum number of bytes by which the encoder's output may exceed the same
+ * data sent as stored blocks, which is the input plus 5 bytes per 65535. It
+ * comes from the 9-bit literals of the fixed huffman encoding, may be reached
+ * within a single call, and has to be added to the output buffer size of each
+ * call. It is checked against SLZ_MAX_DEBT at build time in slz.c.
+ */
+#define SLZ_MAX_DEBT_BYTES 40
+
+/* Maximum number of bytes a single call to slz_encode() may emit beyond the
+ * <len> input bytes it is passed: 5 bytes per started 65535 bytes for the
+ * stored blocks, 2 bytes to close the stream when <more> is not set, up to 5
+ * bytes still queued from previous calls, and SLZ_MAX_DEBT_BYTES. This is 52
+ * bytes for up to 64 kB, i.e. roughly 47 bytes plus 5 per 64 kB. The format's
+ * header (10 bytes for gzip, 2 for zlib) must be added for the first call, and
+ * slz_flush() and slz_finish() have their own bounds documented below.
+ */
+#define SLZ_MAX_OVERHEAD(len) (5 * (((len) + 65534) / 65535) + 2 + 5 + SLZ_MAX_DEBT_BYTES)
+
 /* Note about output buffer sizing: encode functions below do not take an
- * output len, instead the caller must provide a "large enough" output buffer.
+ * output len, instead the caller must provide a "large enough" output buffer,
+ * which must be at least <len> + SLZ_MAX_OVERHEAD(<len>) bytes for each call.
  * When enabling direct queuing via SLZ_DIRECT_ENQUEUE24, the 3 bytes following
  * the end of the buffer may be written to, and the caller must take that into
  * account by allocating a buffer that is at least 3 bytes larger than needed.

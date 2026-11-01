@@ -259,9 +259,12 @@ These two factors have a significant impact on the compression ratio :
   further. Second, referencing a match can be longer than the data it replaces.
   This is true for short sequences, but it can be true even for a long sequence
   in the middle of a series of plain literals. By monitoring the output stream
-  and verifying the encoding cost before switching, it is possible to avoid any
-  overhead beyond the base 5 bytes per 32kB plus headers for non-compressible
-  data.
+  and verifying the encoding cost before switching, it is possible to limit the
+  overhead to the base 5 bytes per 65535 bytes plus headers for non-compressible
+  data, plus at most SLZ_MAX_DEBT_BYTES (40 bytes, see slz.h) by which the
+  fixed huffman encoding may lag behind before SLZ falls back to plain
+  literals. SLZ_MAX_OVERHEAD(len) in slz.h gives the room each call needs on
+  top of its input length.
 
 SLZ is provided as a library with a few extra tools (such as the zenc testing
 utility mentioned above). It is distributed under the X11 license, meaning
