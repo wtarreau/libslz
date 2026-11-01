@@ -893,20 +893,30 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 
 			/* Incompressible data: once enough literals have accumulated
 			 * without a single match, stop looking for a while and just
-			 * dump what follows as literal blocks, doubling the amount
-			 * skipped each time so that a long incompressible block
-			 * costs less and less to walk over. A match resets it.
+			 * add what follows to the pending literals, doubling the
+			 * amount skipped each time so that a long incompressible block
+			 * costs less and less to walk over. A match resets it. The
+			 * skipped bytes are not emitted here, as closing a stored
+			 * block at each step would cost 5 bytes every few kB and
+			 * break the promise of 5 bytes per 65535. Since they were not
+			 * inspected, <bit9> is forced so that they may only leave as
+			 * a stored block, and we switch to EOB so that a reference is
+			 * only accepted if it pays for the return to FIXED. <plit> may
+			 * thus exceed 65535, the pending literals are always sent with
+			 * copy_lit() which splits them into full stored blocks.
 			 */
 #if SLZ_LITERAL_SKIP
 			if (level <= 1 && !(plit & 63)) {
-				/* be careful: plit+skip must never be >= 65535 */
-				long skip;
-				skip_ratio = (skip_ratio * 2 + 1) & 255; // capped exponential: 0,1,3,7,... and stays at 255
-				skip = rem >= skip_ratio * 32 ? skip_ratio * 32 : rem;
-				copy_lit_small(strm, in + pos - plit, plit + skip, more || skip < rem);
+				long skip = rem >= skip_ratio * 64 ? skip_ratio * 64 : rem; // 0,64,192,...,8128: keeps plit aligned
+				skip_ratio = (skip_ratio * 2 + 1) & 127; // capped exponential: 0,1,3,7,... and stays at 127
 				pos += skip;
 				rem -= skip;
-				plit = 0;
+				plit += skip;
+				bit9 = SLZ_SWITCH_COST;
+				if (strm->state == SLZ_ST_FIXED) {
+					send_eob(strm);
+					strm->state = SLZ_ST_EOB;
+				}
 # ifndef UNALIGNED_FASTER
 				/* we'll need to update the current word since we skipped some bytes */
 				goto reload_word;
@@ -914,14 +924,17 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 				continue;
 # endif
 			}
-			else if (level == 2 && !(plit & 2047)) {
-				/* be careful: plit+skip must never be >= 65535 */
+			else if (__builtin_expect(level == 2 && !(plit & 2047), 0)) {
 				long skip = rem >= skip_ratio * 4096 ? skip_ratio * 4096 : rem;
 				skip_ratio = (skip_ratio * 2 + 1) & 7; // capped exponential: 0,1,3,7 and stays at 7
-				copy_lit_small(strm, in + pos - plit, plit + skip, more || skip < rem);
 				pos += skip;
 				rem -= skip;
-				plit = 0;
+				plit += skip;
+				bit9 = SLZ_SWITCH_COST;
+				if (strm->state == SLZ_ST_FIXED) {
+					send_eob(strm);
+					strm->state = SLZ_ST_EOB;
+				}
 # ifndef UNALIGNED_FASTER
 				/* we'll need to update the current word since we skipped some bytes */
 				goto reload_word;
@@ -1116,7 +1129,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 			 * only those sent in huffman mode add to the debt.
 			 */
 			if (bit9 >= SLZ_SWITCH_COST || strm->debt >= SLZ_MAX_DEBT)
-				copy_lit_small(strm, in + pos - plit, plit, 1);
+				copy_lit(strm, in + pos - plit, plit, 1);
 			else {
 				copy_lit_huff(strm, in + pos - plit, plit, 1);
 				strm->debt += bit9;
@@ -1220,7 +1233,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 			cost = (strm->state == SLZ_ST_EOB) ? SLZ_LAST_COST_EOB : SLZ_LAST_COST;
 
 		if (bit9 >= cost || strm->debt >= SLZ_MAX_DEBT)
-			copy_lit_small(strm, in + pos - plit, plit, more);
+			copy_lit(strm, in + pos - plit, plit, more);
 		else
 			copy_lit_huff(strm, in + pos - plit, plit, more);
 
