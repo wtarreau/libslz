@@ -767,6 +767,17 @@ static inline void insert_ref(union ref *refs, const unsigned char *in, unsigned
  * of a stream over the same data sent as stored blocks to 32 bytes. In
  * practice it reaches 154 bits on crafted data and 149 on silesia.tar, where
  * values 100 to 1000 trade a little ratio between levels 2 and 3.
+ *
+ * The same threshold also marks the stored mode inside a call: whenever the
+ * encoder leaves fixed huffman mode (literal skip, full stored block), the
+ * balance is raised to at least SLZ_CREDIT + SLZ_MAX_DEBT, so that the test
+ * on references does not need to load the state for each candidate, and so
+ * that the pending literals leave as a stored block. Entering fixed huffman
+ * mode restarts from the balance saved in <strm->debt>, which drops the mark.
+ * A call starting in stored mode is not marked, as this would force its first
+ * literals into a stored block. Its first reference is then accepted for what
+ * it saves by itself, and the switch to fixed huffman is charged when it is
+ * performed by that reference, but not when the first literals perform it.
  */
 #define SLZ_MAX_DEBT        200
 #define SLZ_CREDIT           64
@@ -915,9 +926,10 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 			 * block at each step would cost 5 bytes every few kB and
 			 * break the promise of 5 bytes per 65535. Since they were not
 			 * inspected, <bal> is raised so that they may only leave as
-			 * a stored block, and we switch to EOB so that a reference is
-			 * only accepted if it pays for the return to FIXED. <plit> may
-			 * thus exceed 65535, the pending literals are always sent with
+			 * a stored block, and so that a reference is only accepted if
+			 * it pays for the return to FIXED (see SLZ_MAX_DEBT). The EOB
+			 * is sent by copy_lit() along with them. <plit> may thus
+			 * exceed 65535, the pending literals are always sent with
 			 * copy_lit() which splits them into full stored blocks.
 			 */
 #if SLZ_LITERAL_SKIP
@@ -928,11 +940,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 				rem -= skip;
 				plit += skip;
 				/* skipped bytes may only leave as a stored block */
-				bal += SLZ_SWITCH_COST + SLZ_CREDIT;
-				if (strm->state == SLZ_ST_FIXED) {
-					send_eob(strm);
-					strm->state = SLZ_ST_EOB;
-				}
+				bal += SLZ_MAX_DEBT + SLZ_CREDIT;
 # ifndef UNALIGNED_FASTER
 				/* we'll need to update the current word since we skipped some bytes */
 				goto reload_word;
@@ -950,11 +958,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 				 * on the first test, where <skip> is 0, like the stored
 				 * block sent there before: it keeps the same matches.
 				 */
-				bal += SLZ_SWITCH_COST + SLZ_CREDIT;
-				if (strm->state == SLZ_ST_FIXED) {
-					send_eob(strm);
-					strm->state = SLZ_ST_EOB;
-				}
+				bal += SLZ_MAX_DEBT + SLZ_CREDIT;
 # ifndef UNALIGNED_FASTER
 				/* we'll need to update the current word since we skipped some bytes */
 				goto reload_word;
@@ -969,6 +973,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 				if (__builtin_expect(plit == 0xffc0, 0)) {
 					copy_lit_small(strm, in + pos - plit, plit, 1);
 					plit = 0;
+					bal = strm->debt + SLZ_MAX_DEBT + SLZ_CREDIT;
 				}
 			}
 			continue;
@@ -1045,7 +1050,10 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 		 * is what guarantees that once switched to FIXED we can stay
 		 * in it for as long as needed.
 		 */
-		if ((strm->state == SLZ_ST_EOB || bal >= SLZ_MAX_DEBT + SLZ_CREDIT) &&
+		/* Note: <bal> is at least SLZ_MAX_DEBT + SLZ_CREDIT in stored
+		 * mode, except at the beginning of a call (see SLZ_MAX_DEBT).
+		 */
+		if (bal >= SLZ_MAX_DEBT + SLZ_CREDIT &&
 		    (dist & 0x1f) + (code >> 16) + SLZ_SWITCH_COST > 8 * mlen)
 			goto send_as_lit;
 
@@ -1165,7 +1173,10 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 		if (strm->state == SLZ_ST_EOB) {
 			strm->state = SLZ_ST_FIXED;
 			enqueue8(strm, 0x02, 3); // BTYPE = 01, BFINAL = 0
-			bal += SLZ_SWITCH_COST; // what leaving fixed huffman will cost
+			/* restart from the saved balance (drops the stored mode mark)
+			 * plus what leaving fixed huffman will cost
+			 */
+			bal = strm->debt + SLZ_SWITCH_COST;
 		}
 
 		/* copy the length first */
