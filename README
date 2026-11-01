@@ -262,9 +262,20 @@ These two factors have a significant impact on the compression ratio :
   and verifying the encoding cost before switching, it is possible to limit the
   overhead to the base 5 bytes per 65535 bytes plus headers for non-compressible
   data, plus at most SLZ_MAX_DEBT_BYTES (40 bytes, see slz.h) by which the
-  fixed huffman encoding may lag behind before SLZ falls back to plain
-  literals. SLZ_MAX_OVERHEAD(len) in slz.h gives the room each call needs on
-  top of its input length.
+  huffman encoding may lag behind before SLZ falls back to plain literals.
+  SLZ_MAX_OVERHEAD(len) in slz.h gives the room each call needs on top of its
+  input length.
+
+- content type : most of the contents compressed by HTTP servers and gateways
+  is text (HTML, CSS, JS, JSON, SVG...), on which the fixed huffman tree is far
+  from optimal, as it encodes most letters on 8 bits and match lengths on 7
+  bits or more. Since 1.4, an application knowing that it compresses such
+  contents can call slz_set_content_type(strm, SLZ_CT_TEXT) after initializing
+  the stream. Instead of the fixed tree, SLZ then uses a static tree that was
+  trained on web contents, declared at the beginning of each block in about 80
+  bytes. It remains as cheap to use as the fixed one, at the expense of a few
+  percent of speed, and shrinks the output of such contents by 12 to 18%. It
+  is not suited to binary contents nor to contents of less than 1-2 kB.
 
 SLZ is provided as a library with a few extra tools (such as the zenc testing
 utility mentioned above). It is distributed under the X11 license, meaning
