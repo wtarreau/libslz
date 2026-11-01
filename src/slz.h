@@ -83,8 +83,8 @@ struct slz_stream {
 	uint8_t unused:2; /* free for future use */
 	uint8_t format:2; /* SLZ_FMT_* */
 	uint8_t level:4;  /* 0 = no compression, 1..15 = compression */
-	uint8_t debt;    /* number of bits by which the fixed huffman encoding is
-	                  * currently behind the equivalent stored blocks, see
+	uint16_t debt;   /* number of bits by which the output is above the
+	                  * equivalent stored blocks, offset by SLZ_CREDIT, see
 	                  * SLZ_MAX_DEBT in slz.c
 	                  */
 	uint32_t crc32;
