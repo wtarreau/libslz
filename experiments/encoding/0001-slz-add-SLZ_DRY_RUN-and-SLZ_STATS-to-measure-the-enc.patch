@@ -1,0 +1,571 @@
+From 873bc5148bc941714d1c73343a0b84e67b142ef9 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sun, 8 Nov 2026 15:05:22 +0100
+Subject: [PATCH 1/3] slz: add SLZ_DRY_RUN and SLZ_STATS to measure the encoder
+
+Two measurement aids, both disabled by default and entirely absent from
+the preprocessed code then (gcc -E output is identical to the parent's).
+
+SLZ_DRY_RUN is a bit field of the parts of the output that are not
+encoded, while every decision is still taken as usual: 1 = huffman
+literals, 2 = references, 4 = stored copies. Block headers are still
+sent. It measures what the encoding format costs on top of the match
+search. Output cannot be decoded.
+
+SLZ_STATS counts lookups, hits, references (lengths, distances, sizes),
+literal runs per block type, and skipped bytes, and dumps everything
+with histograms on stderr at exit. Not thread-safe, accumulates over
+all calls, so use it with zenc -l 1. The compressed output is unchanged.
+
+Xeon W-2145, gcc-15 -O3 -march=native -mno-avx512f + JCC padding,
+taskset -c 2 zenc -l 3 -t, silesia.tar, best of 3, MB/s (d3 = no
+huffman literals nor references, d7 = nothing encoded):
+
+  -k    lvl    def     d1     d2     d4     d3     d7  | lits  refs  all
+  4096  1    580.5  652.2  616.4  587.8  682.6  692.7  | 11.0%  5.8% 16.2%
+  4096  2    515.8  580.0  544.3  518.6  608.9  624.5  | 11.1%  5.2% 17.4%
+  4096  3    489.2  554.0  515.9  489.8  585.8  582.9  | 11.7%  5.2% 16.1%
+  4096  4    469.7  532.3  495.9  470.3  561.2  563.6  | 11.8%  5.3% 16.7%
+  4096  T    439.3  482.1  474.1  439.4  537.8  545.7  |  8.9%  7.3% 19.5%
+  32    1    609.4  688.5  640.2  609.5  722.7  725.6  | 11.5%  4.8% 16.0%
+  32    2    523.7  593.3  552.0  528.5  627.5  639.5  | 11.7%  5.1% 18.1%
+  32    3    479.1  549.2  505.0  479.0  576.0  574.1  | 12.8%  5.1% 16.5%
+  32    4    457.2  521.0  483.3  459.6  553.6  557.8  | 12.2%  5.4% 18.0%
+  32    T    419.4  461.2  449.9  417.5  507.2  514.1  |  9.1%  6.8% 18.4%
+
+(right columns: share of the time spent encoding, 1 - def/dN). So the
+format costs 16-19% of the time; the remaining 81-84% is the search and
+the decisions. Huffman literals are two thirds of that cost although
+they are only 15% of the bytes: at -4 -k 4096 that's ~1.7 ns per
+literal (31.1M of them) vs ~1.3 ns per reference (18.7M). Stored copies
+are negligible (memcpy).
+
+SLZ_STATS on silesia.tar (211947520 bytes), level 4:
+
+                         -k 4096      -k 32
+  lookups (% of input)    29.44%      33.37%
+  word hits / lookups     33.36%      26.29%
+  in window / hits        91.75%     100.00%
+  refs taken / in window  98.02%      93.30%
+  references            18719547    17351141
+    bytes covered         79.96%      75.24%
+    avg length              9.05        9.19
+    avg distance          4142.5      2630.3
+    avg size (bits)        20.53       20.00
+    right after a ref     61.39%      56.79%
+    extended backwards     5.28%       4.36%
+  huffman lit runs       7226056     7495765
+    avg length (bytes)       4.3         4.7
+    bits per literal       8.211       8.163
+  stored lit runs           2468        5241
+    avg length (bytes)    4596.7      3354.8
+    bytes in stored        5.35%       8.30%
+
+  lengths (4 MB): 4: 37.7%, 5: 16.3%, 6: 10.4%, 7: 8.2%, 8: 4.6%,
+  9-16: 12.6%, 17-32: 6.8%, 33-64: 2.7%, 65+: 0.6%
+  distances (4 MB): roughly flat at 7-12% per power of two from 64 to
+  16383, 7.3% for 16k-32k, 8% below 32
+  huffman runs (4 MB): 1: 38.6%, 2-3: 28.9%, 4-7: 17.5%, 8-15: 11.1%,
+  16+: 4.0%
+
+Sum check: 18.72M refs * 20.53 bits + 31.13M lits * 8.211 bits + 11.35M
+stored bytes = 91.34 MB, for 91360519 actually produced.
+
+Reproduce with:
+  make zenc USR_CFLAGS="-DSLZ_STATS=1"; ./zenc -4 -t silesia.tar
+  make zenc USR_CFLAGS="-DSLZ_DRY_RUN=7"; ./zenc -4 -l 3 -t -v silesia.tar
+---
+ src/slz.c | 279 +++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 278 insertions(+), 1 deletion(-)
+
+diff --git a/src/slz.c b/src/slz.c
+index eaf1e30..12b4550 100644
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -125,6 +125,30 @@ static uint32_t text_dist_table[32768];
+ # define SLZ_HASH_BITS 13
+ #endif
+ 
++/* Measurement aids, both disabled by default and entirely absent from the
++ * code when disabled.
++ *
++ * SLZ_DRY_RUN is a bit field of the parts of the output that are not encoded,
++ * in order to measure what encoding them costs. Every decision is still taken
++ * as usual and the block headers are still emitted, so only the cost of the
++ * suppressed parts disappears, but the output cannot be decoded:
++ *   1: literals sent in huffman blocks (fixed or text tree)
++ *   2: references (length and distance codes)
++ *   4: literals sent in stored blocks (the copy only, not the block header)
++ *
++ * SLZ_STATS counts what the encoder finds and emits (lookups, references with
++ * their lengths and distances, literal runs per block type, skipped bytes),
++ * and dumps it all on stderr at exit. It is not thread-safe and accumulates
++ * over all streams and calls, so better run it on a single pass (zenc -l 1).
++ */
++#ifndef SLZ_DRY_RUN
++# define SLZ_DRY_RUN 0
++#endif
++
++#ifndef SLZ_STATS
++# define SLZ_STATS 0
++#endif
++
+ /* First, RFC1951-specific declarations and extracts from the RFC.
+  *
+  * RFC1951 - deflate stream format
+@@ -264,6 +288,150 @@ union ref {
+ 	uint64_t by64;
+ };
+ 
++#if SLZ_STATS
++/* see SLZ_STATS. Histograms: lengths 4,5,6,7,8,9-16,17-32,33-64,65-128,
++ * 129-257,258; distances and literal runs by power of two.
++ */
++static struct {
++	unsigned long long calls, in_bytes;
++	unsigned long long lookups;      /* words hashed and looked up in the main loop */
++	unsigned long long hits;         /* same word found in the bucket */
++	unsigned long long hits_win;     /* ... and within the window: a candidate match */
++	unsigned long long refs;         /* references emitted */
++	unsigned long long ref_len;      /* sum of their lengths */
++	unsigned long long ref_dist;     /* sum of their distances */
++	unsigned long long ref_bits;     /* sum of their encoded sizes */
++	unsigned long long ref_adj;      /* references not preceded by any literal */
++	unsigned long long back_refs;    /* references extended backwards */
++	unsigned long long back_bytes;   /* bytes they gained this way */
++	unsigned long long huff_runs;    /* literal runs sent in huffman blocks */
++	unsigned long long huff_lits;    /* literals in these runs */
++	unsigned long long huff_bits;    /* their encoded size */
++	unsigned long long stored_runs;  /* literal runs sent as stored blocks */
++	unsigned long long stored_lits;  /* literals in these runs */
++	unsigned long long stored_blks;  /* stored blocks (runs are split at 65535) */
++	unsigned long long huff_blks;    /* huffman blocks opened */
++	unsigned long long skips;        /* literal skip steps */
++	unsigned long long skipped;      /* bytes passed over by them (probed or not) */
++	unsigned long long probes;       /* words probed during a skip */
++	unsigned long long probe_hits;   /* probes which ended the skip */
++	unsigned long long len_hist[11];
++	unsigned long long dist_hist[16];
++	unsigned long long hrun_hist[18];
++	unsigned long long srun_hist[18];
++} slz_stats;
++
++static inline int slz_stats_log2(unsigned long long v, int max)
++{
++	int l = 63 - __builtin_clzll(v);
++
++	return l < max ? l : max;
++}
++
++static inline void slz_stats_ref(uint32_t mlen, uint32_t dist, uint32_t bits, uint32_t lits)
++{
++	slz_stats.refs++;
++	slz_stats.ref_len += mlen;
++	slz_stats.ref_dist += dist;
++	slz_stats.ref_bits += bits;
++	slz_stats.ref_adj += !lits;
++	slz_stats.len_hist[mlen <= 8 ? (int)mlen - 4 : mlen == 258 ? 10 : slz_stats_log2(mlen - 1, 7) + 2]++;
++	slz_stats.dist_hist[slz_stats_log2(dist, 15)]++;
++}
++
++static inline void slz_stats_huff_run(const unsigned char *buf, uint32_t len, int text)
++{
++	uint32_t i;
++
++	slz_stats.huff_runs++;
++	slz_stats.huff_lits += len;
++	for (i = 0; i < len; i++)
++		slz_stats.huff_bits += text ? (text_huff[buf[i]] & 15) : 8 + (buf[i] >= 144);
++	slz_stats.hrun_hist[slz_stats_log2(len, 17)]++;
++}
++
++static inline void slz_stats_stored_run(uint32_t len)
++{
++	slz_stats.stored_runs++;
++	slz_stats.stored_lits += len;
++	slz_stats.stored_blks += (len + 65534) / 65535;
++	slz_stats.srun_hist[slz_stats_log2(len, 17)]++;
++}
++
++static void slz_stats_hist(const char *name, const unsigned long long *hist, int n, int lin)
++{
++	static const char *lens[11] = { "4", "5", "6", "7", "8", "9-16", "17-32", "33-64", "65-128", "129-257", "258" };
++	unsigned long long tot = 0;
++	int i;
++
++	for (i = 0; i < n; i++)
++		tot += hist[i];
++	fprintf(stderr, "  %s:\n", name);
++	for (i = 0; i < n; i++) {
++		char rng[32];
++
++		if (!hist[i])
++			continue;
++		if (lin)
++			snprintf(rng, sizeof(rng), "%s", lens[i]);
++		else if (i == n - 1)
++			snprintf(rng, sizeof(rng), "%llu+", 1ULL << i);
++		else
++			snprintf(rng, sizeof(rng), "%llu-%llu", 1ULL << i, (2ULL << i) - 1);
++		fprintf(stderr, "    %-12s %14llu  %6.2f%%\n", rng, hist[i], 100.0 * hist[i] / tot);
++	}
++}
++
++__attribute__((destructor))
++static void slz_stats_dump(void)
++{
++	unsigned long long lits = slz_stats.huff_lits + slz_stats.stored_lits;
++	unsigned long long runs = slz_stats.huff_runs + slz_stats.stored_runs;
++	unsigned long long in = slz_stats.in_bytes ? slz_stats.in_bytes : 1;
++#define PCT(a, b) ((b) ? 100.0 * (double)(a) / (double)(b) : 0.0)
++#define AVG(a, b) ((b) ? (double)(a) / (double)(b) : 0.0)
++
++	if (!slz_stats.calls)
++		return;
++	fprintf(stderr, "slz stats: %llu calls, %llu input bytes\n", slz_stats.calls, slz_stats.in_bytes);
++	fprintf(stderr, "  lookups      %14llu  (%.2f%% of input bytes)\n",
++		slz_stats.lookups, PCT(slz_stats.lookups, in));
++	fprintf(stderr, "  word hits    %14llu  (%.2f%% of lookups)\n",
++		slz_stats.hits, PCT(slz_stats.hits, slz_stats.lookups));
++	fprintf(stderr, "  in window    %14llu  (%.2f%% of hits), %llu references taken (%.2f%%)\n",
++		slz_stats.hits_win, PCT(slz_stats.hits_win, slz_stats.hits),
++		slz_stats.refs, PCT(slz_stats.refs, slz_stats.hits_win));
++	fprintf(stderr, "  references   %14llu  covering %llu bytes (%.2f%% of input)\n",
++		slz_stats.refs, slz_stats.ref_len, PCT(slz_stats.ref_len, in));
++	fprintf(stderr, "    avg length %.2f, avg distance %.1f, avg size %.2f bits (%.3f bits/byte)\n",
++		AVG(slz_stats.ref_len, slz_stats.refs), AVG(slz_stats.ref_dist, slz_stats.refs),
++		AVG(slz_stats.ref_bits, slz_stats.refs), AVG(slz_stats.ref_bits, slz_stats.ref_len));
++	fprintf(stderr, "    %llu (%.2f%%) right after another one, %llu (%.2f%%) extended backwards by %.2f bytes on avg\n",
++		slz_stats.ref_adj, PCT(slz_stats.ref_adj, slz_stats.refs),
++		slz_stats.back_refs, PCT(slz_stats.back_refs, slz_stats.refs),
++		AVG(slz_stats.back_bytes, slz_stats.back_refs));
++	fprintf(stderr, "  literal runs %14llu  covering %llu bytes (%.2f%% of input), avg %.1f bytes\n",
++		runs, lits, PCT(lits, in), AVG(lits, runs));
++	fprintf(stderr, "    huffman    %14llu  runs, %llu bytes, avg %.1f bytes, %.3f bits/byte\n",
++		slz_stats.huff_runs, slz_stats.huff_lits, AVG(slz_stats.huff_lits, slz_stats.huff_runs),
++		AVG(slz_stats.huff_bits, slz_stats.huff_lits));
++	fprintf(stderr, "    stored     %14llu  runs, %llu bytes, avg %.1f bytes, %llu blocks\n",
++		slz_stats.stored_runs, slz_stats.stored_lits, AVG(slz_stats.stored_lits, slz_stats.stored_runs),
++		slz_stats.stored_blks);
++	fprintf(stderr, "  huffman blocks opened %llu\n", slz_stats.huff_blks);
++	fprintf(stderr, "  literal skip %14llu  steps, %llu bytes passed over (%.2f%% of input)\n",
++		slz_stats.skips, slz_stats.skipped, PCT(slz_stats.skipped, in));
++	fprintf(stderr, "    probes     %14llu  of which %llu hits (%.2f%%)\n",
++		slz_stats.probes, slz_stats.probe_hits, PCT(slz_stats.probe_hits, slz_stats.probes));
++	slz_stats_hist("reference lengths", slz_stats.len_hist, 11, 1);
++	slz_stats_hist("reference distances", slz_stats.dist_hist, 16, 0);
++	slz_stats_hist("huffman literal runs", slz_stats.hrun_hist, 18, 0);
++	slz_stats_hist("stored literal runs", slz_stats.srun_hist, 18, 0);
++#undef PCT
++#undef AVG
++}
++#endif /* SLZ_STATS */
++
+ /* This hash provides good average results on HTML contents, and is among the
+  * few which provide almost optimal results on various different pages.
+  */
+@@ -630,6 +798,9 @@ static void send_text_hdr(struct slz_stream *__restrict strm, int bfinal)
+ /* Opens a huffman block for <ctype> with BFINAL set to <bfinal> */
+ static inline void open_huff_block(struct slz_stream *__restrict strm, int bfinal, int ctype)
+ {
++#if SLZ_STATS
++	slz_stats.huff_blks++;
++#endif
+ 	if (ctype == SLZ_CT_TEXT)
+ 		send_text_hdr(strm, bfinal);
+ 	else
+@@ -684,8 +855,13 @@ void _copy_lit_small(struct slz_stream *__restrict strm, const void *buf, uint32
+ #endif
+ 	copy_16b(strm, len);
+ 	copy_16b(strm, ~len);
++#if SLZ_STATS
++	slz_stats_stored_run(len);
++#endif
++#if !(SLZ_DRY_RUN & 4)
+ 	memcpy(strm->outbuf, buf, len);
+ 	strm->outbuf += len;
++#endif
+ }
+ 
+ /* out-of-line versions of _copy_lit_small() for each content type. They must
+@@ -727,6 +903,9 @@ void _copy_lit(struct slz_stream *__restrict strm, const void *buf, uint32_t len
+ 	if (strm->state != SLZ_ST_EOB)
+ 		send_eob(strm, ctype);
+ 
++#if SLZ_STATS
++	slz_stats_stored_run(len);
++#endif
+ 	len2 = 65535;
+ 	len -= len2;
+ 
+@@ -737,9 +916,13 @@ void _copy_lit(struct slz_stream *__restrict strm, const void *buf, uint32_t len
+ 		flush_bits(strm); // see copy_lit_small()
+ #endif
+ 		copy_32b(strm, (~len2 << 16) + len2);
++#if !(SLZ_DRY_RUN & 4)
+ 		memcpy(strm->outbuf, buf, len2);
++#endif
+ 		buf += len2;
++#if !(SLZ_DRY_RUN & 4)
+ 		strm->outbuf += len2;
++#endif
+ 		len2 = len;
+ 		if (__builtin_expect(len2 > 65535, 0))
+ 			len2 = 65535;
+@@ -794,10 +977,17 @@ void _copy_lit_huff(struct slz_stream *__restrict strm, const unsigned char *buf
+ 		goto eob;
+ 	}
+ 
++#if SLZ_STATS
++	slz_stats_huff_run(buf, len, ctype == SLZ_CT_TEXT);
++#endif
++#if !(SLZ_DRY_RUN & 1)
+ 	pos = 0;
+ 	do {
+ 		send_huff(strm, buf[pos++], ctype);
+ 	} while (pos < len);
++#else
++	(void)pos;
++#endif
+ }
+ 
+ /* out-of-line versions of _copy_lit_huff() for each content type */
+@@ -997,6 +1187,9 @@ struct text_vref {
+ 	uint32_t dist;   /* distance code, as in text_dist_table */
+ 	uint16_t lits;   /* literals before this reference */
+ 	uint16_t mlen;   /* match length */
++#if SLZ_STATS
++	uint32_t sdist;  /* distance, see SLZ_STATS */
++#endif
+ };
+ 
+ /* sends the <len> pending bytes at <buf> in a text block, as literals except
+@@ -1016,15 +1209,35 @@ void text_replay(struct slz_stream *__restrict strm, const unsigned char *buf, u
+ 	}
+ 
+ 	for (i = 0; i < n; i++) {
++#if SLZ_STATS
++		if (vref[i].lits)
++			slz_stats_huff_run(buf, vref[i].lits, 1);
++		slz_stats_ref(vref[i].mlen, vref[i].sdist, (vref[i].code >> 16) + (vref[i].dist & 0x1f), vref[i].lits);
++#endif
++#if !(SLZ_DRY_RUN & 1)
+ 		for (l = vref[i].lits; l; l--)
+ 			send_huff(strm, *buf++, SLZ_CT_TEXT);
++#else
++		(void)l;
++		buf += vref[i].lits;
++#endif
++#if !(SLZ_DRY_RUN & 2)
+ 		enqueue24(strm, vref[i].code & 0xFFFF, vref[i].code >> 16);
+ 		enqueue24(strm, vref[i].dist >> 5, vref[i].dist & 0x1f);
++#endif
+ 		buf += vref[i].mlen;
+ 	}
+ 
++#if SLZ_STATS
++	if (buf < end)
++		slz_stats_huff_run(buf, end - buf, 1);
++#endif
++#if !(SLZ_DRY_RUN & 1)
+ 	while (buf < end)
+ 		send_huff(strm, *buf++, SLZ_CT_TEXT);
++#else
++	(void)end;
++#endif
+ }
+ 
+ /* returns non-zero if the pending literals of text stream <strm>, which cost
+@@ -1092,6 +1305,9 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 	struct text_vref vref[SLZ_TEXT_VREFS];
+ 	uint32_t dist, code;
+ 	union ref refs[1 << SLZ_HASH_BITS];
++#if SLZ_STATS
++	uint32_t st_dist = 0, st_lits;
++#endif
+ 
+ 	if (__builtin_expect(!strm->level, 0)) {
+ 		/* force to send as literals (eg to preserve CPU) */
+@@ -1101,6 +1317,10 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 		goto leave;
+ 	}
+ 
++#if SLZ_STATS
++	slz_stats.calls++;
++	slz_stats.in_bytes += ilen;
++#endif
+ 	reset_refs(refs, sizeof(refs));
+ 	bal = strm->debt;
+ 
+@@ -1119,6 +1339,9 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ #endif
+ 		h = slz_hash(word);
+ 		asm volatile ("" ::); // prevent gcc from trying to be smart with the prefetch
++#if SLZ_STATS
++		slz_stats.lookups++;
++#endif
+ 
+ 		if (sizeof(long) >= 8) {
+ 			ent = refs[h].by64;
+@@ -1215,6 +1438,9 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 			 */
+ 			if (ctype == SLZ_CT_GENERIC && level <= 2 && !(plit & 63)) {
+ 				long skip = rem >= skip_ratio * 64 ? skip_ratio * 64 : rem; // 0,64,192,...,8128: keeps plit aligned
++#if SLZ_STATS
++				unsigned long st_pos = pos;
++#endif
+ 				skip_ratio = (skip_ratio * 2 + 1) & 127; // capped exponential: 0,1,3,7,... and stays at 127
+ 				/* Level 2 still looks up and indexes the last word of
+ 				 * each whole 64-byte chunk it skips, and stops skipping
+@@ -1235,17 +1461,26 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 					do {
+ 						uint32_t w = read_le32(in + pos + 60);
+ 						uint32_t hw = slz_hash(w);
++#if SLZ_STATS
++						slz_stats.probes++;
++#endif
+ 
+ 						if (sizeof(long) >= 8) {
+ 							uint64_t old = refs[hw].by64;
+ 
+ 							if ((uint32_t)(old >> 32) == w && (unsigned long)(pos + 59 - (uint32_t)old) < 32768) {
++#if SLZ_STATS
++								slz_stats.probe_hits++;
++#endif
+ 								skip = 0;
+ 								break;
+ 							}
+ 							refs[hw].by64 = ((uint64_t)(pos + 60)) + ((uint64_t)w << 32);
+ 						} else {
+ 							if (refs[hw].by32.word == w && (unsigned long)(pos + 59 - refs[hw].by32.pos) < 32768) {
++#if SLZ_STATS
++								slz_stats.probe_hits++;
++#endif
+ 								skip = 0;
+ 								break;
+ 							}
+@@ -1260,6 +1495,10 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 				pos += skip;
+ 				rem -= skip;
+ 				plit += skip;
++#if SLZ_STATS
++				slz_stats.skips++;
++				slz_stats.skipped += pos - st_pos;
++#endif
+ 				/* skipped bytes may only leave as a stored block */
+ 				bal += SLZ_MAX_DEBT + SLZ_CREDIT;
+ # ifndef UNALIGNED_FASTER
+@@ -1271,6 +1510,9 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 			}
+ 			else if (__builtin_expect(ctype == SLZ_CT_GENERIC && level == 3 && !(plit & 2047), 0)) {
+ 				long skip = rem >= skip_ratio * 4096 ? skip_ratio * 4096 : rem;
++#if SLZ_STATS
++				unsigned long st_pos = pos;
++#endif
+ 				skip_ratio = (skip_ratio * 2 + 1) & 7; // capped exponential: 0,1,3,7 and stays at 7
+ 
+ 				/* Note: by checking intervals smaller than the mask above, a hit resumes
+@@ -1287,17 +1529,26 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 					do {
+ 						uint32_t w = read_le32(in + pos + 252);
+ 						uint32_t hw = slz_hash(w);
++#if SLZ_STATS
++						slz_stats.probes++;
++#endif
+ 
+ 						if (sizeof(long) >= 8) {
+ 							uint64_t old = refs[hw].by64;
+ 
+ 							if ((uint32_t)(old >> 32) == w && (unsigned long)(pos + 251 - (uint32_t)old) < 32768) {
++#if SLZ_STATS
++								slz_stats.probe_hits++;
++#endif
+ 								skip = 0;
+ 								break;
+ 							}
+ 							refs[hw].by64 = ((uint64_t)(pos + 252)) + ((uint64_t)w << 32);
+ 						} else {
+ 							if (refs[hw].by32.word == w && (unsigned long)(pos + 251 - refs[hw].by32.pos) < 32768) {
++#if SLZ_STATS
++								slz_stats.probe_hits++;
++#endif
+ 								skip = 0;
+ 								break;
+ 							}
+@@ -1312,6 +1563,10 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 				pos += skip;
+ 				rem -= skip;
+ 				plit += skip;
++#if SLZ_STATS
++				slz_stats.skips++;
++				slz_stats.skipped += pos - st_pos;
++#endif
+ 				/* skipped bytes may only leave as a stored block. Also done
+ 				 * on the first test, where <skip> is 0, like the stored
+ 				 * block sent there before: it keeps the same matches.
+@@ -1347,9 +1602,16 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 			continue;
+ 		}
+ 
++#if SLZ_STATS
++		slz_stats.hits++;
++#endif
+ 		/* We reject pos = last and pos > last+32768 */
+ 		if ((unsigned long)(pos - last - 1) >= 32768)
+ 			goto send_as_lit;
++#if SLZ_STATS
++		slz_stats.hits_win++;
++		st_dist = pos - last;
++#endif
+ 
+ 		/* faster to keep a copy of this with gcc 13-16 */
+ 		lastp = in + last;
+@@ -1467,6 +1729,9 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 					vref[nvref].dist = dist;
+ 					vref[nvref].lits = plit - vplit;
+ 					vref[nvref].mlen = mlen;
++#if SLZ_STATS
++					vref[nvref].sdist = st_dist;
++#endif
+ 					nvref++;
+ 					lit_excess += (dist & 0x1f) + (code >> 16) - 8 * (uint32_t)mlen;
+ 					plit += mlen;
+@@ -1556,6 +1821,10 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 				plit -= back;
+ 				rem  += back;
+ 				mlen += back;
++#if SLZ_STATS
++				slz_stats.back_refs++;
++				slz_stats.back_bytes += back;
++#endif
+ 				/* <code> was computed from the un-extended
+ 				 * length above and must follow, or we would
+ 				 * consume <back> more bytes than the length
+@@ -1583,6 +1852,9 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 		}
+ #endif // SLZ_BACKWARD_MATCH // otherwise 43.83%
+ 
++#if SLZ_STATS
++		st_lits = (ctype == SLZ_CT_TEXT) ? plit - vplit : plit;
++#endif
+ 		/* first, copy pending literals */
+ 		if (plit) {
+ 			/* Huffman encoding requires 9 bits for octets 144..255, so this
+@@ -1637,8 +1909,13 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 				bal = strm->debt + SLZ_SWITCH_COST;
+ 		}
+ 
++#if SLZ_STATS
++		slz_stats_ref(mlen, st_dist, (code >> 16) + (dist & 0x1f), st_lits);
++#endif
+ 		/* copy the length first */
+-#if SLZ_DIRECT_ENQUEUE56
++#if SLZ_DRY_RUN & 2
++		/* not encoded, see SLZ_DRY_RUN */
++#elif SLZ_DIRECT_ENQUEUE56
+ 		/* the length code and the distance code that follows it total
+ 		 * 31 bits at most, which one enqueue can take in a single
+ 		 * shift-or-store instead of two
+-- 
+2.43.0
+

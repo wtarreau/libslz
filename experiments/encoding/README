@@ -1,0 +1,429 @@
+Encoder experiments, November 2026
+==================================
+
+This file collects the measurements made on the slz encoder (src/slz.c)
+after commit 7bafca4 ("WIP: readme update with new level"), on top of the
+new level 2 (literal skip with a probe of the last word of each skipped
+64-byte chunk) and the skipped indexing at level 3 (stride 256). They were
+first reported in commit messages and in discussions; they are gathered
+here so that they don't have to be run again.
+
+Patches in this directory (originally commits 56734e4, 3836469 and
+3c45512 on branch 20261108-lit-skip-2, rebased onto the v1.4 release
+candidate 78686e9 where they apply in sequence). Their code is disabled
+by default and absent from the preprocessed output when disabled (gcc -E
+output identical to the base's):
+
+  0001  slz: add SLZ_DRY_RUN and SLZ_STATS to measure the encoder
+  0002  slz: rework FIND_OPTIMAL_MATCH as a hash chain with a depth limit
+  0003  slz: add FIND_OPTIMAL_MATCH_MIN to try 3-byte matches
+
+../brotli/0001 and ../lz4/0001 extend SLZ_STATS and apply on top of
+these, in that order.
+
+Corpora:
+  - silesia.tar: 211947520 bytes (recoverable from tests/silesia.tslz with
+    zdec, see the encoder benchmark notes);
+  - hap-org.html: 932561 bytes, concatenation of 7 haproxy.org pages;
+  - tests/index.html: 76799 bytes.
+
+zenc options: -1..-4 = level, -T = text tree (at level 3 internally),
+-k = block size in kB (4096 = default, 32 = haproxy-like buffers),
+-l = loops, -t = no output, -v = report totout/ratio/MB/s.
+
+Unless stated otherwise, timings come from a Xeon W-2145 (Skylake-SP),
+gcc-15 -O3 -g -fomit-frame-pointer -march=native -mno-avx512f
+-Wa,-mbranches-within-32B-boundaries -Wa,-malign-branch=jcc+fused+jmp+call,
+taskset -c 2, zenc -l 3 -t -v, best of 3 runs, MB/s as printed by zenc.
+They were NOT measured on the ARL (the reference platform) and should be
+confirmed there before taking any decision based on them. Sizes do not
+depend on the machine.
+
+Note added later the same day: zenc used to release each 2 MB of the
+mapped input with madvise(MADV_DONTNEED) once compressed, so every pass
+faulted the file in again, measured ones included. That cost ~4% of each
+pass (silesia -4 -k 32: 404-406 MB/s without, 421-422 with the new -p
+option that pre-heats the input and keeps it mapped). All zenc speeds in
+this file and in ../brotli/README / ../lz4/README were measured without -p: absolute
+figures are ~4% low, comparisons between configurations are unaffected.
+Use -p from now on. -p also pre-faults the output buffer (commit
+a4183c6, merged as 449bc6e), which is calloc()'d at twice the block size
+and was faulted in during the first pass (~22k faults at -k 262144).
+
+A single pass (-l 1) remains ~10% slower than the following ones even
+with -p, and this is not zenc: with the schedutil cpufreq governor, the
+core's clock ramps up during the first pass (perf stat, silesia -p -1:
+3.69 GHz on average for -l 1 vs 4.39 GHz for -l 2, same IPC 1.82/1.85,
+same page faults). So either measure with -l 2 or more (the first pass is
+never timed when looping), or set the governor to performance; anything
+busy before the pass (e.g. pre-faulting a large output buffer) changes
+the -l 1 figure by warming the clock up.
+
+
+1. Measurement aids
+-------------------
+
+SLZ_DRY_RUN (bit field): the parts of the output that are not encoded,
+while every decision is still taken as usual and the block headers are
+still emitted. The output is not decodable.
+  1 = literals sent in huffman blocks (fixed or text tree)
+  2 = references (length + distance codes)
+  4 = literals sent in stored blocks (the memcpy only)
+
+SLZ_STATS: counters dumped on stderr at exit by a destructor: lookups,
+word hits, hits within the window, references (count, lengths, distances,
+encoded sizes, adjacency, backward extension), literal runs per block type
+(huffman/stored), huffman blocks opened, literal-skip steps and probes,
+and histograms of lengths, distances and run lengths. Not thread-safe,
+accumulates over all calls: use zenc -l 1. The compressed output is
+unchanged (checked at -1/-4, -k 32/4096).
+
+FIND_OPTIMAL_MATCH=N: replaces the bucket lookup with a walk along a hash
+chain built over the whole block on entry. Among the first N earlier
+positions carrying the same word (exact compare, 0 = all of them) within
+the window, it keeps the longest match, the nearest one on equal lengths.
+No match found means literal. Important: the chain has no collisions AND
+indexes every position, including those covered by matches which the
+hash table never sees (it only gets the looked-up positions plus 3 per
+match via SLZ_INSERT_SKIPPED). So depth 1 is NOT "the current hash minus
+collisions", it is that plus full indexing, and depth N is an upper bound
+for N entries per bucket, not what such buckets would give. Parsing stays
+greedy. All of silesia takes 3.9s at depth 0 (the old implementation
+scanned the window byte by byte and was unusable on silesia; it also
+stopped at the second matching candidate and equals depth 2 exactly).
+
+FIND_OPTIMAL_MATCH_MIN=3 (default 4): with FIND_OPTIMAL_MATCH, keys the
+chain on 3 bytes and takes 3-byte matches only when their code (7 bits of
+length + 5..18 bits of distance in the fixed tree) is shorter than their
+three literals (8 or 9 bits each). For ASCII this is a pure distance cut:
+3-byte matches up to distance 8192. Dropped with the text tree, which has
+no code for length 3.
+
+Reproduce:
+  make zenc USR_CFLAGS="-DSLZ_STATS=1";     ./zenc -4 -t silesia.tar
+  make zenc USR_CFLAGS="-DSLZ_DRY_RUN=7";   ./zenc -4 -l 3 -t -v silesia.tar
+  make zenc USR_CFLAGS="-DSLZ_STATS=1 -DFIND_OPTIMAL_MATCH=0 -DFIND_OPTIMAL_MATCH_MIN=3"
+
+
+2. What the encoding format costs (SLZ_DRY_RUN)
+-----------------------------------------------
+
+silesia.tar, MB/s. d1 = no huffman literals, d2 = no references, d4 = no
+stored copies, d3 = d1+d2, d7 = nothing encoded. Right columns: share of
+the time spent encoding, i.e. 1 - def/dN.
+
+  -k    lvl    def     d1     d2     d4     d3     d7  |  lits   refs    all
+  4096  1    580.5  652.2  616.4  587.8  682.6  692.7  | 11.0%   5.8%  16.2%
+  4096  2    515.8  580.0  544.3  518.6  608.9  624.5  | 11.1%   5.2%  17.4%
+  4096  3    489.2  554.0  515.9  489.8  585.8  582.9  | 11.7%   5.2%  16.1%
+  4096  4    469.7  532.3  495.9  470.3  561.2  563.6  | 11.8%   5.3%  16.7%
+  4096  T    439.3  482.1  474.1  439.4  537.8  545.7  |  8.9%   7.3%  19.5%
+  32    1    609.4  688.5  640.2  609.5  722.7  725.6  | 11.5%   4.8%  16.0%
+  32    2    523.7  593.3  552.0  528.5  627.5  639.5  | 11.7%   5.1%  18.1%
+  32    3    479.1  549.2  505.0  479.0  576.0  574.1  | 12.8%   5.1%  16.5%
+  32    4    457.2  521.0  483.3  459.6  553.6  557.8  | 12.2%   5.4%  18.0%
+  32    T    419.4  461.2  449.9  417.5  507.2  514.1  |  9.1%   6.8%  18.4%
+
+Findings:
+  - the format costs 16-19% of the time; 81-84% is the match search and
+    the decisions. That's where the big gains would be;
+  - huffman literals are two thirds of the encoding cost although they are
+    only ~15% of the bytes: at -4 -k 4096, ~1.7 ns per literal (31.1M of
+    them) vs ~1.3 ns per whole reference (18.7M, 9 bytes each on average);
+  - stored copies are free (d4 within noise of def);
+  - d1 and d2 are roughly additive (d3).
+
+Leads derived from this (not tried yet):
+  - batch several literal codes into a single enqueue56() (six 9-bit codes
+    fit in 56 bits), but huffman runs average only 4.3 bytes, 39% of them
+    a single byte, so it would need a short fast path for 2-3 literals;
+  - the remaining per-lookup cost is roughly 6 ns at -4, dominated by the
+    bucket hit test mispredict (65% of all mispredicts, measured earlier).
+
+
+3. Statistics on silesia (SLZ_STATS)
+------------------------------------
+
+Per level. lookups = words looked up in % of input bytes; hits = same word
+found in the bucket, % of lookups; inwin = hits within the window, % of
+hits; taken = references emitted, % of hits in window; cover = % of input
+covered by references; len/dist/bits = average length, distance and
+encoded size of references; adj = % of references right after another
+one (no literal in between); back = % extended backwards; hrun = average
+huffman literal run (bytes); hbits = bits per huffman literal; stored =
+bytes sent in stored blocks; skip = % of input passed over by the literal
+skip.
+
+  -k   lvl lookups  hits  inwin  taken      refs  cover   len    dist  bits   adj  back hrun hbits     stored  skip
+  4096 1    18.50  46.92  90.75  99.44  16598887  73.67  9.41  4147.9 20.50 62.30  5.02  3.3 8.155   34980510 16.06
+  4096 2    23.42  41.75  91.33  97.09  18371591  79.04  9.12  4127.1 20.52 61.29  5.11  3.9 8.205   16673092  6.66
+  4096 3    25.78  37.62  91.50  99.34  18686175  79.84  9.06  4137.4 20.53 61.33  5.25  4.2 8.211   12038896  3.73
+  4096 4    29.44  33.36  91.75  98.02  18719547  79.96  9.05  4142.5 20.53 61.39  5.28  4.3 8.211   11344744  0.00
+  4096 T    30.54  33.65  92.11  90.16  18087642  78.50  9.20  4150.4 17.68 62.19  5.16  3.8 8.809   19539182  0.00
+  32   1    19.43  36.58 100.00  98.44  14825368  66.73  9.54  2532.2 19.89 57.79  3.86  3.7 8.128   47334255 21.10
+  32   2    24.91  33.33 100.00  95.01  16716294  73.48  9.32  2612.5 19.99 56.86  4.26  4.1 8.150   26480465  9.83
+  32   3    29.77  28.88 100.00  95.12  17334567  75.17  9.19  2627.4 20.00 56.72  4.35  4.6 8.162   17951829  3.64
+  32   4    33.37  26.29 100.00  93.30  17351141  75.24  9.19  2630.3 20.00 56.79  4.36  4.7 8.163   17582658  0.00
+  32   T    35.83  28.34 100.00  75.73  16299687  72.24  9.39  2676.8 17.18 58.35  4.38  4.3 8.323   29675938  0.00
+
+Level 2 probes: 238672 at 4 MB with 7.63% hits, 365597 at 32 kB with
+11.03% hits. Level 3 probes: 31739 (2.70% hits) and 31947 (5.77%).
+
+Sum check at -4 -k 4096: 18.72M refs * 20.53 bits + 31.13M huffman
+literals * 8.211 bits + 11.35M stored bytes = 91.34 MB, for 91360519
+bytes actually produced.
+
+Histograms, columns: -4 -k 4096 | -4 -k 32 | -T -k 4096 | -T -k 32
+(% of references or of runs):
+
+  reference lengths
+    4          37.73%   36.62%   36.96%   35.72%
+    5          16.30%   16.00%   15.81%   15.92%
+    6          10.44%   10.67%   10.67%   10.83%
+    7           8.21%    8.46%    8.43%    8.48%
+    8           4.63%    4.67%    4.76%    4.72%
+    9-16       12.61%   13.18%   12.99%   13.47%
+    17-32       6.79%    6.99%    6.99%    7.27%
+    33-64       2.65%    2.80%    2.73%    2.94%
+    65-128      0.37%    0.37%    0.39%    0.40%
+    129-257     0.10%    0.10%    0.10%    0.10%
+    258         0.16%    0.15%    0.17%    0.16%
+
+  reference distances
+    1           0.05%    0.08%    0.05%    0.08%
+    2-3         0.24%    0.36%    0.25%    0.37%
+    4-7         0.61%    0.73%    0.62%    0.71%
+    8-15        2.23%    2.63%    2.31%    2.70%
+    16-31       5.47%    6.23%    5.59%    6.28%
+    32-63       5.26%    6.03%    5.38%    5.94%
+    64-127      7.08%    8.16%    7.20%    8.08%
+    128-255     8.50%    9.78%    8.58%    9.68%
+    256-511     9.50%   10.74%    9.52%   10.66%
+    512-1023   10.18%   11.40%   10.09%   11.31%
+    1024-2047  10.56%   11.47%   10.37%   11.39%
+    2048-4095  11.74%   12.12%   11.48%   12.14%
+    4096-8191  11.46%   10.66%   11.34%   10.79%
+    8192-16383  9.84%    7.16%    9.85%    7.33%
+    16384-32767 7.27%    2.45%    7.38%    2.54%
+
+  huffman literal runs
+    1          38.57%   34.98%   39.50%   36.04%
+    2-3        28.89%   28.70%   30.10%   29.56%
+    4-7        17.45%   20.73%   18.01%   20.79%
+    8-15       11.10%   11.05%    9.59%    9.96%
+    16-31       3.13%    3.17%    2.08%    2.42%
+    32-63       0.64%    1.03%    0.58%    0.94%
+    64+         0.20%    0.33%    0.13%    0.29%
+
+  Stored runs are long: at -4 -k 4096, 2468 runs averaging 4597 bytes,
+  67% of them between 256 and 2047 bytes.
+
+Findings:
+  - only 29% (4 MB) to 33% (32 kB) of the input bytes are looked up at -4:
+    the rest is covered by matches and passed over. The literal path
+    handles 20-28% of the bytes, the reference path most of the rest;
+  - 61% of references directly follow another one;
+  - length 4 is 37% of the references, 9-16 still 13%;
+  - distances are almost flat at 7-12% per power of two from 64 to 16k;
+    at 32 kB the blocks cap them, so the last two buckets shrink;
+  - at 4 MB, 8% of word hits are stale entries out of the window: lost
+    bucket capacity. Not at 32 kB since the table is reset per block;
+  - the text tree at 32 kB rejects 24% of the matches it finds, because
+    of its debt limit (SLZ_TEXT_MAX_DEBT).
+
+
+4. Match search quality (FIND_OPTIMAL_MATCH)
+--------------------------------------------
+
+Combined with SLZ_STATS. "hash" is the regular encoder, "all" = depth 0.
+bits = average reference size, lits = % of the input left as literals,
+run = average literal run.
+
+  -k    lvl depth    totout  vs_hash     refs avglen avgdist  bits   lits  run
+  4096  4   hash   91360519   +0.00% 18719547   9.05  4142.5 20.53  20.04  5.9
+  4096  4   1      88995294   -2.59% 20352603   8.66  5077.9 20.64  16.83  5.6
+  4096  4   2      85803247   -6.08% 18931512   9.32  5655.3 20.95  16.71  5.6
+  4096  4   4      83759652   -8.32% 17989610   9.82  6309.7 21.23  16.61  5.6
+  4096  4   16     81614561  -10.67% 16899562  10.48  7526.7 21.73  16.47  5.7
+  4096  4   all    80529300  -11.86% 16317870  10.87  8567.8 22.12  16.33  5.7
+  4096  T   hash   88247695   +0.00% 18087642   9.20  4150.4 17.68  21.50  6.7
+  4096  T   1      85940369   -2.61% 19306878   8.88  4838.2 17.71  19.14  6.9
+  4096  T   2      83675414   -5.18% 17892752   9.59  5418.6 18.19  19.04  7.0
+  4096  T   4      82290922   -6.75% 16962775  10.13  6081.2 18.63  18.96  7.0
+  4096  T   16     80895868   -8.33% 15903990  10.82  7307.4 19.34  18.81  7.1
+  4096  T   all    80159142   -9.17% 15331378  11.24  8382.5 19.84  18.67  7.2
+  32    4   hash   96588868   +0.00% 17351141   9.19  2630.3 20.00  24.76  7.0
+  32    4   1      95341686   -1.29% 18302003   8.90  2848.3 19.92  23.15  7.0
+  32    4   2      92567813   -4.16% 17052985   9.57  3156.9 20.20  23.02  7.1
+  32    4   4      90868232   -5.92% 16284876  10.03  3485.0 20.44  22.90  7.1
+  32    4   16     89234655   -7.61% 15482272  10.58  4054.1 20.83  22.75  7.1
+  32    4   all    88518499   -8.36% 15115035  10.85  4489.0 21.09  22.63  7.2
+  32    T   hash   95140431   +0.00% 16299687   9.39  2676.8 17.18  27.76  8.7
+  32    T   1      93763833   -1.45% 17163104   9.10  2847.2 17.07  26.29  8.9
+  32    T   2      91746702   -3.57% 15960183   9.81  3166.7 17.50  26.14  8.9
+  32    T   4      90531510   -4.84% 15225620  10.30  3504.5 17.85  26.00  9.0
+  32    T   16     89406598   -6.03% 14457052  10.87  4092.4 18.38  25.84  9.0
+  32    T   all    88865424   -6.60% 14100080  11.17  4547.1 18.69  25.72  9.1
+
+tests/index.html, ratio:
+
+            hash   depth 1  depth 2  depth 4  depth 16   all
+  -1      44.42%   43.06%   41.37%   40.13%   39.21%   38.96%
+  -4      44.19%   43.00%   41.31%   40.07%   39.15%   38.90%
+  -1 -T   37.37%   36.48%   35.37%   34.58%   34.08%   34.01%
+
+(The old window-scan implementation gave 41.37% / 35.37%, i.e. depth 2.)
+
+Findings:
+  - collisions plus partial indexing cost 2.6% at 4 MB and 1.3% at 32 kB;
+    this experiment can't tell which of the two dominates. They mostly
+    lose matches (3.2 and 1.6 points more of the input left as literals);
+  - the rest of the gap to the longest match (9.3% and 7.1%) comes from
+    looking at a single candidate. Past depth 1 the literal share barely
+    moves: matches get longer (9.05 -> 10.87) and twice as far
+    (4142 -> 8568), so each costs 1.6 bits more but there are 13% fewer;
+  - each doubling of the distance costs one more extra bit of distance
+    code in fixed huffman, so searching further spends bits. It still pays
+    per covered byte (2.268 bits/byte for hash, 2.383 at depth 1, 2.248 at
+    depth 2, 2.162 at 4, 2.074 at 16, 2.035 for all) but the returns fall
+    fast: 3.49 points for 1->2, 2.24 for 2->4, ~1.2 per doubling for
+    4->16, 1.19 for 16->all;
+  - depth 2 recovers about half of the total gap. This does not contradict
+    the earlier rejection of 2 entries per bucket, which was decided on
+    CPU cost (and real buckets would do worse than depth 2, see the
+    caveat in section 1);
+  - the chain keeps the longest match, not the cheapest in bits: a much
+    farther match one byte longer may cost more. Ranking candidates by
+    bits saved (8 * len - length code bits - distance code bits) instead
+    was proposed, not tried.
+
+
+5. 3-byte matches (FIND_OPTIMAL_MATCH_MIN=3)
+--------------------------------------------
+
+Idea: HTML has many short repeats at short distances ("</", "=\"", "<a "),
+and a 3-byte match at short distance is cheaper than 3 literals in the
+fixed tree (7 + 5..11 bits vs 24 bits up to distance 8192). The text tree
+was left out since it has no code for length 3 (it would need to be
+regenerated with tools/mktext.c, taking code space from other symbols).
+
+-4, len3 = share of references of length 3 (-3 gives the same picture):
+
+  corpus   k     variant      totout  vs_hash      refs    len3  avglen avgdist   bits  lits%
+  hap      4096  hash         280766   +0.00%     76105   0.00%  11.18  4325.7  20.91   8.77
+  hap      4096  fom1-m4      277007   -1.34%     81664   0.00%  10.62  4501.6  20.74   7.00
+  hap      4096  fom1-m3      303909   +8.24%    103998  35.73%   8.53  2505.5  19.88   4.88
+  hap      4096  fom2-m4      261445   -6.88%     74713   0.00%  11.62  5082.4  21.10   6.90
+  hap      4096  fom2-m3      279783   -0.35%     93067  28.73%   9.55  3063.4  20.29   4.68
+  hap      4096  fom4-m4      252187  -10.18%     70428   0.00%  12.34  5727.0  21.40   6.84
+  hap      4096  fom4-m3      263512   -6.15%     85495  23.35%  10.41  3755.9  20.68   4.56
+  hap      4096  fom16-m4     242888  -13.49%     65602   0.00%  13.26  7017.0  21.95   6.74
+  hap      4096  fom16-m3     246065  -12.36%     76366  16.74%  11.67  5421.2  21.44   4.44
+  hap      4096  fom0-m4      238096  -15.20%     62682   0.00%  13.89  8187.6  22.46   6.66
+  hap      4096  fom0-m3      237745  -15.32%     71242  14.86%  12.52  7213.6  22.13   4.36
+  hap      32    hash         304658   +0.00%     73567   0.00%  11.09  2801.2  20.41  12.54
+  hap      32    fom1-m4      302389   -0.74%     77923   0.00%  10.61  2740.4  20.19  11.33
+  hap      32    fom1-m3      323922   +6.32%    103869  37.44%   8.30  1729.4  19.55   7.51
+  hap      32    fom2-m4      288952   -5.16%     72050   0.00%  11.49  3049.8  20.49  11.19
+  hap      32    fom2-m3      302082   -0.85%     93841  31.22%   9.21  2029.4  19.90   7.36
+  hap      32    fom4-m4      281401   -7.63%     68649   0.00%  12.08  3368.6  20.73  11.10
+  hap      32    fom4-m3      288255   -5.38%     87358  26.89%   9.90  2389.0  20.20   7.26
+  hap      32    fom16-m4     273900  -10.10%     64944   0.00%  12.78  3963.8  21.13  10.97
+  hap      32    fom16-m3     274426   -9.92%     80141  22.32%  10.80  3169.6  20.74   7.15
+  hap      32    fom0-m4      270482  -11.22%     62946   0.00%  13.20  4441.9  21.46  10.89
+  hap      32    fom0-m3      268870  -11.75%     76730  21.46%  11.29  3849.2  21.15   7.08
+  silesia  4096  hash       91360519   +0.00%  18719547   0.00%   9.05  4142.5  20.53  20.04
+  silesia  4096  fom1-m3    95359013   +4.38%  28803079  43.32%   6.52  2825.2  19.58  11.41
+  silesia  4096  fom2-m3    89600083   -1.93%  26134255  36.44%   7.20  3370.4  19.97  11.18
+  silesia  4096  fom4-m3    85844029   -6.04%  24342261  31.52%   7.75  4029.4  20.33  11.02
+  silesia  4096  fom16-m3   81603710  -10.68%  22131536  25.80%   8.54  5558.5  21.00  10.80
+  silesia  4096  fom0-m3    79378785  -13.11%  20846414  23.89%   9.09  7149.3  21.58  10.63
+  silesia  32    hash       96588868   +0.00%  17351141   0.00%   9.19  2630.3  20.00  24.76
+  silesia  32    fom1-m3    99123191   +2.62%  28283924  45.76%   6.41  1855.4  19.17  14.43
+  silesia  32    fom2-m3    93837879   -2.85%  25809481  39.49%   7.04  2151.4  19.50  14.24
+  silesia  32    fom4-m3    90601962   -6.20%  24248819  35.39%   7.51  2486.6  19.78  14.11
+  silesia  32    fom16-m3   87250015   -9.67%  22501559  31.36%   8.11  3189.0  20.28  13.91
+  silesia  32    fom0-m3    85765657  -11.21%  21655567  30.33%   8.44  3799.0  20.63  13.78
+
+(silesia m4 rows: see section 4.)
+
+Findings:
+  - keying on 3 bytes hurts at low depth (+8.2% on the HTML at depth 1):
+    the most recent occurrence of 3 bytes is often only a 3-byte match,
+    which shadows a longer one further back, and greedy parsing takes it;
+  - with all candidates examined, 3-byte keys save only 0.15% (4 MB) and
+    0.60% (32 kB) of the HTML's output over 4-byte keys, vs 1.43% and
+    3.11% on silesia. On the HTML they do move 2.3 points of the input
+    from literals to references (6.66% -> 4.36% at 4 MB), but the average
+    match shrinks from 13.89 to 12.52 bytes with 14% more references: a
+    short match taken greedily cuts into a longer one starting a few
+    bytes later. It would need lazy matching on top of a deep search;
+  - conclusion: not worth it with a few candidates per bucket and greedy
+    parsing, and HTML is not where it would help.
+
+An earlier experiment (commits 0fbac20 / 857c7ea on another branch,
+SLZ_MIN_MATCH / SLZ_HASH_BYTES) had already found, with the real single-
+entry hash: hashing on 3 bytes alone costs 4-5% of output (more
+collisions, worse candidates for long matches), accepting 3-byte matches
+another 1.7-5%, and hash-4/match-3 is byte-identical to hash-4/match-4.
+
+
+6. Ideas discussed but not run, with the reasoning
+--------------------------------------------------
+
+Larger hash table (e.g. SLZ_HASH_BITS=15): the chain experiments above
+don't depend on it (the chain filters on the exact word). Left aside
+without measurement. Note that the table is on the stack and reset per
+call: 15 bits = 256 kB to clear for each 16-32 kB haproxy buffer, and
+far beyond L1.
+
+Dropping text-mode references beyond 8192 or 16384 early to save CPU:
+rejected on reasoning. Share of references beyond 8192 / 16384:
+hap-org.html 17.6% / 7.5% at 4 MB, 10.0% / 2.8% at 32 kB; silesia 17.2% /
+7.4% and 9.9% / 2.5%. A dropped reference (~11 bytes on the HTML) costs
+~22 bits as a reference and ~75 bits as text literals, i.e. ~50 bits lost
+each: in the order of 10-30% more output (minus what nearer partial
+matches recover). And it would cost CPU, not save it: the lookup and the
+word compare are already paid when the distance is known, the window test
+is already a distance compare, and the bytes go through the literal path
+instead (one lookup and one huffman literal each, the most expensive part
+per byte, see section 2). The only CPU effect of far distances is the
+cache footprint of text_dist_table (128 kB, far distances touch its last
+96 kB); if it ever shows in a profile, computing the code for far
+distances only is the way, not dropping the match (computing it for all
+distances from the fixed one was measured 3-5% slower earlier).
+
+A second candidate per bucket for level 4: level 4 is kept as the upper
+bound with no compromise (large backward match, no literal skip). Two
+candidates per bucket were measured long ago as costly in CPU for little
+gain.
+
+
+7. ARL results reported by Willy in the same period
+------------------------------------------------------
+
+Core Ultra 7 265K, Willy's own build, MB/s / bytes, silesia.tar.
+
+Baseline at 7bafca4:
+              4 MB                     32 kB
+  l1   941.2  296350698       1011.7  323448042
+  l2   828.0  276981102        868.3  295883856
+  l3   795.5  274524147        800.9  290058198
+  l4   746.5  274081503        750.6  289766550
+  T    742.4  264743031        726.7  285421239
+
+(zenc -l 3 here, hence totals 3x the single-pass sizes.)
+
+Backward match reach 2 at level 2, i.e. SLZ_BACKWARD_MATCH { 0,1,2,2,8 }
+instead of { 0,1,1,2,8 }:
+  4 MB:  l2 822.4 MB/s, 276557460 bytes  (-0.7% speed, -0.15% size)
+  32 kB: l2 860.1 MB/s, 295553982 bytes  (-0.9% speed, -0.11% size)
+Rejected: 0.44% (4 MB) to 0.85% (32 kB) of speed per 0.1% of size, while
+moving from level 2 to level 3 costs 0.40-0.44% per 0.1%.
+
+Level 3 with skipped indexing at stride 256 vs level 4, 32 kB: +0.10%
+size for +6.7% speed (290058198 at 800.9 vs 289766550 at 750.6), same
+as at 4 MB (+0.16% for +6.6%): the stride holds at both block sizes.
+
+Level spacing at 32 kB: 1->2 -8.5% size for -14% speed, 2->3 -2.0% for
+-7.8%, 3->4 -0.1% for -6.3%.

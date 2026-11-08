@@ -1,0 +1,230 @@
+From d5a8a83d11dcee019c08add6af83501bba41e405 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sun, 8 Nov 2026 15:18:28 +0100
+Subject: [PATCH 2/3] slz: rework FIND_OPTIMAL_MATCH as a hash chain with a
+ depth limit
+
+The experimental FIND_OPTIMAL_MATCH scanned the whole window byte by byte
+for each lookup, which made it unusable on large inputs, and stopped at
+the second matching candidate despite its name. It now walks a hash chain
+built over the whole block on entry, among the first FIND_OPTIMAL_MATCH
+candidates carrying the same word (0 = all of them), keeping the longest
+match and the nearest one on equal lengths. Depth 1 is the last occurrence
+of the word, and depth 0 is the longest match within the window, still
+parsed greedily. The chain has no collisions and indexes all positions,
+including those covered by matches which the hash table never sees (it
+only gets the looked up ones plus 3 per match with SLZ_INSERT_SKIPPED).
+So depth 1 is the regular lookup without collisions *and* with all
+positions indexed, and depth N is an upper bound for N entries per bucket,
+not what such buckets would give.
+Depth 2 gives exactly the same output as the old scan (index.html at -1:
+41.37%, -1 -T: 35.37%). The whole silesia.tar takes 3.9s at depth 0.
+
+Combined with SLZ_STATS, silesia.tar (211947520 bytes), "hash" being the
+regular lookup:
+
+  -k    lvl depth    totout  vs_hash     refs avglen avgdist  bits  lits% runlen
+  4096  4   hash   91360519   +0.00% 18719547   9.05  4142.5 20.53  20.04  5.9
+  4096  4   1      88995294   -2.59% 20352603   8.66  5077.9 20.64  16.83  5.6
+  4096  4   2      85803247   -6.08% 18931512   9.32  5655.3 20.95  16.71  5.6
+  4096  4   4      83759652   -8.32% 17989610   9.82  6309.7 21.23  16.61  5.6
+  4096  4   16     81614561  -10.67% 16899562  10.48  7526.7 21.73  16.47  5.7
+  4096  4   all    80529300  -11.86% 16317870  10.87  8567.8 22.12  16.33  5.7
+  4096  T   hash   88247695   +0.00% 18087642   9.20  4150.4 17.68  21.50  6.7
+  4096  T   1      85940369   -2.61% 19306878   8.88  4838.2 17.71  19.14  6.9
+  4096  T   2      83675414   -5.18% 17892752   9.59  5418.6 18.19  19.04  7.0
+  4096  T   4      82290922   -6.75% 16962775  10.13  6081.2 18.63  18.96  7.0
+  4096  T   16     80895868   -8.33% 15903990  10.82  7307.4 19.34  18.81  7.1
+  4096  T   all    80159142   -9.17% 15331378  11.24  8382.5 19.84  18.67  7.2
+  32    4   hash   96588868   +0.00% 17351141   9.19  2630.3 20.00  24.76  7.0
+  32    4   1      95341686   -1.29% 18302003   8.90  2848.3 19.92  23.15  7.0
+  32    4   2      92567813   -4.16% 17052985   9.57  3156.9 20.20  23.02  7.1
+  32    4   4      90868232   -5.92% 16284876  10.03  3485.0 20.44  22.90  7.1
+  32    4   16     89234655   -7.61% 15482272  10.58  4054.1 20.83  22.75  7.1
+  32    4   all    88518499   -8.36% 15115035  10.85  4489.0 21.09  22.63  7.2
+  32    T   hash   95140431   +0.00% 16299687   9.39  2676.8 17.18  27.76  8.7
+  32    T   1      93763833   -1.45% 17163104   9.10  2847.2 17.07  26.29  8.9
+  32    T   2      91746702   -3.57% 15960183   9.81  3166.7 17.50  26.14  8.9
+  32    T   4      90531510   -4.84% 15225620  10.30  3504.5 17.85  26.00  9.0
+  32    T   16     89406598   -6.03% 14457052  10.87  4092.4 18.38  25.84  9.0
+  32    T   all    88865424   -6.60% 14100080  11.17  4547.1 18.69  25.72  9.1
+
+(bits = average reference size, lits% = share of the input left as
+literals, runlen = average literal run). Collisions and partial indexing
+together cost 2.6% at 4 MB and 1.3% at 32 kB, without telling which
+dominates: they mostly lose matches (3.2 and 1.6 points more of the input
+left as literals). The rest of the gap to the longest match, 9.3% and
+7.1%, comes from looking at a single candidate: the matches
+get longer (9.05 -> 10.87) and twice as far (4142 -> 8568), so each one
+costs 1.6 bits more but there are 13% fewer of them, while the share of
+literals barely moves past depth 1. index.html: -1 44.42% hash, 43.06%
+depth 1, 41.37% depth 2, 40.13% depth 4, 39.21% depth 16, 38.96% all.
+
+Reproduce with:
+  make zenc USR_CFLAGS="-DSLZ_STATS=1 -DFIND_OPTIMAL_MATCH=0"
+  ./zenc -4 -t -v silesia.tar
+---
+ src/slz.c | 112 ++++++++++++++++++++++++++++++++++++------------------
+ 1 file changed, 74 insertions(+), 38 deletions(-)
+
+diff --git a/src/slz.c b/src/slz.c
+index 12b4550..26e2e55 100644
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -24,6 +24,9 @@
+ 
+ #include <stdio.h>
+ #include <string.h>
++#ifdef FIND_OPTIMAL_MATCH
++#include <stdlib.h>
++#endif
+ #include "slz.h"
+ #include "slz-prv.h"
+ #include "tables.h"
+@@ -1305,6 +1308,9 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 	struct text_vref vref[SLZ_TEXT_VREFS];
+ 	uint32_t dist, code;
+ 	union ref refs[1 << SLZ_HASH_BITS];
++#ifdef FIND_OPTIMAL_MATCH
++	uint32_t *fom_prev = NULL; /* see FIND_OPTIMAL_MATCH */
++#endif
+ #if SLZ_STATS
+ 	uint32_t st_dist = 0, st_lits;
+ #endif
+@@ -1324,6 +1330,27 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 	reset_refs(refs, sizeof(refs));
+ 	bal = strm->debt;
+ 
++#ifdef FIND_OPTIMAL_MATCH
++	/* chain each position to the previous one with the same hash, as
++	 * position + 1 so that 0 ends the chain.
++	 */
++	{
++		uint32_t *head = calloc(1 << 16, sizeof(*head));
++		long p;
++
++		fom_prev = malloc((ilen + 1) * sizeof(*fom_prev));
++		if (!head || !fom_prev)
++			abort();
++		for (p = 0; p + 4 <= ilen; p++) {
++			uint32_t hh = (read_le32(in + p) * 2654435761U) >> 16;
++
++			fom_prev[p] = head[hh];
++			head[hh] = p + 1;
++		}
++		free(head);
++	}
++#endif
++
+ 	strm->outbuf = out;
+ 
+ #ifndef UNALIGNED_FASTER
+@@ -1356,51 +1383,57 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 		}
+ 
+ #ifdef FIND_OPTIMAL_MATCH
+-		/* Experimental code to see what could be saved with an ideal
+-		 * longest match lookup algorithm. This one is very slow but
+-		 * scans the whole window. In short, here are the savings :
++		/* Experimental code to see what could be saved with a better
++		 * match lookup than the single entry per hash bucket. It walks
++		 * a hash chain built over the whole block on entry, retaining
++		 * the longest match within the window among the first
++		 * FIND_OPTIMAL_MATCH candidates carrying the same word (0 = all
++		 * of them), the nearest one on equal lengths. 1 is thus the
++		 * last occurrence of the word. Note that the chain indexes all
++		 * positions, including those covered by matches which the hash
++		 * table never sees, and has no collisions, so depth 1 is the
++		 * regular lookup without collisions *and* with all positions
++		 * indexed, and depth N an upper bound for N entries per bucket.
++		 * 0 is the longest match (still with greedy parsing). The
++		 * result replaces the bucket's: no match found means literal.
++		 * Old results with the window scan it replaces:
+ 		 *   file        orig     fast(ratio)  optimal(ratio)
+ 		 *  README       5185    3419 (65.9%)    3165 (61.0%)  -7.5%
+ 		 *  index.html  76799   35662 (46.4%)   29875 (38.9%) -16.3%
+ 		 *  rfc1952.c   29383   13442 (45.7%)   11793 (40.1%) -12.3%
+-		 *
+-		 * Thus the savings to expect for large files is at best 16%.
+-		 *
+-		 * A non-colliding hash gives 33025 instead of 35662 (-7.4%),
+-		 * and keeping the last two entries gives 31724 (-11.0%).
+ 		 */
+-		unsigned long scan;
+-		int saved = 0;
+-		int bestpos = 0;
+-		int bestlen = 0;
+-		int firstlen = 0;
+-		int max_lookup = 2; // 0 = no limit
+-
+-		for (scan = pos - 1; scan < pos && (unsigned long)(pos - scan - 1) < 32768; scan--) {
+-			int len;
+-
+-			if (*(uint32_t *)(in + scan) != word)
+-				continue;
+-
+-			len = memmatch(in + pos, in + scan, rem);
+-			if (!bestlen)
+-				firstlen = len;
+-
+-			if (len > bestlen) {
+-				bestlen = len;
+-				bestpos = scan;
++		{
++			uint32_t cand = fom_prev[pos]; /* position + 1, 0 = none */
++			long fmax = rem > 258 ? 258 : rem;
++			long bestlen = 0, flen, depth = FIND_OPTIMAL_MATCH;
++			uint32_t bestpos = 0;
++
++			while (cand && pos - (cand - 1) <= 32768) {
++				uint32_t c = cand - 1;
++
++				if (read_le32(in + c) == word) {
++					/* the byte past the best length must match to beat it */
++					if (in[c + bestlen] == in[pos + bestlen]) {
++						flen = memmatch(in + pos, in + c, fmax);
++						if (flen > bestlen) {
++							bestlen = flen;
++							bestpos = c;
++							if (flen >= fmax)
++								break;
++						}
++					}
++					if (!--depth)
++						break;
++				}
++				cand = fom_prev[c];
+ 			}
+-			if (!--max_lookup)
+-				break;
+-		}
+-		if (bestlen) {
+-			//printf("pos=%d last=%d bestpos=%d word=%08x ent=%08x len=%d\n",
+-			//       (int)pos, (int)last, (int)bestpos, (int)word, (int)ent, bestlen);
+-			last = bestpos;
+-			ent  = word;
+-			saved += bestlen - firstlen;
++			if (bestlen) {
++				last = bestpos;
++				ent  = word;
++			}
++			else
++				ent = (uint32_t)~word;
+ 		}
+-		//fprintf(stderr, "first=%d best=%d saved_total=%d\n", firstlen, bestlen, saved);
+ #endif
+ 
+ 		if ((uint32_t)ent != word) {
+@@ -2048,6 +2081,9 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 		plit = 0;
+ 	}
+  leave:
++#ifdef FIND_OPTIMAL_MATCH
++	free(fom_prev);
++#endif
+ 	strm->ilen += ilen;
+ 	return strm->outbuf - out;
+ }
+-- 
+2.43.0
+
