@@ -1,0 +1,211 @@
+LZ4 between two haproxy instances: measurements and thoughts
+============================================================
+
+Idea (2026-11-08): implement LZ4 as an alternate output format. Browsers
+don't accept it, so it would only work between two haproxy instances
+(e.g. across a WAN or between datacenters), with a custom content-coding
+configured on both sides. LZ4 is normally much faster than the deflate
+formats, especially to decompress. See ../encoding/README for the
+measurement tools and ../brotli/README for the comparison with brotli.
+
+
+1. The format
+-------------
+
+LZ4 is LZ77 without any entropy coding, everything is byte-aligned. The
+block format is a series of sequences:
+
+  token (1 byte: 4 bits literal count, 4 bits match length - 4)
+  [literal count extension: bytes of 255, then a last byte < 255,
+   present when the 4-bit count is 15]
+  literals (raw bytes)
+  offset (2 bytes, little endian, 1-65535)
+  [match length extension, same scheme, when the 4-bit length is 15]
+
+Constraints: minimum match 4; the last 5 bytes of a block are always
+literals; the last match must start at least 12 bytes before the end of
+the block; the last sequence has only the token and the literals.
+
+The frame format wraps blocks: magic number, frame descriptor (flags,
+block max size 64 kB to 4 MB, optional content size), then blocks each
+preceded by a 4-byte size whose high bit marks an uncompressed block,
+an end mark, and optional xxHash32 checksums (per block and/or content).
+Blocks can be declared independent, which fits slz's stateless calls.
+
+What this means for an slz-style encoder:
+  - slz already defers literals until a match is found (<plit>), so at
+    match time both the literal count and the match length are known:
+    emitting a token, the extensions, a memcpy of the literals and the
+    offset is trivial, and there is no bit queue at all;
+  - no 9-bit literals, hence no stored blocks, no debt/credit logic and
+    no cost tests: incompressible data costs one extension byte per 255
+    literals plus a token, and a block can always be sent uncompressed
+    for 4 bytes;
+  - slz's window (32 kB) is within LZ4's 64 kB offset limit, and LZ4
+    matches are not capped at 258;
+  - the end-of-block constraints need a little care in the main loop.
+
+
+2. What an LZ4 emitter fed by slz's match finder would produce
+--------------------------------------------------------------
+
+SLZ_STATS (patch 0001 in this directory, originally commit 84989ac;
+it applies on top of ../encoding/0001-0003 and ../brotli/0001) computes the size of slz's own parse in LZ4
+block format (tokens, extensions, offsets, literals, 5 bytes per call).
+The parse is still decided for deflate (cost tests, 258 cap), so it is
+approximate. Against the real lz4 1.10.0 on the same blocks:
+
+                 slz -1 parse  slz -4 parse  lz4 1.10.0
+  hap-org  4 kB     50.61%        47.93%       47.95%
+  hap-org 16 kB     42.43%        39.72%       39.69%
+  hap-org 32 kB     40.24%        37.16%       37.07%
+  hap-org  1 MB     34.24%        34.14%       33.26%
+  silesia  4 kB     61.76%        58.06%       57.90%
+  silesia 16 kB     56.88%        52.34%       52.12%
+  silesia 32 kB     55.02%        50.23%       49.93%
+  silesia  1 MB     51.09%        47.52%       47.68%
+
+Average sequence overhead: 3.10-3.17 bytes per reference.
+
+So slz's level 4 match finder is as good as lz4's own for LZ4 output (it
+is the same design: 4-byte hash, single entry, greedy parsing). Level 1
+loses 3-5 points to its literal skip.
+
+Speed: SLZ_DRY_RUN=7 (nothing encoded, ../encoding/README section 2) gives the
+speed of slz's search and decisions alone: 557.8 MB/s at -4 -k 32 on
+silesia and 725.6 at -1, vs 608 MB/s for lz4 (different CPU core and
+harness, see section 4). An LZ4 emitter adds back a memcpy and a few
+bytes per sequence, but removes the deflate-specific decisions, so slz
+with an LZ4 emitter should land at roughly 85-90% of lz4's compression
+speed at the same ratio with level 4 (the search alone is at 92%), or
+faster than lz4 at a worse ratio with level 1. Not implemented, so not
+measured.
+
+
+3. LZ4 against the deflate formats (lzbench + zenc + zdec, 2026-11-08)
+----------------------------------------------------------------------
+
+Each block compressed independently. Ratio, compression MB/s,
+decompression MB/s. lz4/lz4hc/libdeflate/zlib/zstd from lzbench; slz
+from the current zenc (compression) and zdec (decompression, i.e. uslz),
+since lzbench's slz is the old 1.4-dev3. Xeon W-2145, taskset -c 4.
+
+  hap-org: ratio / compression MB/s / decompression MB/s
+                    4 kB                  16 kB                 32 kB                 1 MB                  
+  lz4                47.95%  632  3152     39.69%  669  3155     37.07%  682  3146     33.26%  731  3758    
+  lz4 fast-3         52.86%  750  3320     42.73%  737  3293     39.33%  741  3276     36.05%  801  3791    
+  lz4 fast-17        78.27% 1753  5199     62.15% 1373  4088     55.54% 1235  3796     49.74% 1214  4227    
+  lz4hc -1           46.34%  269  3283     37.46%  304  3347     34.37%  319  3387     29.12%  382  3426    
+  lz4hc -4           44.36%  153  3456     34.74%  144  3624     31.31%  137  3713     25.07%  118  3871    
+  lz4hc -9           44.27%  138  3464     34.58%  108  3640     31.08%   92  3727     24.55%   51  3912    
+  libdeflate -1      32.90%  169   655     27.51%  248   988     25.92%  275  1158     23.81%  301  1433    
+  libdeflate -6      31.85%   99   668     25.98%  124  1012     24.05%  124  1164     21.54%  120  1524    
+  zlib -1            34.24%   94   282     29.01%  129   331     27.55%  150   409     25.86%  144   456    
+  zstd -1            34.07%  292   813     27.66%  345  1152     26.11%  443  1357     21.70%  530  1758    
+  slz -1 (current)   45.58%  533   603     37.99%  607   632     36.06%  623   645     30.21%  565   607    
+  slz -4 (current)   42.21%  459   529     34.85%  529   573     32.67%  555   603     30.11%  550   609    
+  slz -T (current)   35.35%  436   486     29.59%  504   548     27.96%  527   578     26.08%  519   589    
+
+  silesia: ratio / compression MB/s / decompression MB/s
+                    4 kB                  16 kB                 32 kB                 1 MB                  
+  lz4                57.90%  615  2918     52.12%  611  2803     49.93%  608  2755     47.68%  685  3385    
+  lz4 fast-3         61.79%  784  3179     55.05%  722  2994     52.38%  702  2913     50.63%  780  3455    
+  lz4 fast-17        76.95% 1811  4550     68.93% 1389  3805     65.19% 1220  3494     62.37% 1156  3900    
+  lz4hc -1           55.93%  242  3056     49.21%  231  2989     46.51%  230  2975     42.20%  296  2925    
+  lz4hc -4           54.11%  139  3194     46.68%  125  3194     43.58%  113  3200     37.86%   87  3174    
+  lz4hc -9           53.97%  118  3226     46.38%   90  3237     43.15%   71  3259     36.97%   39  3274    
+  libdeflate -1      42.37%  161   582     38.14%  217   797     36.71%  227   896     34.75%  232  1030    
+  libdeflate -6      40.67%   92   580     35.98%  109   799     34.27%  106   889     31.93%   99  1064    
+  zlib -1            43.15%   74   252     39.29%  101   317     38.05%  108   341     36.51%  102   368    
+  zstd -1            43.19%  288   786     38.17%  365  1035     37.22%  421  1206     34.72%  469  1452    
+  slz -1 (current)   57.08%  553   673     52.54%  595   668     50.87%  606   674     47.07%  555   624    
+  slz -4 (current)   52.62%  416   541     47.41%  445   551     45.57%  455   565     43.16%  448   537    
+  slz -T (current)   53.01%  376   403     47.15%  404   412     44.89%  417   420     41.75%  421   393    
+
+Observations:
+  - lz4 compresses only 0-30% faster than slz -1 on this machine (608-
+    731 MB/s vs 533-623, the gap being largest at 4 kB and 1 MB), and
+    lz4's --fast modes buy speed with ratio much like slz's literal skip
+    does;
+  - the big difference is decompression: 2.8-3.8 GB/s for lz4 vs 0.4-
+    0.67 GB/s for uslz, i.e. 4-6x against slz -1 streams and up to 9x
+    against -T ones (dynamic block). That is the real argument for LZ4
+    between two haproxy instances: the receiving side's CPU;
+  - the price is the ratio: at 32 kB lz4 is between slz -1 and -4 on
+    silesia (49.93% vs 50.87%/45.57%), similar to slz -1 on the HTML
+    (37.07% vs 36.06%) but 33% larger than slz -T there (27.96%). Over
+    a WAN where bandwidth is the reason for compressing at all, that may
+    matter more than the CPU;
+  - lz4hc reaches slz -4 ratios on the HTML (lz4hc -4: 31.31% at 32 kB)
+    with the same decompression speed but at 137 MB/s to compress;
+  - for reference, zstd -1 beats slz -T's ratio on the HTML (26.11% vs
+    27.96% at 32 kB) at 443 MB/s and decompresses at 1.36 GB/s; its per-
+    stream memory was not measured, and that's what matters for haproxy.
+    Browsers accept zstd as a content-coding nowadays, as far as I know,
+    unlike lz4.
+
+
+4. Conclusions (2026-11-08)
+---------------------------
+
+  - No real gain to expect on the compression side. slz's level 4 search
+    already finds what lz4 finds (same size in LZ4 format, section 2),
+    and lz4 compresses only 0-30% faster than slz -1. An LZ4 emitter on
+    slz's search would be simple to write (slz already holds literals
+    back until a match, so the literal count and match length are known
+    when the token is due; no bit queue, no stored blocks, no debt logic,
+    4 bytes for an uncompressed block; only the end-of-block rules need
+    care), and would reach about 85-90% of lz4's speed at the same ratio.
+  - The only real argument is decompression, 4-9x faster than uslz,
+    i.e. CPU saved on the receiving haproxy. It comes at the price of a
+    much larger output than slz -T on text (+33% on the HTML at 32 kB),
+    which matters if bandwidth is why we compress between the two sites.
+  - zstd -1 would be the interesting one (better ratio than slz -T, 1.36
+    GB/s to decompress, accepted by browsers), but it is way more complex
+    to implement: unlike LZ4 or brotli it is no longer a matter of output
+    format (FSE/huffman entropy stages, sequence coding). Its per-stream
+    memory was not measured.
+  - Observation that also supports the matcher's design: several modern
+    implementations copy slz's design (single-entry 4-byte hash, greedy
+    parsing), and lz4 lands at exactly the same parse quality.
+
+
+5. Commands used
+----------------
+
+lzbench (commit 32ab077: lz4 1.10.0, libdeflate 1.26, zlib 1.3.2, zstd
+1.5.7), -b<kB> compresses each block independently, -t1,1 sets the
+minimum time of each measurement to 1 second, -o4 prints CSV
+(compressor, compression MB/s, decompression MB/s, original size,
+compressed size, ratio, file):
+
+  cd lzbench
+  for f in /tmp/hap-org.html /dev/shm/silesia.tar; do
+      for b in 4 16 32 1024; do
+          taskset -c 4 ./lzbench -b$b -t1,1 -o4 \
+              -elz4/lz4fast,3,17/lz4hc,1,4,9/slz_deflate,1,2/libdeflate,1,6/zlib,1/zstd,1 $f
+      done
+  done
+
+zenc and zdec builds (zenc as in ../brotli/README section 7, zdec the way the
+decoder is usually measured, without the jump padding):
+
+  gcc-15 $F -o zenc src/zenc.c src/slz_common.c src/slz.c
+  gcc-14 -O3 -g -fomit-frame-pointer -march=native -mno-avx512f -Isrc \
+      -o zdec src/zdec.c src/slz_common.c src/uslz.c
+
+slz compression, best of 3 (-l 200 on the HTML, -l 3 on silesia):
+
+  taskset -c 4 ./zenc <-1|-4|-4 -T> -k <kB> -l 3 -t -v silesia.tar
+
+slz decompression: raw deflate streams produced with the same options,
+then decoded by zdec, best of 3, zdec's own MB/s (decoded bytes over the
+timed rounds):
+
+  ./zenc <opts> -k <kB> -D -c silesia.tar > s.raw
+  taskset -c 4 ./zdec -D -l 3 -t -v s.raw
+
+LZ4 estimate of slz's parse (the "lz4 estimate" line of SLZ_STATS):
+
+  make zenc USR_CFLAGS="-DSLZ_STATS=1"
+  ./zenc -4 -k 32 -t hap-org.html 2>&1 | grep "lz4 estimate"

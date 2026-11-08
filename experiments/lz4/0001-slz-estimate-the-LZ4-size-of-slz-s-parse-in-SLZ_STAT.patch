@@ -1,0 +1,79 @@
+From 0a970b1a2abafb7aeaf6d6196798131e8019d5e9 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sun, 8 Nov 2026 16:33:54 +0100
+Subject: [PATCH] slz: estimate the LZ4 size of slz's parse in SLZ_STATS
+
+SLZ_STATS now computes what the references and literals slz emits would
+weigh in LZ4 block format: per reference a token, the extension bytes of
+the literal count and of the match length, a 2-byte offset, plus all
+literal bytes, plus 5 bytes per call (block size and final token). This
+tells what an LZ4 emitter fed by slz's match finder would produce,
+without writing it. The parse remains the one decided for deflate (no
+stored mode in LZ4, matches capped at 258), so it is approximate.
+
+Against the real lz4 1.10.0 (lzbench -b<kB>), same blocks:
+
+                 slz -1 parse  slz -4 parse  lz4 1.10.0
+  hap-org  4 kB     50.61%        47.93%       47.95%
+  hap-org 16 kB     42.43%        39.72%       39.69%
+  hap-org 32 kB     40.24%        37.16%       37.07%
+  hap-org  1 MB     34.24%        34.14%       33.26%
+  silesia  4 kB     61.76%        58.06%       57.90%
+  silesia 16 kB     56.88%        52.34%       52.12%
+  silesia 32 kB     55.02%        50.23%       49.93%
+  silesia  1 MB     51.09%        47.52%       47.68%
+
+So slz's level 4 match finder is as good as lz4's own for LZ4 output,
+level 1 loses 3-5 points to the literal skip.
+---
+ src/slz.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/slz.c b/src/slz.c
+index 60b2e8f..8d8a7fd 100644
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -336,6 +336,7 @@ static struct {
+ 	unsigned long long dc_short;     /* misses where it only gives a shorter match (>= 4) */
+ 	unsigned long long dc_short_lost;/* bytes these shorter ones would lose */
+ 	const unsigned char *base;       /* start of the current call's input */
++	unsigned long long lz4_seq;      /* LZ4 sequence overhead of the references, see slz_stats_ref() */
+ } slz_stats = { .dcache = { 4, 11, 15, 16 } };
+ 
+ static inline long memmatch(const unsigned char *a, const unsigned char *b, long max);
+@@ -357,6 +358,15 @@ static inline void slz_stats_ref(uint32_t mlen, uint32_t dist, uint32_t bits, ui
+ 	slz_stats.len_hist[mlen <= 8 ? (int)mlen - 3 : mlen == 258 ? 11 : slz_stats_log2(mlen - 1, 7) + 3]++;
+ 	slz_stats.dist_hist[slz_stats_log2(dist, 15)]++;
+ 
++	/* LZ4 block format: each reference is a sequence made of a token
++	 * (4 bits of literal count, 4 bits of match length - 4), extra bytes
++	 * of 255 for counts of 15 and more, the literals, a 2-byte offset,
++	 * and extra bytes for the match length. The literals themselves are
++	 * counted apart (huff_lits + stored_lits).
++	 */
++	slz_stats.lz4_seq += 1 + 2 + (lits >= 15 ? (lits - 15) / 255 + 1 : 0) +
++	                     (mlen - 4 >= 15 ? (mlen - 4 - 15) / 255 + 1 : 0);
++
+ 	/* Brotli's distance cache: short codes 0-3 are the last 4 distances,
+ 	 * 4-9 the last one -1,+1,-2,+2,-3,+3 and 10-15 the same around the
+ 	 * second-to-last one. All codes but 0 push the distance in the ring.
+@@ -495,6 +505,16 @@ static void slz_stats_dump(void)
+ 		slz_stats.stored_runs, slz_stats.stored_lits, AVG(slz_stats.stored_lits, slz_stats.stored_runs),
+ 		slz_stats.stored_blks);
+ 	fprintf(stderr, "  huffman blocks opened %llu\n", slz_stats.huff_blks);
++	{
++		/* LZ4 estimate, see slz_stats_ref(): sequences + all literals,
++		 * plus per call a 4-byte block size and a final token for the
++		 * trailing literals (their extra bytes are ignored).
++		 */
++		unsigned long long lz4 = slz_stats.lz4_seq + lits + 5 * slz_stats.calls;
++
++		fprintf(stderr, "  lz4 estimate %14llu  bytes (%.2f%% of input) with this parse, %.2f bytes per reference\n",
++			lz4, PCT(lz4, in), AVG(slz_stats.lz4_seq, slz_stats.refs));
++	}
+ 	fprintf(stderr, "  literal skip %14llu  steps, %llu bytes passed over (%.2f%% of input)\n",
+ 		slz_stats.skips, slz_stats.skipped, PCT(slz_stats.skipped, in));
+ 	fprintf(stderr, "    probes     %14llu  of which %llu hits (%.2f%%)\n",
+-- 
+2.43.0
+
