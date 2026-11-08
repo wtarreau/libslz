@@ -1,0 +1,422 @@
+Edge skipping: removing the backward match's buffer-start test
+==============================================================
+
+Three rounds of experiments: August 2026 on the full-rework branches,
+a port to the per-level encoder on 2026-11-07, and a disassembly study
+of the ARL binaries on 2026-11-08. None of it was merged. The patches
+are in this directory (git format-patch, they apply to their own bases,
+not necessarily to the current tree), along with the scripts. Section 8
+lists them.
+
+Unless stated otherwise, "Skylake" figures are from the Xeon W-2145 and
+"ARL" figures are Willy's Arrow Lake runs.
+
+
+1. The idea
+-----------
+
+Willy's description: "adjust the start and end of the main loop
+based on the number of bytes we can look up or back at once, so as to
+avoid some repetitive checks inside the loop".
+
+The test that can go is the backward match's: before extending a match
+backwards over the pending literals, the encoder checks that the bytes
+preceding the reference exist:
+
+    (last >= MAX_C(sizeof(long), SLZ_BACKWARD_MATCH[level]))
+
+If no position below some bound ever enters the reference table, this
+test is always true and can be dropped. Refusing to start matches on the
+first bytes of each call achieves that. The table starts empty at every
+call, so those first positions had nearly nothing to match against
+anyway.
+
+Why the edge is 2R and not R (R = how far the backward match reads before
+a reference). Willy asked: "I just don't understand why back match can
+run twice as far as last". The backward match itself never reads more than
+R bytes before <last>. The edge needs roughly twice that because the
+table can hold positions *below* the point where scanning starts:
+  1. scanning starts at position S, and a match found at S extends back
+     by up to R bytes, so it starts at S-R;
+  2. the insert after a match (SLZ_INSERT_SKIPPED) then indexes S-R+1 to
+     S-R+3;
+  3. a later reference to S-R+1 reads R bytes before it, down to
+     S-2R+1, which must not be below 0.
+So S >= 2R-1. For R=8 that's 15, rounded up to 16. Getting this wrong does
+not fail loudly: it reads before the buffer, and can emit references to
+positions before the buffer, which decode to garbage.
+
+Positions 0 to R-1 can never be indexed without the test. The edge
+protects the wrong side for those: it guarantees that every *scanned*
+position has R bytes before it, but the backward match also reads R bytes
+before the *reference*. If position 0 were in the table, a later match
+against it would read in[-1]:
+  - unsafe read: in[-1] may be unmapped if the buffer starts a page;
+  - wrong output: if that stray byte happens to equal the byte before
+    the current position, the match is extended to start at -1, and
+    copies from data that isn't part of the input.
+The difference from base is narrow: base indexes position 0 and can
+*match* it, but never *extends* a match whose reference is below 8; the
+edge build can't match position 0 at all. Getting position 0 back without
+the test would need another bound on the reference side (bmax =
+MIN(plit, last, R)) or a guaranteed-readable byte before the input, which
+the API doesn't promise. The bound puts a test back on the match path in
+another form, and that test is what the edge removed.
+
+
+2. August 2026: SLZ_EDGE_SKIP=16 on the full-rework branches
+------------------------------------------------------------
+
+Commits 036880c (20260809-exp-edges, 20260808-exp-edges-canned), then
+cb82ed0 (20260809-full-rework-1) and 767c45e (20260823/20260913/20260914
+full-rework branches), all the same change. The full study is
+tools/edgestudy/FINDINGS.md in that commit (in 0002). Its question:
+the match loop tests rem >= 4, rem < 4, last >= 8, clamps the match
+length to rem and to 258 - mlen. Can those be replaced by refusing to
+match near the edges of the buffer and dumping plain literals there?
+Answer: "one of them, yes, and it is worth 3%. The rest either cost more
+than they save or cannot be removed at all."
+
+Method: tests/eabx.sh, 16 .text paddings x 3 runs, cycles, Skylake, gcc
+-O3 -march=native with the full feature set of the time
+(SLZ_INSERT_SKIPPED, SLZ_BACKWARD_MATCH, SLZ_DIRECT_ENQUEUE{8,24,56},
+SLZ_LITERAL_SKIP). The levels were the old numbering, with only 8-byte
+backward reach, hence a fixed 16-byte edge.
+
+                         cycles     output      ratio
+    web, 32 kB blocks    -3.13%    +0.084%     33.21%
+    web, 1 MB blocks     -3.35%    +0.002%     30.76%
+    silesia, 32 kB       -2.93%    +0.052%     45.41%
+    silesia, 1 MB        -2.76%    +0.002%     43.35%
+    lnx80, 32 kB         -2.86%    +0.113%     24.87%
+    lnx80, 1 MB          -2.76%    +0.004%     23.29%
+
+The control: SLZ_EDGE_KEEPTEST=1 skips the same 16 bytes but keeps the
+test. It produces byte-identical output, and lands between +1.4% and
++4.1%, i.e. a net loss. So the gain was the deleted test and nothing
+else, and the skipped bytes were pure cost. An earlier 8-byte variant
+measured -3.5%, but the extra 0.7% was register-allocation luck: with
+SLZ_BACKWARD_MATCH off there is no test to remove, and skipping 8 bytes
+then cost 4.5%.
+
+The 8-vs-16 bug: the first version skipped 8 bytes. It showed up as a
+1-byte output difference against the KEEPTEST build, which must be
+byte-identical by construction, and valgrind confirmed it on the linux
+archive ("Invalid read of size 8 ... 4 bytes before a block of size
+32,768"). The regular round-trip corpus (sizes 0..300) did not catch it;
+tests/echeck.sh and tests/ovtest.c (0001) were written for that.
+Since then, edge == keeptest byte for byte is the correctness invariant
+of every edge experiment.
+
+Rejected in the same study (code not kept, only FINDINGS.md):
+  - unbounding memmatch() with a constant cap (SLZ_MAX_MATCH - 4): as
+    fast as the edge alone (-3.75%) but the scan must stop 272 bytes
+    before the end: +1.59% output at 32 kB;
+  - a cap tracking rem (min(rem - 15, 258) - 4): the output cost goes,
+    and so does the gain (-0.65% to +0.94% instead of -2.8 to -3.2%).
+    The two properties are inseparable. The 2x unroll in the compare is
+    worth about 11% by itself;
+  - SLZ_MAX_MATCH=250 to drop the bmax clamp: slower and larger
+    (-2.91% instead of -3.47%, +0.039% output);
+  - SLZ_EDGE_MERGE1, hash-hit and distance tests in one branch: +2.20%
+    alone, neutral on top of the edge.
+Cannot be removed: the rem >= 4 loop test; the rem < 4 break after a
+match (already free); the distance test, which also rejects empty
+slots; bmax = min(plit, 8), which is correctness, not an edge.
+
+2026-08-16: SLZ_BACKWARD_MAX=16 (0003, 0004). With the edge, a
+second pair of 8-byte reads at pos - 16 and last - 16 needs no bounds
+test of its own. Cost +2 to +3.3% cycles for -0.002% to -0.051% output:
+the first 8 bytes of backward matching are worth about 1% of output, the
+next 8 only 0.05%. Left at 8. That commit carried a broken backward
+block (swept in by an earlier commit -a), fixed in f30c2df, which also
+established that the edge must be 32 for a lookback of 16 (2R again).
+
+The October 18 benchmarks on the rework branch used -DSLZ_EDGE_SKIP=16
+as part of the reference build configuration; nothing was measured on the
+edge itself then.
+
+
+3. 2026-11-07: per-level port (SLZ_EDGE_SKIP=1, commit a9ebd18)
+---------------------------------------------------------------
+
+Ported onto the current per-level encoder, off by default (0005).
+With -DSLZ_EDGE_SKIP=1, the first SLZ_EDGE(level) = 2R bytes of each call
+are queued as literals and the test is removed. R is
+SLZ_BACKWARD_MATCH[level], or 8 above level 1 without UNALIGNED_LE_OK
+(the byte loop). The edge is thus 2 bytes at levels 1 and 2, 4 at level 3
+and with the text tree, and 16 at level 4. SLZ_EDGE_KEEPTEST=1 keeps the
+test (on R) and must produce the same output; it only acts on top of
+SLZ_EDGE_SKIP=1.
+
+The positions from R to the edge are still indexed, since references to
+them remain safe (Willy's suggestion: "why wouldn't we index the bytes
+skipped at the edge"). This mattered at level 1 because of a weakness it
+already has: if a 32 kB block's first accepted match comes after 64
+literals, the first skip check marks the pending literals for a stored
+block, the short matches that follow are refused, and the skip keeps
+growing to the end of the block. Missing one reference to position 0 sent
+an x-ray block out at 32773 bytes instead of 18226. Indexing positions R
+and up cut level 1's extra output at 32 kB from +0.108% to +0.068%. The
+rest comes from blocks whose first match refers to position 0, which
+can't be indexed safely. The same weakness exists without the edge on any
+block whose first match comes late, and the new level 2 avoids it.
+
+Checks: edge == keep byte for byte at all levels and -T, with 1, 32 and
+4096 kB blocks, on silesia, the Linux tarball and the web files;
+round-trips from 0 to 300 bytes; valgrind on exact-size chunks (7 bytes to
+32 kB) clean at all levels, and it does flag "Invalid read of size 8" at
+level 4 when the edge is set to R instead of 2R. The default build's .text
+is byte-identical to its parent.
+
+Skylake, zenc input MB/s, best of 5 with the three builds alternated, gcc
+15 -O3 -march=native with both JCC flags (edgebench.sh);
+lin200.tar is the first 212 MB of the Linux tarball.
+
+First run, before indexing the edge positions (edge vs base):
+
+                     -1       -2       -3       -4       -T
+  silesia, 32 kB   +0.47%   +0.09%   +1.25%   +1.18%   +5.60%
+  silesia, 4 MB    +0.43%   +0.50%   +1.24%   +1.10%   +5.35%
+  linux, 32 kB     -0.15%   -0.22%   +0.85%   +1.17%   +4.83%
+  linux, 4 MB      +0.24%   +0.15%   +0.94%   +1.10%   +4.93%
+
+Second run, as committed. "keep" is SLZ_EDGE_KEEPTEST:
+
+                       base    edge   keep    edge    keep    output
+  silesia -k 32  -1   610.8   615.4  601.2   +0.75%  -1.57%  +0.0677%
+                 -2   531.0   535.1  533.5   +0.77%  +0.47%  +0.0081%
+                 -3   486.4   495.2  480.7   +1.81%  -1.17%  +0.0034%
+                 -4   458.2   462.8  459.7   +1.00%  +0.33%  +0.0243%
+                 -T   419.5   442.5  435.0   +5.48%  +3.69%  +0.0376%
+  silesia        -1   582.2   587.6  573.5   +0.93%  -1.49%  -0.0005%
+                 -2   516.2   521.0  518.3   +0.93%  +0.41%  -0.0001%
+                 -3   497.5   504.1  494.1   +1.33%  -0.68%  +0.0000%
+                 -4   470.8   472.4  469.4   +0.34%  -0.30%  +0.0003%
+                 -T   441.9   465.5  458.2   +5.34%  +3.69%  +0.0032%
+  lin200 -k 32   -1   540.4   541.6  529.3   +0.22%  -2.05%  +0.0103%
+                 -2   540.6   541.2  542.7   +0.11%  +0.39%  +0.0034%
+                 -3   529.6   536.6  521.6   +1.32%  -1.51%  +0.0058%
+                 -4   519.7   528.5  526.0   +1.69%  +1.21%  +0.0354%
+                 -T   496.7   519.9  513.1   +4.67%  +3.30%  +0.0061%
+  lin200         -1   538.0   542.1  530.3   +0.76%  -1.43%  -0.0000%
+                 -2   540.5   543.9  543.8   +0.63%  +0.61%  -0.0000%
+                 -3   532.6   537.6  528.0   +0.94%  -0.86%  +0.0000%
+                 -4   527.0   530.4  526.9   +0.65%  -0.02%  +0.0003%
+                 -T   498.6   522.7  518.8   +4.83%  +4.05%  +0.0000%
+
+(no -k = 4 MB blocks.) What it said on the Skylake:
+  - the edge wins everywhere, by 0.1 to 1.8% on levels 1 to 4;
+  - the removed test alone (edge vs keep) is worth 1.8 to 3.0% at levels
+    1 and 3, and less at levels 2 and 4. That is well below August's 3%.
+    The control itself is slower than base at levels 1 and 3;
+  - the -T gain is mostly not the test: the keep build gains 3.3 to 4.1%
+    too, and so does -T with 4 MB blocks, where 4 bytes per call can't
+    matter. Lowering the test from 8 to R without the edge gains nothing
+    (416.9 vs 418.2 MB/s with 32 kB blocks). It looks like layout or
+    register allocation in the text encoder, "which needs checking on
+    other machines before being relied on";
+  - output with 4 MB blocks doesn't change. With 32 kB blocks it grows
+    0.003 to 0.038% at levels 2 to 4 and -T, and 0.068% at level 1.
+
+
+4. 2026-11-07: ARL results
+--------------------------
+
+Willy's ARL, zenc -l 3, silesia.tar, 4 MB blocks, MB/s. A first
+"KEEPTEST" run was in fact a second base build (identical output sizes;
+KEEPTEST needs -DSLZ_EDGE_SKIP=1 -DSLZ_EDGE_KEEPTEST=1). It gives the
+noise level on this test: <= 0.3% (940.1/940.8, 824.7/825.7,
+805.2/807.7, 746.4/746.6, 742.3/741.7).
+
+        base    edge    keep   edge vs keep (the test)   keep vs base
+  -1   940.1   930.1   920.9          +1.0%                  -2.0%
+  -2   824.7   834.8   827.3          +0.9%                  +0.3%
+  -3   805.2   798.9   806.8          -1.0%                  +0.2%
+  -4   746.4   748.7   754.2          -0.7%                  +1.0%
+  -T   742.3   742.0   748.0          -0.8%                  +0.8%
+
+  - Edge vs base alternates in sign by level (-1.1%, +1.2%, -0.8%,
+    +0.3%, 0.0%) at about three times the noise. That pattern points to
+    block placement, not work saved: the removed test is perfectly
+    predicted, which costs almost nothing on the ARL. The Skylake gains,
+    +5% on -T in particular, were most likely the same placement luck,
+    the kind the JCC erratum amplifies there. -T moving by exactly 0.0%
+    on the ARL fits that.
+  - On the ARL, removing the test is worth nothing reliable: the test
+    alone helps levels 1-2 and hurts levels 3, 4 and -T, by about 1%
+    either way.
+  - Level 1 is the one consistent result, on both machines: adding the
+    edge prologue costs about 2% (keep vs base; -1.4 to -2.05% on the
+    Skylake too), and removing the test wins back only half of that on
+    the ARL. With 4 MB blocks the prologue runs about 150 times over the
+    whole 636 MB, so this isn't the cost of running it. Section 5 found
+    the cause.
+
+
+5. 2026-11-08: what level 1 depends on (disassembly of the ARL binaries)
+-----------------------------------------------------------------------
+
+Willy provided the ARL binaries (zenc-base/skip/keep, gcc 15.2,
+-march=arrowlake-s), suspecting that "at level 1 we're benefitting from
+an optimal code construct that is lost with other modes". Rebuilt here
+with the same compiler and flags (arlbuild.sh), level 1's code
+was byte-for-byte identical, so the experiments below ran on the exact
+code the ARL runs. It is a register-allocation side effect of the
+last >= 8 test:
+  - base: the test reads <last> from the 64-bit <ent> register, so gcc
+    keeps <ent> alive. Its zero-extend then lands in a different register
+    (mov %r8d,%ecx), and Intel cores remove such moves at rename at no
+    cost. The ref load feeds the match load with no extra latency;
+  - skip: without the test, nothing needs <ent> any more, so gcc
+    zero-extends it in place (mov %ecx,%ecx). Intel never eliminates a
+    move from a register to itself. That adds one cycle between the ref
+    load and lastp = in + last, which feeds both the match compare and the
+    distance lookup. On every candidate, that costs more than the removed
+    test saves: 0.95% fewer instructions, 0.5% more cycles;
+  - keep: gcc turns last >= 1 into last != 0 and must keep the
+    zero-extended <last> itself until the end of the match path. It ends
+    up spilled to the stack on every candidate (mov %rcx,0x20(%rsp)),
+    with 3% of level 1's samples on that store. Instructions are
+    unchanged and cycles are 9% higher on the Skylake.
+
+Two attempts to write the good construct into the source (0006,
+reconstructed, never committed at the time):
+  - SLZ_REF_POS_HIGH=1: position in the upper half of the ref entry,
+    word in the lower half. The hit test compares the low half directly,
+    with no mov+shr: 2 fewer instructions on every literal, on the path
+    behind 65% of the mispredicts. The match path pays a real shr $32
+    instead of a zero-extend. With pos-high alone, the last >= 8 test
+    brings back a spill;
+  - SLZ_EDGE_LASTP=1: the test written as lastp >= in + 8, which removes
+    that spill and keeps output identical.
+
+Skylake, ARL-identical builds without JCC padding, silesia 4 MB, best of
+5 (lp = LASTP, hlp = POS_HIGH + LASTP, hskip = POS_HIGH + EDGE_SKIP):
+
+                     -1       -2       -3       -4       -T
+  lp      ins     +0.21%   -0.25%   -0.12%   -1.09%   -1.71%
+          cyc     +2.49%   +1.78%   +2.73%   +1.52%   +1.43%
+  hlp     ins     -0.66%   -1.38%   -0.04%   -1.22%   -1.94%
+          cyc     +0.58%   +2.82%   -0.47%   +3.93%   +1.13%
+  hskip   ins     -1.82%   -2.48%   -1.10%   -1.44%   -1.25%
+          cyc     -1.78%   +4.16%   -3.18%   -3.57%   +6.91%
+
+Cycles swing between -3.6% and +6.9% at the same instruction count, which
+is layout; only the ARL could judge them. ARL, -1, silesia.tar 4 MB:
+
+  base                                  941.3 MB/s
+  POS_HIGH                              930.5   -1.1%
+  POS_HIGH + EDGE_SKIP                  924.7
+  POS_HIGH + EDGE_SKIP + KEEPTEST       922.4
+  POS_HIGH + LASTP                      927.4
+  POS_HIGH + LASTP + EDGE_SKIP          924.2
+  POS_HIGH + LASTP + SKIP + KEEPTEST    922.8
+  LASTP                                 939.4   -0.2% (noise)
+  LASTP + EDGE_SKIP + KEEPTEST          923.1
+
+"The 2 instructions pos-high saves per literal don't show on the ARL, so
+its literal loop isn't limited by instruction count." Both macros were
+dropped.
+
+LASTP at all levels on the ARL (old first-word level-2 probe, 4 MB,
+base / LASTP): -1 940.5 / 938.4, -2 827.0 / 834.4, -3 806.3 / 783.9,
+-4 746.7 / 749.8, -T 742.8 / 741.7. The output is identical, so these are
++0.9% at level 2, -2.8% at level 3, +0.4% at level 4 and noise elsewhere.
+The source change is the same for every level, so the differences come
+from how gcc compiles each level's copy of the loop. That fits level 1:
+whether <ent> stays alive decides between an eliminated zero-extend, an
+in-place one or a spill, and gcc decides that separately for each level.
+
+Willy noticed that EDGE_SKIP gives exactly the same steps as LASTP
+(level 2: 834.8 and 834.4 vs 827.0; level 4: 748.7 and 749.8 vs 746.7),
+although the two edits share nothing in level 2 (EDGE_SKIP adds a
+prologue and removes a test, LASTP only rewrites that test). When two
+unrelated edits give the same per-level step, the step comes from where
+the code lands, not from what it does. It is not loop alignment though:
+-falign-loops=32 costs 1.8% at level 2 on the ARL (812.4 vs 827.0) and
+-falign-jumps is noise (826.2). So it is something else, block order or
+register allocation as with level 1's <ent>. Not investigated further;
+the way to find out would be the same diff of _slz_rfc1951_encode_lev2
+between base and LASTP built with the ARL flags.
+
+
+6. Conclusions
+--------------
+
+  - Edge skipping stays off. In August, on the old single loop, it was a
+    real -3% on the Skylake with a control proving it was the test. On
+    today's per-level encoder the removed test is perfectly predicted
+    and worth nothing reliable on the ARL; what the edge gains or loses
+    there is layout, and there is nothing to tune in it.
+  - Level 1 consistently loses about 2% from the edge prologue, on both
+    machines, and the cause is known: the test keeps <ent> alive, which
+    lets gcc emit a zero-extend that Intel eliminates. Removing or
+    rewriting the test loses that. Rewriting the ref layout (pos-high)
+    to save instructions didn't help on the ARL either.
+  - The Skylake's +5% on -T was not the test (the control had it too,
+    and so did 4 MB blocks) and did not exist on the ARL.
+  - The 2R rule (16 for an 8-byte reach, 32 for 16) and the edge ==
+    keeptest byte-identity check are what to reuse if this is ever tried
+    again; the round-trip corpus alone does not catch a wrong edge,
+    valgrind on exact-size chunks does.
+  - Positions 0 to R-1 can never be indexed without the test, which at
+    level 1 can tip a whole 32 kB block into stored mode. That level-1
+    weakness (a late first match makes the skip run away) exists without
+    the edge too.
+  - Level 2 can move by about 1% on the ARL from code placement alone
+    (not loop alignment, see section 5). If worth
+    chasing, it should be done at the end of the series once the code is
+    final, since tuning now would be undone by the next rebase.
+
+
+7. Commands
+-----------
+
+Builds (Skylake; add both JCC flags):
+
+  make clean; make USR_CFLAGS="-march=native \
+      -Wa,-mbranches-within-32B-boundaries \
+      -Wa,-malign-branch=jcc+fused+jmp+call [-DSLZ_EDGE_SKIP=1 \
+      [-DSLZ_EDGE_KEEPTEST=1]]"
+
+then copy zenc to zenc-base, zenc-edge, zenc-keep in one directory and
+run edgebench.sh <dir> 5 <cpu> (expects /dev/shm/silesia.tar
+and /dev/shm/lin200.tar = first 211947520 bytes of the Linux tarball).
+
+ARL runs (Willy):
+
+  taskset -c 1 ./zenc -D -<level> -t -v -l 3 < /dev/shm/silesia.tar
+
+Valgrind: ovtest.c is August's tests/ovtest.c with a level
+argument, a -T flag (any 4th argument) and a zeroed stream struct (without
+that, valgrind flags the struct's bitfields on every encode, which has
+nothing to do with the edge):
+
+  gcc -O1 -g -Isrc -o ovtest ovtest.c src/slz.c src/slz_common.c \
+      -DSLZ_EDGE_SKIP=1
+  valgrind -q ./ovtest <file> <chunk size> <level> [T]
+
+arlbuild.sh reproduces Willy's ARL build (gcc-15,
+-march=arrowlake-s and its cache params) to compare disassembly;
+cyc.sh reports cycles/instructions/MB/s/size under perf stat.
+The scripts still contain the paths of the worktree they ran in.
+
+
+8. Patches
+----------
+
+  0001  3de5924  encoder round-trip and overread checker (Aug 9,
+                 tests/echeck.sh, tests/ovtest.c)
+  0002  cb82ed0  SLZ_EDGE_SKIP=16, SLZ_EDGE_KEEPTEST, FINDINGS.md (Aug 9;
+                 same as 036880c and 767c45e)
+  0003  0762e01  SLZ_BACKWARD_MAX=16 relying on the edge (Aug 16)
+  0004  f30c2df  fix of the 16-byte backward match, edge 32 for 16
+  0005  a9ebd18  per-level SLZ_EDGE_SKIP port (Nov 7, on 20261107-lit-skip-1)
+  0006  0ca91cd  SLZ_REF_POS_HIGH and SLZ_EDGE_LASTP (Nov 8, on top of
+                 0005; reconstructed from the session, never committed at
+                 the time; output identical to base, default .text
+                 identical to a9ebd18)
+
+0001-0004 stack on 20260809-full-rework-1, 0005-0006 on 20261107-lit-skip-1.
+Old commit messages are kept verbatim.

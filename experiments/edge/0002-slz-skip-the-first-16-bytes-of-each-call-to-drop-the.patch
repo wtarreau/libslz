@@ -1,0 +1,330 @@
+From cb82ed0c9394991ac213926ba25761200bb6c6b3 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sun, 9 Aug 2026 13:17:25 +0200
+Subject: [PATCH] slz: skip the first 16 bytes of each call to drop the last>=8 test
+
+The backward match tests that the 8 bytes preceding a reference are
+readable before comparing them. Refusing to start a match on the first
+16 bytes of a call keeps every position below 8 out of the reference
+table, which makes that test always true, so it can go. The table starts
+empty at every call, so those first positions had nearly nothing to
+match against anyway.
+
+Measured with tests/eabx.sh, 16 .text paddings x 3 runs, on cycles:
+
+                         cycles     output      ratio
+    web, 32 kB blocks    -3.13%    +0.084%     33.21%
+    web, 1 MB blocks     -3.35%    +0.002%     30.76%
+    silesia, 32 kB       -2.93%    +0.052%     45.41%
+    silesia, 1 MB        -2.76%    +0.002%     43.35%
+    lnx80, 32 kB         -2.86%    +0.113%     24.87%
+    lnx80, 1 MB          -2.76%    +0.004%     23.29%
+
+The gain is the deleted test and nothing else: SLZ_EDGE_KEEPTEST=1
+skips the same 16 bytes but keeps the test, produces byte-identical
+output, and lands between +1.4% and +4.1%, i.e. a net loss. The 16
+skipped bytes are pure cost.
+
+It has to be 16 and not 8. The backward match may start a match up to 8
+bytes before the position that was scanned, and SLZ_INSERT_SKIPPED
+indexes from that extended start, so skipping only 8 lets positions 1
+to 3 into the table and a later reference to them reads in[-7]. That
+showed up as a 1-byte output difference against the KEEPTEST build,
+which must be byte-identical by construction, and valgrind confirms it
+on the linux archive. SLZ_EDGE_SKIP below 16 is a compile-time error,
+and the two builds are compared byte for byte at all four levels on
+three corpora.
+
+Off by default; the default build is byte-identical to its parent.
+
+tools/edgestudy/FINDINGS.md records the three variants that were tried
+and rejected on measurements: unbounding the match comparison, capping
+matches at 250 to collapse the backward clamp, and merging the hash-hit
+and distance tests into a single branch.
+---
+ src/slz-prv.h               |  24 +++++
+ src/slz.c                   |  32 ++++++-
+ tools/edgestudy/FINDINGS.md | 170 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 225 insertions(+), 1 deletion(-)
+ create mode 100644 tools/edgestudy/FINDINGS.md
+
+diff --git a/src/slz-prv.h b/src/slz-prv.h
+index 6bde8d6..11b5d63 100644
+--- a/src/slz-prv.h
++++ b/src/slz-prv.h
+@@ -137,6 +137,30 @@
+ # define SLZ_BACKWARD_MATCH 0
+ #endif
+ 
++/* Number of bytes at the beginning of the input the match scan refuses to
++ * start on, dumped as plain literals instead (0 disables it). Their purpose is
++ * to keep the reference table free of any position below 8, so that the
++ * backward match may read the 8 bytes preceding a reference without testing
++ * that they exist. The table starts empty at every call, so these first
++ * positions had almost nothing to match against anyway.
++ *
++ * 16 rather than 8, because the backward match may move the start of a match
++ * up to 8 bytes earlier than the position that was scanned, and the positions
++ * indexed back by SLZ_INSERT_SKIPPED are counted from that extended start. A
++ * match scanned at position 8 and extended by 8 therefore inserts positions
++ * 1 to 3, and a later reference to one of those would read in[-7].
++ */
++#ifndef SLZ_EDGE_SKIP
++# define SLZ_EDGE_SKIP 0
++#endif
++#if SLZ_EDGE_SKIP && SLZ_EDGE_SKIP < 16
++# error "SLZ_EDGE_SKIP must be at least 16, see above"
++#endif
++/* diagnostic only: start at 8 but keep the test, to separate the two effects */
++#ifndef SLZ_EDGE_KEEPTEST
++# define SLZ_EDGE_KEEPTEST 0
++#endif
++
+ /* Log2 of the size of the hash table used for the references table. */
+ #ifndef SLZ_HASH_BITS
+ # define SLZ_HASH_BITS 13
+diff --git a/src/slz.c b/src/slz.c
+index 62158b7..60f9519 100644
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -576,6 +576,23 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
+ 	//asm("nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n");
+ 	strm->outbuf = out;
+ 
++#if SLZ_EDGE_SKIP
++	/* Skip the first SLZ_EDGE_SKIP positions so that nothing below position
++	 * 8 ever enters the reference table, hence every match found further
++	 * down is anchored at <last> >= 8 and the 8 bytes before it are known
++	 * readable. Buffers too short for that are entirely handled by the tail
++	 * below.
++	 */
++	if (__builtin_expect(rem < SLZ_EDGE_SKIP + 4, 0))
++		goto tail_literals;
++
++	do {
++		bit9 += ((unsigned char)in[pos++] >= 144);
++	} while (pos < SLZ_EDGE_SKIP);
++	plit = SLZ_EDGE_SKIP;
++	rem -= SLZ_EDGE_SKIP;
++#endif
++
+ #ifndef UNALIGNED_FASTER
+ 	if (rem >= 4)  // <word> is only used inside the loop below, hence the test for >= 4
+ 		word = ((uint32_t)(unsigned char)in[pos] << 8) + ((uint32_t)(unsigned char)in[pos + 1] << 16) + ((uint32_t)(unsigned char)in[pos + 2] << 24);
+@@ -809,16 +826,26 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
+ 			 * that the reference sits in the first 8 bytes of the
+ 			 * block and the extension is simply skipped.
+ 			 */
++#if SLZ_EDGE_SKIP && !SLZ_EDGE_KEEPTEST
++			/* nothing below position 8 is ever inserted into the
++			 * table, so <last> is always at least 8 here
++			 */
++			{
++#else
+ 			if (/*__builtin_expect*/(last >= 8/*, 1*/)) { // 459 MB/s
+ 			//if (__builtin_expect(last >= 8, 1)) { // 449 MB/s
++#endif
+ 				uint64_t x = *(uint64_t *)&in[pos - 8] ^
+ 				             *(uint64_t *)&in[last - 8];
+ 
+ 				back = x ? (__builtin_clzll(x) >> 3) : 8;
+ 				if (back > bmax)
+ 					back = bmax;
+-			} else
++			}
++#if !SLZ_EDGE_SKIP || SLZ_EDGE_KEEPTEST
++			else
+ 				back = 0;
++#endif
+ #else
+ 			if (bmax > (long)last)
+ 				bmax = last;
+@@ -1028,6 +1055,9 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
+ #endif
+ 	}
+ 
++#if SLZ_EDGE_SKIP
++ tail_literals:
++#endif
+ 	//if (__builtin_expect(rem, 0)) { // larger and slower
+ 	if (rem) { // 449
+ 		/* we're reading the 1..3 last bytes */
+diff --git a/tools/edgestudy/FINDINGS.md b/tools/edgestudy/FINDINGS.md
+new file mode 100644
+index 0000000..43845be
+--- /dev/null
++++ b/tools/edgestudy/FINDINGS.md
+@@ -0,0 +1,170 @@
++# Removing the boundary checks from the encode loop
++
++The question: the match loop tests `rem >= 4`, `rem < 4`, `last >= 8`, clamps
++the match length to `rem` and to `258 - mlen`. Can those be replaced by simply
++refusing to match near the edges of the buffer and dumping plain literals
++there?
++
++Answer: **one of them, yes, and it is worth 3%.** The rest either cost more
++than they save or cannot be removed at all. Details below.
++
++All numbers from `tests/eabx.sh`, 16 `.text` paddings x 3 runs, `taskset -c 7`,
++gcc -O3 -march=native with the full feature set
++(`-DSLZ_INSERT_SKIPPED=1 -DSLZ_BACKWARD_MATCH -DSLZ_DIRECT_ENQUEUE{8,24,56}=1
++-DSLZ_LITERAL_SKIP=1`). Cycles, not seconds. Sizes are exact.
++Level 3 = 1 MB blocks, level 1 = 32 kB blocks, which is the production case.
++
++## The one that works: SLZ_EDGE_SKIP
++
++Refuse to start a match on the first 16 bytes of each call, emitting them as
++plain literals. Nothing below position 8 then ever enters the reference table,
++so every `last` is at least 8 and the backward match can read the 8 bytes
++before it without testing that they exist. The table starts empty at every
++call, so those positions had nearly nothing to match against anyway.
++
++                        cycles      output       ratio
++    web,  level 3       -3.35%     +0.002%      30.76%
++    web,  level 1       -3.13%     +0.084%      33.21%
++    silesia, level 3    -2.76%     +0.002%      43.35%
++    silesia, level 1    -2.93%     +0.052%      45.41%
++    lnx80, level 3      -2.76%     +0.004%      23.29%
++    lnx80, level 1      -2.86%     +0.113%      24.87%
++
++The output cost is the 16 forced literals per call: 0.049% of a 32 kB block,
++and nothing at all at 1 MB.
++
++### it really is the test, not the code motion
++
++`SLZ_EDGE_KEEPTEST=1` starts at 16 but keeps the `last >= 8` test. It produces
++byte-identical output to `SLZ_EDGE_SKIP=16`, so the two differ by exactly one
++test and nothing else:
++
++                        SKIP=16    SKIP=16 + KEEPTEST
++    web,  level 3        -3.35%          +2.15%
++    web,  level 1        -3.13%          +2.98%
++    silesia, level 3     -2.76%          +3.26%
++    silesia, level 1     -2.93%          +4.14%
++    lnx80, level 3       -2.76%          +1.43%
++    lnx80, level 1       -2.86%          +2.36%
++
++Keeping the test makes the whole thing a *loss*. So the gain is entirely the
++deleted test, and the skipped bytes are pure cost. This matches
++[[libslz-slz-hot-loop-allocation]]: what a single test in this loop costs has
++little to do with executing it.
++
++An earlier variant that skipped 8 bytes measured -3.5% instead of -2.8%, but
++that extra 0.7% was register-allocation luck, not a real effect: with
++`SLZ_BACKWARD_MATCH` off there is no `last >= 8` test to remove, and skipping
++8 bytes then *cost* 4.5%. Only the KEEPTEST pairing above measures the test.
++
++## BUG: skipping 8 is not enough, it has to be 16
++
++The first version skipped 8 bytes, reasoning that the table would then hold no
++position below 8. It does not. The backward match moves the start of a match up
++to 8 bytes earlier than the scanned position, and `SLZ_INSERT_SKIPPED` indexes
++the positions following that *extended* start. A match scanned at position 8
++and extended by 8 starts at 0 and inserts positions 1, 2 and 3. A later
++reference to one of those reads `in[last - 8]` = `in[-7]`.
++
++Valgrind on the exact-size harness confirms it, on the linux archive at 32 kB
++blocks:
++
++    Invalid read of size 8
++       at slz_rfc1951_encode
++       Address 0x4b2f79c is 4 bytes before a block of size 32,768 alloc'd
++
++It first showed up as a **1-byte output difference** between `SKIP=8` and
++`SKIP=8 + KEEPTEST`, which must be byte-identical by construction. That
++equality is now the correctness invariant for this feature and is checked at
++all four levels on all three corpora. `SLZ_EDGE_SKIP` below 16 is a
++compile-time error.
++
++The regular round-trip corpus (web / repetitive / random / zeroes, sizes 0..300
++plus a few larger) did **not** catch it. `tests/echeck.sh` now also runs the
++linux archive and silesia, which do.
++
++## Rejected: unbounding the match comparison
++
++`memmatch()` tests its bound on every word it compares. The idea was to let it
++overshoot instead and clamp the result afterwards, so the bound leaves the
++loop. That can be built two ways, and they fail differently. Both were tried
++on top of SKIP=16.
++
++**Constant cap.** Pass `SLZ_MAX_MATCH - 4` rather than `min(rem, 258) - 4`.
++Then the scan must stop 272 bytes before the end of the input so the overshoot
++stays inside the buffer, and everything in those 272 bytes becomes literals:
++
++    web, level 3   -3.75% cycles   +0.055% output
++    web, level 1                   +1.59% output
++
++The cycles are as good as SKIP alone, but 272 of every 32768 bytes forced to
++literals is far too much to pay at the block size that matters.
++
++**Cap tracking rem.** Keep `min(rem - 15, 258) - 4`, so only the 15-byte
++overshoot has to fit and the scan stops 20 bytes early instead of 272. The
++output cost duly collapses -- but so does the gain:
++
++                        SKIP=16   + overshoot   + overshoot, no unroll
++    web, level 3         -3.23%       -0.65%          -0.82%
++    web, level 1         -2.97%       -0.72%          -0.74%
++    silesia, level 3     -2.90%       +0.77%          +0.94%
++    silesia, level 1     -2.79%       -0.05%          +1.43%
++
++    output over SKIP=16: +0.003% at 1 MB blocks, +0.10% at 32 kB
++
++So the two properties are inseparable: what made the first form fast was the
++*constant* cap, and a constant cap is exactly what forces the 272-byte margin.
++Make the cap track `rem` and the margin becomes negligible but the extra
++subtract and cmov land on the per-match critical path and give back 2 to 3.7%.
++Either way it loses, and the bound inside `memmatch()` stays.
++
++One thing worth keeping from this: the 2x unroll in the comparison is worth
++about 11% by itself. An unbounded compare written without it measured +7.14%
++against a baseline that its unrolled twin beat by 3.75%.
++
++## Rejected: SLZ_MAX_MATCH=250
++
++Stopping matches at 250 leaves room for the 8 bytes the backward match may
++prepend, which removes the `bmax > 258 - mlen` clamp; and since the walk
++returns at most 8 anyway, the remaining `min(plit, 8)` collapses to a single
++compare against `plit`. Two cmovs gone.
++
++    web, level 3:  SKIP -3.47%  ->  SKIP + M250 -2.91%   (+0.039% output)
++    web, level 1:  SKIP -3.13%  ->  SKIP + M250 -2.74%   (+0.068% output)
++
++Slower, and it costs output. Removing instructions from this loop is not the
++same thing as making it faster.
++
++## Rejected: SLZ_EDGE_MERGE1, one branch instead of two
++
++Merging the hash-hit test and the distance test into a single branch
++(`if ((ent != word) | (pos - last - 1 >= 32768))`), output byte-identical:
++
++    web, level 3:  base +0.00%   MERGE1 +2.20%   SKIP -3.34%   SKIP+MERGE1 -3.24%
++
++Worse alone, neutral on top of SKIP.
++
++## What cannot be removed
++
++- `while (rem >= 4)` is the loop condition itself.
++- `if (rem < 4) break;` after a match is already free: it is the loop's own
++  exit test, moved earlier so that `SLZ_INSERT_SKIPPED` inherits `rem >= 4`
++  without a test of its own.
++- The distance test `(pos - last - 1) >= 32768` is not an edge check. It
++  rejects the 0xFE empty-table sentinel and out-of-window references, and it
++  is what commit b7b07da got wrong. It could only go away if empty entries
++  named a real, in-window position whose word is genuinely stored there, which
++  means seeding the 64 kB table with a computed 64-bit value per call instead
++  of `memset()`. `reset_refs()` already documents that the libc `memset()` beats
++  a hand-rolled 64-bit store loop here, and at 32 kB blocks that fill is 2 bytes
++  of table per input byte, so this trades a well-predicted compare for the one
++  cost that is already dominant. Not attempted.
++- `bmax = min(plit, 8)` bounds the walk by literals that were *already emitted*,
++  so it is correctness, not an edge.
++
++## Files
++
++    tests/echeck.sh    round-trip at every level over sizes 0..300 and beyond,
++                       on six contents, plus valgrind on tests/ovtest.c
++    tests/ovtest.c     compresses chunks allocated at their exact size, so any
++                       read past either end of the input traps
+-- 
+2.43.0
+

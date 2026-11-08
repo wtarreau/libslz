@@ -1,0 +1,108 @@
+From f30c2dfbf0ec3162c97fe2b4f53326579f90647d Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sun, 16 Aug 2026 20:55:20 +0200
+Subject: [PATCH] slz: fix the 16-byte backward match and its edge requirement
+
+Two problems, and the first is mine in a way worth recording.
+
+fd5593d, which was meant to change only the SLZ_MATCH_LEN default, also
+carries an unrelated hunk: a rework of the backward match block that was
+in the working tree at the time and that I swept up with "git commit -a"
+without reviewing it or mentioning it in the message. Committing with -a
+while the tree is being edited by someone else is how that happens; the
+paths should have been listed explicitly.
+
+That rework is incomplete, and it is what broke SLZ_BACKWARD_MAX=16:
+
+    back = 0;
+  #if SLZ_BACKWARD_MAX >= 16
+    if (x) {                                 <-- inverted
+        x = in[pos - 16] ^ in[last - 16];
+        back += 8;
+    }
+  #else
+    back += x ? (__builtin_clzll(x) >> 3) : 8;   <-- only for the 8 case
+  #endif
+
+so with 16 selected <back> could only ever come out 0 or 8, the second
+word was loaded and never scanned, and the second look was taken exactly
+when the first eight bytes had *not* all matched. The result was
+references reaching before the start of the match, which decode to
+garbage: 10 of 30 round-trips failed, and the output looked 29% smaller
+because most of it was wrong. Moving the scan out of the #if and
+inverting the test gives the intended shared form, where 8 is the same
+code as before (slz.o md5 matches) and 16 simply feeds it a second word.
+
+Second, the SLZ_EDGE_SKIP requirement was stated as 16 and has to be 32:
+the skip has to cover both the bytes the backward match reads and how far
+it can move a match start, since SLZ_INSERT_SKIPPED indexes positions
+counted from that extended start. 8 + 8 = 16 for a lookback of 8, so
+16 + 16 = 32 for a lookback of 16. That was verified separately: with the
+scan fixed, EDGE_SKIP 24, 32 and 64 all pass at a lookback of 8, and 32
+passes at 16, in both the speed-oriented and the size-oriented config.
+
+---
+ src/slz-prv.h | 10 ++++++++--
+ src/slz.c     | 19 +++++++++----------
+ 2 files changed, 17 insertions(+), 12 deletions(-)
+
+diff --git a/src/slz-prv.h b/src/slz-prv.h
+index 2bdd697..eff7fff 100644
+--- a/src/slz-prv.h
++++ b/src/slz-prv.h
+@@ -270,8 +270,14 @@ static inline uint32_t slz_hash(uint32_t a, uint32_t shift)
+ #ifndef SLZ_BACKWARD_MAX
+ # define SLZ_BACKWARD_MAX 8
+ #endif
+-#if SLZ_BACKWARD_MAX >= 16 && SLZ_EDGE_SKIP < 16
+-# error "SLZ_BACKWARD_MAX 16 requires SLZ_EDGE_SKIP >= 16"
++/* The skip has to cover both what the backward match reads and how far it can
++ * move a match start, because SLZ_INSERT_SKIPPED indexes positions counted from
++ * that extended start: 8 + 8 = 16 for a lookback of 8, so 16 + 16 = 32 for a
++ * lookback of 16. Getting this wrong does not fail loudly, it emits references
++ * to positions before the buffer, which decode to garbage.
++ */
++#if SLZ_BACKWARD_MAX >= 16 && SLZ_EDGE_SKIP < 32
++# error "SLZ_BACKWARD_MAX 16 requires SLZ_EDGE_SKIP >= 32"
+ #endif
+ 
+ #ifndef SLZ_HASH_FUNC
+diff --git a/src/slz.c b/src/slz.c
+index f7d3230..7674db3 100644
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -1083,22 +1083,21 @@ static inline long _slz_rfc1951_encode(struct slz_stream *strm, unsigned char *o
+ 
+ 				back = 0;
+ #if SLZ_BACKWARD_MAX >= 16
+-				if (x) {
++				if (!x) {
+ 					/* all 8 matched, so look 8 further
+-					 * back. SLZ_EDGE_SKIP >= 16 keeps this
+-					 * second pair of reads inside the
+-					 * buffer without a test of its own,
+-					 * and it only runs when the first xor
+-					 * came out null.
++					 * back and let the scan below finish on
++					 * that second word. SLZ_EDGE_SKIP >= 32
++					 * keeps this pair of reads inside the
++					 * buffer without a test of its own, and
++					 * it only runs when the first xor came
++					 * out null.
+ 					 */
+ 					x = *(uint64_t *)&in[pos - 16] ^
+-						*(uint64_t *)&in[last - 16];
+-
++					    *(uint64_t *)&in[last - 16];
+ 					back += 8;
+ 				}
+-#else
+-				back += x ? (__builtin_clzll(x) >> 3) : 8;
+ #endif
++				back += x ? (__builtin_clzll(x) >> 3) : 8;
+ 				if (back > bmax)
+ 					back = bmax;
+ 			}
+-- 
+2.43.0
+

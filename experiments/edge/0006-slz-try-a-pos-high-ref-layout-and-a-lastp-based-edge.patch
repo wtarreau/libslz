@@ -1,0 +1,146 @@
+From 0ca91cdcc238d14fd195f9e38a1d07a43661d061 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sun, 8 Nov 2026 19:03:45 +0100
+Subject: [PATCH] slz: try a pos-high ref layout and a lastp-based edge test
+
+Rejected experiment from 2026-11-08, never committed at the time and
+reconstructed here from the session's commands, on top of a9ebd18
+(SLZ_EDGE_SKIP). Kept only as a record, see experiments/edge.txt.
+
+Disassembling Willy's ARL binaries (gcc 15.2, -march=arrowlake-s)
+showed what level 1 depends on around the backward match's last>=8
+test:
+  - base: the test reads <last> from the 64-bit <ent>, so <ent> stays
+    alive and its zero-extend lands in another register (mov %r8d,%ecx),
+    which Intel eliminates at rename;
+  - SLZ_EDGE_SKIP: without the test, gcc zero-extends in place
+    (mov %ecx,%ecx), which is never eliminated, adding one cycle between
+    the ref load and lastp = in + last on every candidate: 0.95% fewer
+    instructions but 0.5% more cycles;
+  - SLZ_EDGE_KEEPTEST: last >= 1 becomes last != 0 and the zero-extended
+    <last> is spilled to the stack on every candidate (3% of level 1's
+    samples on that store).
+
+Two macros, both off by default (the default .text is identical):
+  - SLZ_REF_POS_HIGH=1 stores the position in the upper half of the ref
+    entry and the word in the lower half, so that the hit test compares
+    the low half with no mov+shr (2 fewer instructions per literal), at
+    the cost of a real shr $32 on the match path;
+  - SLZ_EDGE_LASTP=1 writes the test as lastp >= in + 8, which removes
+    the spill that pos-high alone brings back. Output is identical.
+
+Instruction counts and cycles, silesia 4 MB blocks, ARL-identical builds
+run on the Xeon W-2145 (Skylake), no JCC padding, best of 5:
+
+                     -1       -2       -3       -4       -T
+  lp      ins     +0.21%   -0.25%   -0.12%   -1.09%   -1.71%
+          cyc     +2.49%   +1.78%   +2.73%   +1.52%   +1.43%
+  hlp     ins     -0.66%   -1.38%   -0.04%   -1.22%   -1.94%
+          cyc     +0.58%   +2.82%   -0.47%   +3.93%   +1.13%
+  hskip   ins     -1.82%   -2.48%   -1.10%   -1.44%   -1.25%
+          cyc     -1.78%   +4.16%   -3.18%   -3.57%   +6.91%
+
+(lp = LASTP, hlp = POS_HIGH + LASTP, hskip = POS_HIGH + EDGE_SKIP.)
+Cycles swing from -3.6% to +6.9% at the same instruction count, which is
+layout on this machine.
+
+User's ARL, zenc -1 on silesia.tar, 4 MB blocks, -l 3:
+
+  base                              941.3 MB/s
+  POS_HIGH                          930.5   -1.1%
+  POS_HIGH + EDGE_SKIP              924.7
+  POS_HIGH + EDGE_SKIP + KEEPTEST   922.4
+  POS_HIGH + LASTP                  927.4
+  POS_HIGH + LASTP + EDGE_SKIP      924.2
+  POS_HIGH + LASTP + SKIP + KEEP    922.8
+  LASTP                             939.4   -0.2% (noise)
+  LASTP + EDGE_SKIP + KEEPTEST      923.1
+
+and LASTP at all levels (base / LASTP, MB/s): -1 940.5 / 938.4,
+-2 827.0 / 834.4, -3 806.3 / 783.9, -4 746.7 / 749.8, -T 742.8 / 741.7.
+EDGE_SKIP gave level 2 and level 4 exactly the same step (834.8 and
+748.7), although the two edits share nothing in level 2, so these steps
+come from how gcc compiles each level's copy of the loop. -falign-loops=32
+did not recover it (812.4) and -falign-jumps was noise (826.2).
+
+The 2 instructions saved per literal don't show on the ARL, so its
+literal loop is not limited by instruction count. Dropped.
+---
+ src/slz.c | 30 ++++++++++++++++++++++++------
+ 1 file changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/src/slz.c b/src/slz.c
+index faf9837..1cb891d 100644
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -292,6 +292,22 @@ union ref {
+ 	uint64_t by64;
+ };
+ 
++/* Experimental: store the position in the upper half of by64 and the word in
++ * the lower one, so that the word comparison needs no shift.
++ */
++#ifndef SLZ_REF_POS_HIGH
++# define SLZ_REF_POS_HIGH 0
++#endif
++#if SLZ_REF_POS_HIGH
++# define REF64(p, w)    (((uint64_t)(p) << 32) + (uint32_t)(w))
++# define REF64_POS(e)   ((uint32_t)((e) >> 32))
++# define REF64_WORD(e)  ((uint32_t)(e))
++#else
++# define REF64(p, w)    ((uint64_t)(p) + ((uint64_t)(w) << 32))
++# define REF64_POS(e)   ((uint32_t)(e))
++# define REF64_WORD(e)  ((uint32_t)((e) >> 32))
++#endif
++
+ /* This hash provides good average results on HTML contents, and is among the
+  * few which provide almost optimal results on various different pages.
+  */
+@@ -883,7 +899,7 @@ static inline void insert_ref(union ref *refs, const unsigned char *in, unsigned
+ 	uint32_t h = slz_hash(w);
+ 
+ 	if (sizeof(long) >= 8)
+-		refs[h].by64 = ((uint64_t)p) + ((uint64_t)w << 32);
++		refs[h].by64 = REF64(p, w);
+ 	else {
+ 		refs[h].by32.pos = p;
+ 		refs[h].by32.word = w;
+@@ -1171,9 +1187,9 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 
+ 		if (sizeof(long) >= 8) {
+ 			ent = refs[h].by64;
+-			last = (uint32_t)ent;
+-			ent >>= 32;
+-			refs[h].by64 = ((uint64_t)pos) + ((uint64_t)word << 32);
++			last = REF64_POS(ent);
++			ent = REF64_WORD(ent);
++			refs[h].by64 = REF64(pos, word);
+ 		} else {
+ 			ent  = refs[h].by32.word;
+ 			last = refs[h].by32.pos;
+@@ -1293,11 +1309,11 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 						if (sizeof(long) >= 8) {
+ 							uint64_t old = refs[hw].by64;
+ 
+-							if ((uint32_t)(old >> 32) == w && (unsigned long)(pos + 59 - (uint32_t)old) < 32768) {
++							if (REF64_WORD(old) == w && (unsigned long)(pos + 59 - REF64_POS(old)) < 32768) {
+ 								skip = 0;
+ 								break;
+ 							}
+-							refs[hw].by64 = ((uint64_t)(pos + 60)) + ((uint64_t)w << 32);
++							refs[hw].by64 = REF64(pos + 60, w);
+ 						} else {
+ 							if (refs[hw].by32.word == w && (unsigned long)(pos + 59 - refs[hw].by32.pos) < 32768) {
+ 								skip = 0;
+@@ -1530,6 +1546,8 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 		    1) { /* <last> >= SLZ_BACK_REACH(level), see SLZ_EDGE_SKIP */
+ #elif SLZ_EDGE_SKIP
+ 		    (last >= SLZ_BACK_REACH(level))) {
++#elif SLZ_EDGE_LASTP
++		    (lastp >= in + MAX_C(sizeof(long), SLZ_BACKWARD_MATCH[level]))) {
+ #else
+ 		    (last >= MAX_C(sizeof(long), SLZ_BACKWARD_MATCH[level]))) {
+ #endif
+-- 
+2.43.0
+

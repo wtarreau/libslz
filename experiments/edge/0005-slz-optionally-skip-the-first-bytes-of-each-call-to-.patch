@@ -1,0 +1,171 @@
+From a9ebd1829c841273a9cade30116c5d3185290cd6 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sat, 7 Nov 2026 17:39:24 +0100
+Subject: [PATCH] slz: optionally skip the first bytes of each call to drop the edge test
+
+The backward match tests that <last> is at least 8 before reading the
+bytes preceding a reference. SLZ_EDGE_SKIP=1 instead queues the first
+SLZ_EDGE(level) bytes of each call as literals, so that this test is always
+true and can go. This was measured at -3% cycles in August (767c45e, on
+the full-rework branches) but never merged; this is a port to the current
+encoder, per level.
+
+The backward match reads at most R = SLZ_BACKWARD_MATCH[level] bytes before
+a reference (or 8 above level 1 without UNALIGNED_LE_OK, where the byte
+loop is used). The edge has to be 2*R and not R: a match found on the first
+scanned position may be extended backwards by R, and SLZ_INSERT_SKIPPED
+then indexes the positions following its new start, which a later
+reference will read R bytes before. With an edge of R, valgrind reports an
+invalid read of 8 bytes at level 4. The edge is thus 2 bytes at levels 1
+and 2, 4 at level 3 and with the text tree, and 16 at level 4.
+
+The positions from R to the edge are still indexed, since references to
+them remain safe. This matters at level 1: a 32 kB block whose first
+accepted match comes after 64 literals reaches the first skip step, which
+marks the pending literals for a stored block, so the next short matches
+are refused and the skip keeps growing until the end of the block. Losing
+a single reference to the first bytes was enough to send a whole block of
+x-ray almost uncompressed (32773 bytes instead of 18226). Indexing what is
+safe halves the level 1 output cost at 32 kB (+0.108% -> +0.068%). The
+remaining blocks are the ones whose first match was on position 0, which
+can never be indexed here.
+
+SLZ_EDGE_KEEPTEST=1 keeps the test, on R instead of 8. It must produce the
+same output as SLZ_EDGE_SKIP alone, which it does at all levels and with
+-T, with 1, 32 and 4096 kB blocks, on silesia, the Linux tarball and
+the web files. Round-trips pass from 0 to 300 bytes, and valgrind on chunks
+allocated at their exact size (7 bytes to 32 kB) is clean at all levels.
+The default build's .text is byte-identical to its parent.
+
+zenc's input MB/s, best of 5 with the three builds alternated, on the Xeon
+W-2145 with gcc 15 -O3 -march=native and both JCC flags; lin200.tar is the
+first 212 MB of the Linux tarball. "keep" is SLZ_EDGE_KEEPTEST:
+
+                       base    edge   keep    edge    keep    output
+  silesia -k 32  -1   610.8   615.4  601.2   +0.75%  -1.57%  +0.0677%
+                 -2   531.0   535.1  533.5   +0.77%  +0.47%  +0.0081%
+                 -3   486.4   495.2  480.7   +1.81%  -1.17%  +0.0034%
+                 -4   458.2   462.8  459.7   +1.00%  +0.33%  +0.0243%
+                 -T   419.5   442.5  435.0   +5.48%  +3.69%  +0.0376%
+  silesia        -1   582.2   587.6  573.5   +0.93%  -1.49%  -0.0005%
+                 -2   516.2   521.0  518.3   +0.93%  +0.41%  -0.0001%
+                 -3   497.5   504.1  494.1   +1.33%  -0.68%  +0.0000%
+                 -4   470.8   472.4  469.4   +0.34%  -0.30%  +0.0003%
+                 -T   441.9   465.5  458.2   +5.34%  +3.69%  +0.0032%
+  lin200 -k 32   -1   540.4   541.6  529.3   +0.22%  -2.05%  +0.0103%
+                 -2   540.6   541.2  542.7   +0.11%  +0.39%  +0.0034%
+                 -3   529.6   536.6  521.6   +1.32%  -1.51%  +0.0058%
+                 -4   519.7   528.5  526.0   +1.69%  +1.21%  +0.0354%
+                 -T   496.7   519.9  513.1   +4.67%  +3.30%  +0.0061%
+  lin200         -1   538.0   542.1  530.3   +0.76%  -1.43%  -0.0000%
+                 -2   540.5   543.9  543.8   +0.63%  +0.61%  -0.0000%
+                 -3   532.6   537.6  528.0   +0.94%  -0.86%  +0.0000%
+                 -4   527.0   530.4  526.9   +0.65%  -0.02%  +0.0003%
+                 -T   498.6   522.7  518.8   +4.83%  +4.05%  +0.0000%
+
+The edge wins everywhere, by 0.1 to 1.8% on levels 1 to 4. The test alone
+(edge vs keep) is worth 1.8 to 3.0% at levels 1 and 3, and less at levels
+2 and 4. The text tree's 5% gain is mostly not the test: the keep build
+gains 3.3 to 4.1% as well, lowering the test from 8 to R without the edge
+gains nothing (416.9 vs 418.2 MB/s with 32 kB blocks), and the gain is the
+same with 4 MB blocks where the edge bytes are negligible. It is most likely
+a code layout or register allocation effect in the text encoder, which
+needs checking on other machines before being relied on.
+---
+ src/slz.c | 58 +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 58 insertions(+)
+
+diff --git a/src/slz.c b/src/slz.c
+index 0554a9d..faf9837 100644
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -120,6 +120,34 @@ static uint32_t text_dist_table[32768];
+  */
+ #define SLZ_BACKWARD_MATCH ((const int[]){ 0, 1, 1, 2, 8 })
+ 
++/* Experimental: refuse to start a match on the first SLZ_EDGE(level) bytes of
++ * each call and queue them as literals instead, so that no position below the
++ * backward match's reach R ever enters the reference table, and the backward
++ * match can read the R bytes before a reference without testing <last>. The
++ * table may receive positions up to R below the first scanned one, because a
++ * match found there may be extended backwards by R, and the positions that
++ * follow its new start are indexed (SLZ_INSERT_SKIPPED). A later reference to
++ * one of these reads R bytes before it, hence an edge of 2*R. R is the
++ * level's SLZ_BACKWARD_MATCH, except that without UNALIGNED_LE_OK the byte
++ * loop may go up to 8 bytes back above level 1. SLZ_EDGE_KEEPTEST keeps the
++ * test (on R) and must produce exactly the same output, for verification.
++ * The positions from R to the edge are still indexed, since references to
++ * them remain safe: at level 1, missing the very first match of a call was
++ * enough to send whole blocks as literals.
++ */
++#ifndef SLZ_EDGE_SKIP
++# define SLZ_EDGE_SKIP 0
++#endif
++#ifndef SLZ_EDGE_KEEPTEST
++# define SLZ_EDGE_KEEPTEST 0
++#endif
++#if defined(UNALIGNED_LE_OK)
++# define SLZ_BACK_REACH(level) (SLZ_BACKWARD_MATCH[level])
++#else
++# define SLZ_BACK_REACH(level) (SLZ_BACKWARD_MATCH[level] <= 1 ? SLZ_BACKWARD_MATCH[level] : 8)
++#endif
++#define SLZ_EDGE(level) (2 * SLZ_BACK_REACH(level))
++
+ /* Log2 of the size of the hash table used for the references table. */
+ #ifndef SLZ_HASH_BITS
+ # define SLZ_HASH_BITS 13
+@@ -1106,6 +1134,27 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 
+ 	strm->outbuf = out;
+ 
++#if SLZ_EDGE_SKIP
++	/* queue the first SLZ_EDGE(level) bytes as literals, see SLZ_EDGE_SKIP.
++	 * Inputs too short for this are entirely sent by the tail below.
++	 */
++	if (__builtin_expect(rem < SLZ_EDGE(level) + 4, 0))
++		goto edge_tail;
++	do {
++		if (ctype == SLZ_CT_TEXT)
++			lit_excess += (text_huff[in[pos]] & 15) - 8;
++		else if (level >= 3) // levels 1-2 charge whole groups, see SLZ_MAX_DEBT
++			bal += (in[pos] >= 144);
++		/* positions past the reach may still be referenced, and the
++		 * first match of a call is often a reference to them.
++		 */
++		if (pos >= SLZ_BACK_REACH(level))
++			insert_ref(refs, in, pos);
++	} while (++pos < SLZ_EDGE(level));
++	plit = pos;
++	rem -= pos;
++#endif
++
+ #ifndef UNALIGNED_FASTER
+  reload_word:
+ 	if (rem >= 4)  // <word> is only used inside the loop below, hence the test for >= 4
+@@ -1477,7 +1526,13 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 		 */
+ 		if (((ctype == SLZ_CT_TEXT && __builtin_expect(plit != vplit, 1)) ||
+ 		     (ctype != SLZ_CT_TEXT && __builtin_expect(plit != 0, 1))) &&
++#if SLZ_EDGE_SKIP && !SLZ_EDGE_KEEPTEST
++		    1) { /* <last> >= SLZ_BACK_REACH(level), see SLZ_EDGE_SKIP */
++#elif SLZ_EDGE_SKIP
++		    (last >= SLZ_BACK_REACH(level))) {
++#else
+ 		    (last >= MAX_C(sizeof(long), SLZ_BACKWARD_MATCH[level]))) {
++#endif
+ 			long bmax = MIN(plit - (ctype == SLZ_CT_TEXT ? vplit : 0), 8); // keep it at 8, always faster
+ 			long back = 0;
+ 
+@@ -1669,6 +1724,9 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ #endif
+ 	}
+ 
++#if SLZ_EDGE_SKIP
++ edge_tail:
++#endif
+ 	if (__builtin_expect(rem, 0)) {
+ 		/* we're reading the 1..3 last bytes */
+ 		plit += rem;
+-- 
+2.43.0
+

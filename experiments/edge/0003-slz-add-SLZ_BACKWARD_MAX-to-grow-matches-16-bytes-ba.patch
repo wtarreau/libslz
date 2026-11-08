@@ -1,0 +1,105 @@
+From 0762e01c2f998fdefd065cf2b818e94691baef2f Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sun, 16 Aug 2026 20:24:57 +0200
+Subject: [PATCH] slz: add SLZ_BACKWARD_MAX to grow matches 16 bytes back
+
+SLZ_EDGE_SKIP >= 16 already guarantees no reference sits below position
+16, so a second pair of 8-byte reads at pos - 16 and last - 16 needs no
+bounds test of its own, and it only runs when the first xor came out
+null, i.e. when all 8 preceding bytes matched. That is much cheaper than
+the unbounded loop tried earlier, which cost +10.31%:
+
+                cycles     size
+  silesia -1    +3.34%    -0.051%
+  web     -1    +3.13%    -0.020%
+  silesia -4    +2.18%    -0.002%
+  web     -4    +2.09%    -0.005%
+
+8 paddings x 3 runs, gcc-14, -march=native -mno-avx512f, with the
+reference config duplicated in each sweep: it repeated to within 0.05%.
+
+What defeats it is the ratio ceiling rather than the cost. The unbounded
+loop gained 0.07% at level 1 and this gets 0.051% of that, so nearly
+every back-extension that exists at all already fits within 16 bytes and
+there is very little to find past 8. For scale, the first 8 bytes of
+backward matching are worth about 1% of output, the next 8 are worth
+0.05%.
+
+Left at 8. Note the 2 to 3% floor: it is the same cost SLZ_KEEP_NEAR_REF
+paid for a single conditional store, so most of it is likely the usual
+price of adding anything to the match path rather than the two reads
+themselves, and the two cannot be separated cheaply. Generates
+byte-identical code when left at 8 (slz.o md5 matches the parent
+commit's with Willy's build flags).
+
+---
+ src/slz-prv.h | 13 +++++++++++++
+ src/slz.c     | 20 +++++++++++++++++++-
+ 2 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/src/slz-prv.h b/src/slz-prv.h
+index 53475dc..4433979 100644
+--- a/src/slz-prv.h
++++ b/src/slz-prv.h
+@@ -255,6 +255,19 @@ static inline uint32_t slz_hash(uint32_t a, uint32_t shift)
+  * multiply-free shift/xor, 2 = the shift/add form used where multiplies are
+  * slow. Only 0 has had its constant swept for ratio.
+  */
++/* How far back a match may be grown over the pending literals, 8 or 16. Each
++ * step is one 8-byte xor plus a bit scan, and the second one only runs when the
++ * first came out null, so 16 costs a pair of reads on a path that is rarely
++ * taken. 16 requires SLZ_EDGE_SKIP >= 16 so that the reads at last - 16 stay
++ * inside the buffer without a test.
++ */
++#ifndef SLZ_BACKWARD_MAX
++# define SLZ_BACKWARD_MAX 8
++#endif
++#if SLZ_BACKWARD_MAX >= 16 && SLZ_EDGE_SKIP < 16
++# error "SLZ_BACKWARD_MAX 16 requires SLZ_EDGE_SKIP >= 16"
++#endif
++
+ #ifndef SLZ_HASH_FUNC
+ # define SLZ_HASH_FUNC 0
+ #endif
+diff --git a/src/slz.c b/src/slz.c
+index 42b00ca..60bca9d 100644
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -1038,7 +1038,7 @@ static inline long _slz_rfc1951_encode(struct slz_stream *strm, unsigned char *o
+ 		 * more than the 0.01% of output it is worth.
+ 		 */
+ 		if (__builtin_expect(plit != 0, 1)) {
+-			long bmax = (plit < 8) ? plit : 8;
++			long bmax = (plit < SLZ_BACKWARD_MAX) ? plit : SLZ_BACKWARD_MAX;
+ 			long back;
+ 
+ 			if (bmax > 258 - mlen)
+@@ -1081,7 +1081,25 @@ static inline long _slz_rfc1951_encode(struct slz_stream *strm, unsigned char *o
+ 				uint64_t x = *(uint64_t *)&in[pos - 8] ^
+ 				             *(uint64_t *)&in[last - 8];
+ 
++#if SLZ_BACKWARD_MAX >= 16
++				if (__builtin_expect(x != 0, 1))
++					back = __builtin_clzll(x) >> 3;
++				else {
++					/* all 8 matched, so look 8 further
++					 * back. SLZ_EDGE_SKIP >= 16 keeps this
++					 * second pair of reads inside the
++					 * buffer without a test of its own,
++					 * and it only runs when the first xor
++					 * came out null.
++					 */
++					uint64_t x2 = *(uint64_t *)&in[pos - 16] ^
++					              *(uint64_t *)&in[last - 16];
++
++					back = x2 ? 8 + (__builtin_clzll(x2) >> 3) : 16;
++				}
++#else
+ 				back = x ? (__builtin_clzll(x) >> 3) : 8;
++#endif
+ 				if (back > bmax)
+ 					back = bmax;
+ 			}
+-- 
+2.43.0
+

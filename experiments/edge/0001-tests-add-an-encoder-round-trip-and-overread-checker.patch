@@ -1,0 +1,117 @@
+From 3de5924bebdc2b2cda26a2d9b40107eb019e2e7a Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sun, 9 Aug 2026 13:17:25 +0200
+Subject: [PATCH] tests: add an encoder round-trip and overread checker
+
+echeck.sh builds zenc with a given set of -D flags and verifies its
+output against gzip -d at every level, over six contents (web, linux
+source archive, silesia, a highly repetitive stream, random data and
+zeroes) and at every size from 0 to 300 plus a few larger ones, then
+runs valgrind on ovtest.c, which compresses chunks allocated at their
+exact size so that a read past either end of the input traps.
+
+The size sweep and the two archives are both needed: the out-of-bounds
+read fixed in the next commit only showed up on the linux archive at
+32 kB blocks.
+---
+ tests/echeck.sh | 52 +++++++++++++++++++++++++++++++++++++++++++++++++
+ tests/ovtest.c  | 28 ++++++++++++++++++++++++++
+ 2 files changed, 80 insertions(+)
+ create mode 100755 tests/echeck.sh
+ create mode 100644 tests/ovtest.c
+
+diff --git a/tests/echeck.sh b/tests/echeck.sh
+new file mode 100755
+index 0000000..977d735
+--- /dev/null
++++ b/tests/echeck.sh
+@@ -0,0 +1,52 @@
++#!/bin/bash
++# Round-trip correctness check for one build configuration of the encoder.
++# Builds zenc with the given -D flags and verifies against gzip -d at every
++# level and over a set of inputs that includes the sizes where the loop's
++# edge handling changes (0..300 bytes), plus a valgrind pass on a harness
++# that allocates each chunk at its exact size so any overread traps.
++#
++# usage: tests/echeck.sh "<cfg>"
++set -e
++cd "$(dirname "$0")/.."
++CFG=$1
++CF="-O3 -fomit-frame-pointer -w -Isrc"
++T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
++
++gcc $CF $CFG -o "$T/zenc" src/zenc.c src/slz.c src/slz_common.c
++
++# a mix of contents: text, highly repetitive, incompressible, all-zero
++head -c 300000 /tmp/web-corpus.bin > "$T/web"
++head -c 400000 /tmp/lnx-archive-80M.bin > "$T/lnx"
++head -c 400000 /tmp/silesia.tar > "$T/sil"
++yes "abcdefgh" | head -c 200000 > "$T/rep"
++head -c 200000 /dev/urandom > "$T/rnd"
++head -c 200000 /dev/zero > "$T/zero"
++
++fail=0
++for f in "$T/web" "$T/lnx" "$T/sil" "$T/rep" "$T/rnd" "$T/zero"; do
++	for lvl in 1 2 3 4; do
++		for n in $(seq 0 300) 1000 4095 4096 4097 32768 65536 200000; do
++			head -c $n "$f" > "$T/in"
++			"$T/zenc" -$lvl -G -c -f < "$T/in" > "$T/gz" 2>/dev/null
++			if ! gzip -dc < "$T/gz" 2>/dev/null | cmp -s - "$T/in"; then
++				echo "FAIL ${f##*/} level=$lvl size=$n"
++				fail=$((fail+1))
++				[ $fail -gt 5 ] && exit 1
++			fi
++		done
++	done
++done
++[ $fail = 0 ] && echo "round-trip OK: $CFG"
++
++# overread check: exact-size allocations, so reading one byte past traps
++if command -v valgrind >/dev/null; then
++	gcc $CF ${CFG//-march=native/} -o "$T/ov" tests/ovtest.c src/slz.c src/slz_common.c
++	for src in "$T/web" "$T/lnx" "$T/sil" "$T/rep" "$T/rnd" "$T/zero"; do
++		for chunk in 3 7 11 260 4096 32768; do
++			valgrind -q --error-exitcode=9 "$T/ov" "$src" $chunk >/dev/null ||
++				{ echo "VALGRIND FAIL ${src##*/} chunk=$chunk"; exit 1; }
++		done
++	done
++	echo "valgrind OK: $CFG"
++fi
++exit $fail
+diff --git a/tests/ovtest.c b/tests/ovtest.c
+new file mode 100644
+index 0000000..a17d955
+--- /dev/null
++++ b/tests/ovtest.c
+@@ -0,0 +1,28 @@
++/* compresses a buffer allocated so that the byte just past the input is
++ * unaddressable, to catch reads past the end of the input buffer.
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "slz.h"
++int main(int argc, char **argv)
++{
++	FILE *f = fopen(argv[1], "r");
++	static unsigned char big[1 << 20];
++	long n = fread(big, 1, sizeof(big), f);
++	long chunk = argc > 2 ? atol(argv[2]) : 32768;
++	unsigned char *out = malloc(2 * chunk + 4096);
++	struct slz_stream s;
++	long ofs;
++
++	slz_init(&s, 1, SLZ_FMT_GZIP);
++	for (ofs = 0; ofs < n; ofs += chunk) {
++		long len = (n - ofs > chunk) ? chunk : n - ofs;
++		unsigned char *in = malloc(len);   /* exact size: valgrind traps len+1 */
++		memcpy(in, big + ofs, len);
++		slz_encode(&s, out, in, len, ofs + len < n);
++		free(in);
++	}
++	slz_finish(&s, out);
++	return 0;
++}
+-- 
+2.43.0
+
