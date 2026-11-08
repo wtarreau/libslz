@@ -1272,6 +1272,43 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 			else if (__builtin_expect(ctype == SLZ_CT_GENERIC && level == 3 && !(plit & 2047), 0)) {
 				long skip = rem >= skip_ratio * 4096 ? skip_ratio * 4096 : rem;
 				skip_ratio = (skip_ratio * 2 + 1) & 7; // capped exponential: 0,1,3,7 and stays at 7
+
+				/* Note: by checking intervals smaller than the mask above, a hit resumes
+				 * at the start of the 256-byte chunk containing it, so <plit> is then no
+				 * longer a multiple of 2048 and the next check comes after 256 to 1792
+				 * literals if no match is found in between. This shortens the scan after
+				 * a false hit. Rewinding to the 2048 boundary instead showed almost no
+				 * size gains but was 0.3-0.8% slower.
+				 */
+				if (skip >= 256) {
+					long chunks = skip >> 8;
+
+					skip &= 255;
+					do {
+						uint32_t w = read_le32(in + pos + 252);
+						uint32_t hw = slz_hash(w);
+
+						if (sizeof(long) >= 8) {
+							uint64_t old = refs[hw].by64;
+
+							if ((uint32_t)(old >> 32) == w && (unsigned long)(pos + 251 - (uint32_t)old) < 32768) {
+								skip = 0;
+								break;
+							}
+							refs[hw].by64 = ((uint64_t)(pos + 252)) + ((uint64_t)w << 32);
+						} else {
+							if (refs[hw].by32.word == w && (unsigned long)(pos + 251 - refs[hw].by32.pos) < 32768) {
+								skip = 0;
+								break;
+							}
+							refs[hw].by32.pos = pos + 252;
+							refs[hw].by32.word = w;
+						}
+						pos += 256;
+						rem -= 256;
+						plit += 256;
+					} while (--chunks);
+				}
 				pos += skip;
 				rem -= skip;
 				plit += skip;
