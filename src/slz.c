@@ -1216,6 +1216,47 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 			if (ctype == SLZ_CT_GENERIC && level <= 2 && !(plit & 63)) {
 				long skip = rem >= skip_ratio * 64 ? skip_ratio * 64 : rem; // 0,64,192,...,8128: keeps plit aligned
 				skip_ratio = (skip_ratio * 2 + 1) & 127; // capped exponential: 0,1,3,7,... and stays at 127
+				/* Level 2 still looks up and indexes the last word of
+				 * each whole 64-byte chunk it skips, and stops skipping
+				 * on the first one already present within the window,
+				 * so that the main loop resumes at the start of that
+				 * chunk. The skipped words remain indexed for the data
+				 * that follows. The last word rather than the first one
+				 * gives shorter distances to what follows the skip and a
+				 * smaller output. Only the remainder of a skip limited by
+				 * the end of the input is skipped unchecked. Since the
+				 * skip steps are 64 bytes apart, <plit> remains aligned
+				 * on them.
+				 */
+				if (level == 2 && skip >= 64) {
+					long chunks = skip >> 6;
+
+					skip &= 63;
+					do {
+						uint32_t w = read_le32(in + pos + 60);
+						uint32_t hw = slz_hash(w);
+
+						if (sizeof(long) >= 8) {
+							uint64_t old = refs[hw].by64;
+
+							if ((uint32_t)(old >> 32) == w && (unsigned long)(pos + 59 - (uint32_t)old) < 32768) {
+								skip = 0;
+								break;
+							}
+							refs[hw].by64 = ((uint64_t)(pos + 60)) + ((uint64_t)w << 32);
+						} else {
+							if (refs[hw].by32.word == w && (unsigned long)(pos + 59 - refs[hw].by32.pos) < 32768) {
+								skip = 0;
+								break;
+							}
+							refs[hw].by32.pos = pos + 60;
+							refs[hw].by32.word = w;
+						}
+						pos += 64;
+						rem -= 64;
+						plit += 64;
+					} while (--chunks);
+				}
 				pos += skip;
 				rem -= skip;
 				plit += skip;
@@ -1704,6 +1745,12 @@ long _slz_rfc1951_encode_lev1(struct slz_stream *__restrict strm, unsigned char 
 }
 
 static __attribute__((noinline))
+long _slz_rfc1951_encode_lev2(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
+{
+	return _slz_rfc1951_encode(strm, out, in, ilen, more, 2, SLZ_CT_GENERIC);
+}
+
+static __attribute__((noinline))
 long _slz_rfc1951_encode_lev3(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
 {
 	return _slz_rfc1951_encode(strm, out, in, ilen, more, 3, SLZ_CT_GENERIC);
@@ -1734,9 +1781,10 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, 
 	if (strm->content_type == SLZ_CT_TEXT)
 		return _slz_rfc1951_encode_text(strm, out, in, ilen, more);
 
-	/* level 2 is still the same as level 1 for now */
-	if (strm->level <= 2)
+	if (strm->level <= 1)
 		return _slz_rfc1951_encode_lev1(strm, out, in, ilen, more);
+	else if (strm->level <= 2)
+		return _slz_rfc1951_encode_lev2(strm, out, in, ilen, more);
 	else if (strm->level <= 3)
 		return _slz_rfc1951_encode_lev3(strm, out, in, ilen, more);
 	else
