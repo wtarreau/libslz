@@ -1,6 +1,6 @@
 /*
  * Fuzzes random sequences of init/encode/flush/finish for the three formats
- * and both levels, and checks that:
+ * and all levels, and checks that:
  *
  *   - the whole output decodes back to the concatenation of the inputs;
  *   - flush() and finish() never emit more than what they document;
@@ -62,7 +62,7 @@ int main(void)
 
 	for (iter = 0; iter < 300000; iter++) {
 		struct slz_stream strm;
-		int f = rnd() % 3, lvl = rnd() & 1;
+		int f = rnd() % 3, lvl = rnd() % 5;
 		long olen = 0, ilen = 0, omax = 0;
 		int ops = 1 + rnd() % 8;
 		int op, nflush = 0;
