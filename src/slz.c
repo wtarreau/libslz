@@ -118,7 +118,7 @@ static uint32_t text_dist_table[32768];
  * compression speed due to the savings on encoding. The only way to disable
  * this optimization is to comment out this line.
  */
-#define SLZ_BACKWARD_MATCH ((const int[]){ 0, 1, 2, 8 })
+#define SLZ_BACKWARD_MATCH ((const int[]){ 0, 1, 1, 2, 8 })
 
 /* Log2 of the size of the hash table used for the references table. */
 #ifndef SLZ_HASH_BITS
@@ -904,7 +904,7 @@ static inline void insert_ref(union ref *refs, const unsigned char *in, unsigned
  * drop below zero, i.e. to accumulate more than SLZ_CREDIT bits of savings:
  * these allow a few groups of literals to remain in fixed huffman instead of
  * paying for a return to it, which improves the compression ratio at levels
- * 2 and 3 (from 32 to 300 it only grows, but costs more CPU past 64, since
+ * 3 and 4 (from 32 to 300 it only grows, but costs more CPU past 64, since
  * more literals are huffman-encoded). The balance is carried between calls in
  * <strm->debt>, and a stream starts with no savings at all.
  *
@@ -916,7 +916,7 @@ static inline void insert_ref(union ref *refs, const unsigned char *in, unsigned
  * SLZ_CREDIT + SLZ_MAX_DEBT + SLZ_SWITCH_COST, which is what bounds the excess
  * of a stream over the same data sent as stored blocks to 252 bits. In
  * practice it reaches 154 bits on crafted data and 149 on silesia.tar, where
- * values 100 to 1000 trade a little ratio between levels 2 and 3.
+ * values 100 to 1000 trade a little ratio between levels 3 and 4.
  *
  * The same threshold also marks the stored mode inside a call: whenever the
  * encoder leaves fixed huffman mode (literal skip, full stored block), the
@@ -929,7 +929,7 @@ static inline void insert_ref(union ref *refs, const unsigned char *in, unsigned
  * it saves by itself, and the switch to fixed huffman is charged when it is
  * performed by that reference, but not when the first literals perform it.
  *
- * At level 1, literals are not counted one at a time, which costs too much in
+ * At levels 1 and 2, literals are not counted one at a time, which costs too much in
  * the main loop. Instead, a group of literals sent in fixed huffman mode before
  * a reference is charged one bit per byte as if all of them took 9 bits, once
  * the decision to send it in fixed huffman mode is taken. The balance is thus
@@ -1190,7 +1190,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 			 */
 			if (ctype == SLZ_CT_TEXT)
 				lit_excess += (text_huff[(unsigned char)word] & 15) - 8;
-			else if (level >= 2) // level 1 charges whole groups, see SLZ_MAX_DEBT
+			else if (level >= 3) // levels 1-2 charge whole groups, see SLZ_MAX_DEBT
 				bal += ((unsigned char)word >= 144);
 			pos++;
 
@@ -1213,7 +1213,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 			/* never on text, where it would be too expensive to
 			 * leave the huffman block for so few literals.
 			 */
-			if (ctype == SLZ_CT_GENERIC && level <= 1 && !(plit & 63)) {
+			if (ctype == SLZ_CT_GENERIC && level <= 2 && !(plit & 63)) {
 				long skip = rem >= skip_ratio * 64 ? skip_ratio * 64 : rem; // 0,64,192,...,8128: keeps plit aligned
 				skip_ratio = (skip_ratio * 2 + 1) & 127; // capped exponential: 0,1,3,7,... and stays at 127
 				pos += skip;
@@ -1228,7 +1228,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 				continue;
 # endif
 			}
-			else if (__builtin_expect(ctype == SLZ_CT_GENERIC && level == 2 && !(plit & 2047), 0)) {
+			else if (__builtin_expect(ctype == SLZ_CT_GENERIC && level == 3 && !(plit & 2047), 0)) {
 				long skip = rem >= skip_ratio * 4096 ? skip_ratio * 4096 : rem;
 				skip_ratio = (skip_ratio * 2 + 1) & 7; // capped exponential: 0,1,3,7 and stays at 7
 				pos += skip;
@@ -1246,7 +1246,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 				continue;
 # endif
 			}
-			else if (ctype != SLZ_CT_GENERIC || level >= 3) // no literal skip at levels >= 3
+			else if (ctype != SLZ_CT_GENERIC || level >= 4) // no literal skip at levels >= 4
 #endif
 			{
 				/* either no literal_skip at build time, or high enough
@@ -1537,7 +1537,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 				bal = strm->debt;
 			}
 			else {
-				if (level <= 1)
+				if (level <= 2)
 					bal += plit; // worst case: all of them take 9 bits
 				copy_lit_huff(strm, in + pos - plit, plit, 1, ctype);
 			}
@@ -1704,18 +1704,18 @@ long _slz_rfc1951_encode_lev1(struct slz_stream *__restrict strm, unsigned char 
 }
 
 static __attribute__((noinline))
-long _slz_rfc1951_encode_lev2(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
-{
-	return _slz_rfc1951_encode(strm, out, in, ilen, more, 2, SLZ_CT_GENERIC);
-}
-
-static __attribute__((noinline))
 long _slz_rfc1951_encode_lev3(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
 {
 	return _slz_rfc1951_encode(strm, out, in, ilen, more, 3, SLZ_CT_GENERIC);
 }
 
-/* With the text tree, we encode everything at level 2 which proves to be both
+static __attribute__((noinline))
+long _slz_rfc1951_encode_lev4(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
+{
+	return _slz_rfc1951_encode(strm, out, in, ilen, more, 4, SLZ_CT_GENERIC);
+}
+
+/* With the text tree, we encode everything at level 3 which proves to be both
  * better and faster on all tests.
  */
 static __attribute__((noinline))
@@ -1726,7 +1726,7 @@ long _slz_rfc1951_encode_text(struct slz_stream *__restrict strm, unsigned char 
 	 */
 	if (strm->text_debt < SLZ_TEXT_CREDIT)
 		strm->text_debt = SLZ_TEXT_CREDIT;
-	return _slz_rfc1951_encode(strm, out, in, ilen, more, 2, SLZ_CT_TEXT);
+	return _slz_rfc1951_encode(strm, out, in, ilen, more, 3, SLZ_CT_TEXT);
 }
 
 long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
@@ -1734,12 +1734,13 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, 
 	if (strm->content_type == SLZ_CT_TEXT)
 		return _slz_rfc1951_encode_text(strm, out, in, ilen, more);
 
-	if (strm->level <= 1)
+	/* level 2 is still the same as level 1 for now */
+	if (strm->level <= 2)
 		return _slz_rfc1951_encode_lev1(strm, out, in, ilen, more);
-	else if (strm->level <= 2)
-		return _slz_rfc1951_encode_lev2(strm, out, in, ilen, more);
-	else
+	else if (strm->level <= 3)
 		return _slz_rfc1951_encode_lev3(strm, out, in, ilen, more);
+	else
+		return _slz_rfc1951_encode_lev4(strm, out, in, ilen, more);
 }
 
 /* Initializes stream <strm> for use with raw deflate (rfc1951). The CRC is
