@@ -1,0 +1,334 @@
+Emitting brotli streams from slz: thoughts and measurements
+==========================================================
+
+Idea first discussed on 2026-11-01 (discussion only, no code), resumed
+on 2026-11-08 with the first measurements. See also ../encoding/README for the
+measurement tools (SLZ_STATS, SLZ_DRY_RUN, FIND_OPTIMAL_MATCH) and for
+the cost split of the current encoder.
+
+
+1. The idea
+-----------
+
+What costs both CPU and ratio in slz is suspected to be deflate's
+bitstream layout, which is old and inefficient. Brotli (RFC 7932) is
+more modern. Could a variant of slz emit a brotli-compatible stream?
+The goal is NOT to beat brotli's speed, but to keep slz's current speed
+and its zero-memory, stateless design (millions of streams in haproxy),
+and maybe gain some ratio from a better designed format. It would
+compress less than brotli's high levels, but possibly about as well as
+q0/q1 without their memory usage.
+
+Motivation at the time: lzbench showed brotli 1.2.0 -0 compressing at
+the speed of slz 1.2 (i.e. 66% of current slz) to 37% where slz gave
+41%. That was a whole-file measurement, see section 4 for why it does
+not reflect haproxy's regime.
+
+Constraints: browsers only accept "br" over HTTPS (most traffic today).
+The window must only cover the current call, which the stream header's
+WBITS allows (16 to 24 bits); each call ends on a meta-block boundary
+and the decoder never sees references to earlier calls. haproxy knows
+its buffer size and could declare a 16 or 32 kB window.
+
+
+2. The format, from a stateless encoder's point of view
+-------------------------------------------------------
+
+Brotli is LZ77 + Huffman like deflate, but:
+  - meta-blocks, each with block types and block switch commands;
+  - separate prefix codes for literals, insert-and-copy lengths and
+    distances;
+  - commands: one insert-and-copy symbol combines the literal count and
+    the match length, followed by the literals and a distance;
+  - a ring of the last 4 distances, with short codes for them and for
+    small variations around the last two;
+  - context modeling: literals coded with one of up to 256 trees picked
+    from the two previous bytes; distance trees picked by copy length;
+  - a static dictionary of 122,784 bytes of words and phrases from web
+    content (English, HTML, JS, CSS, other languages) with 121 transforms
+    (uppercase first, add a space or '">', etc.), referenced as copies
+    whose distance lies beyond the window;
+  - no checksum.
+
+What would help a stateless encoder:
+  - combined insert-and-copy commands: one symbol per match instead of
+    deflate's length code + extra bits, nothing per literal run. Fewer
+    operations and branches. (Note: the insert length is then paid in
+    the command's code and extra bits, while deflate has no per-run
+    marker, so the bit saving is not obvious; the CPU saving is.)
+  - the distance cache: "same distance as last time" or one of the last
+    4 with +-1..3 costs a short code with no extra bits, and insert-and-
+    copy codes 0-127 even imply the last distance at no cost (insert
+    0-9, copy 2-69). Measured in section 5;
+  - cheap framing: an empty metadata block (~1 byte) byte-aligns the
+    stream, vs deflate's 5-byte empty stored block on flush; a stored
+    meta-block costs 3-5 bytes for up to 16 MB vs 5 bytes per 64 kB;
+  - no checksum: only matters for haproxy's gzip output (CRC32 over every
+    byte) and zlib's Adler-32; raw deflate has none, so it changes nothing
+    in zenc/lzbench measurements;
+  - variable-length distances as in deflate (code + extra bits growing
+    with log2 of the distance), with the window declared once.
+
+What is less favourable:
+  - no fixed huffman tree: each compressed meta-block must describe its
+    prefix codes. Same approach as the text tree: train the code
+    descriptions offline on web content and emit them as a constant bit
+    blob per profile (text, generic), only when opening a block that the
+    known savings repay;
+  - literals cost the same as in deflate (one huffman code each), unless
+    using context modeling, which means several literal trees (bigger
+    constant header) and a branch per literal on the previous byte's
+    class. If tried: 2 or 4 trees selected by the previous byte's class;
+  - the insert-and-copy table (704 codes, insert and copy ranges, split
+    at code 128 for the implicit distance) is more complex than deflate's
+    length table, but reduces to a couple of small lookups per match;
+  - the match finder and hashing, which dominate slz's time, stay the
+    same: SLZ_DRY_RUN showed that encoding is only 16-19% of the time,
+    two thirds of it for literals (../encoding/README, section 2). So a brotli
+    emitter can at best keep today's speed, as intended, not improve it
+    much.
+
+Brotli q0/q1 for comparison: they don't need much memory either (small
+hash tables; the MBs come from the streaming ring buffer and the q >= 2
+hashers). What they do per fragment is build huffman codes from the
+data's statistics (sampled histogram for literals, two passes for
+commands at q1), which costs CPU we wouldn't spend with static codes.
+They don't use the static dictionary.
+
+
+3. The dictionary subset
+------------------------
+
+The decoder has the whole 122,784-byte dictionary, but the encoder only
+needs the words it chooses to reference, so it does not have to embed it
+all (which would considerably inflate our code size). A reference is
+(word length, index, transform) encoded as a copy with a distance just
+past the window, so the encoder could embed:
+  - a few hundred of the most profitable words for web content, with
+    their lengths and indexes: a few kB in total;
+  - a small hash table on their first 4 bytes, constant or built at init;
+  - the identity transform only, possibly "uppercase first" and "add a
+    space".
+
+These codes replace literals, i.e. the data with no earlier match in the
+call, which is exactly what a stateless encoder lacks most, especially
+at the beginning of each call. But they cost many bits: the distance is
+about the window size, hence 14-16 extra bits with a 16-32 kB window
+(the smallest window covering a call keeps them cheapest), plus the
+command code: ~20-30 bits per word, vs ~6-7 bits per text-tree literal.
+So only words of ~5-6 bytes or more pay off, and the subset should favour
+long, frequent web words (function, return, document, stylesheet,
+javascript, undefined, background, position, display:, ...), picked by
+an offline tool on measured savings, like the text tree.
+
+Not measured yet. The dictionary is available in brotli's sources (e.g.
+lzbench's lz+entropy/brotli/common/dictionary.c) for a coverage test:
+how many of the literal bytes left by slz -T are covered by dictionary
+words of 6+ bytes.
+
+
+4. Brotli vs slz in haproxy's regime (lzbench + zenc, 2026-11-08)
+-----------------------------------------------------------------
+
+hap-org.html (932561 bytes, 7 haproxy.org pages concatenated), each block
+compressed independently. Brotli and zlib from lzbench -b<kB> -t1,1
+(lzbench's own slz is 1.4-dev3 with the old level numbering, so slz
+figures come from the current zenc instead: zenc -k <kB> -t -v, MB/s best
+of 3 with -l 200). Xeon W-2145, taskset -c 4. The two harnesses differ
+(lzbench in memory, zenc reading a mapped file), so compare speeds with
+care; sizes are exact.
+
+  block   brotli -0     brotli -1     brotli -2     zlib -1      zlib -6
+  4 kB    37.60% 248    35.81% 176    34.75% 109    34.24%  94   32.14%  61
+  16 kB   30.37% 251    29.73% 197    27.63% 156    29.01% 134   26.07%  63
+  32 kB   28.72% 301    27.95% 198    25.60% 174    27.55% 150   24.17%  57
+  1 MB    24.57% 490    22.71% 383    20.81% 207    25.86% 143   21.61%  45
+
+  block   slz -1        slz -4        slz -T
+  4 kB    45.58% 533    42.21% 459    35.35% 436
+  16 kB   37.99% 607    34.85% 529    29.59% 504
+  32 kB   36.06% 623    32.67% 555    27.96% 527
+  1 MB    30.21% 565    30.11% 550    26.08% 519
+
+(ratio, then compression MB/s)
+
+Observations:
+  - in haproxy's regime (independent 4-32 kB calls), slz -T already
+    compresses HTML as well as brotli -0/-1, at 1.7-2.7x their speed:
+    4 kB 35.35% vs 37.60/35.81, 16 kB 29.59% vs 30.37/29.73, 32 kB
+    27.96% vs 28.72/27.95. The whole-file gap seen on 2026-11-01 comes
+    from brotli's window across the file and its adaptive codes (at 1 MB
+    brotli -1 is 13% smaller than slz -T), not from the format;
+  - brotli -2 is 6.6% (16 kB) to 8.4% (32 kB) smaller than slz -T, at
+    a third of its speed. q2 uses a better match finder; for comparison,
+    FIND_OPTIMAL_MATCH depth 2/4 gives -5.2%/-7.6% at 32 kB on this file
+    with the fixed tree (../encoding/README, section 5). So much of q2's lead
+    is likely the search rather than the format;
+  - with the fixed tree, slz -4 is 17-19% and slz -1 28-29% larger than
+    -T on HTML at 4-32 kB: the trained text tree is what puts slz at
+    brotli -0/-1 level here.
+
+
+5. Distance cache potential (SLZ_STATS, patch 0001)
+---------------------------------------------------
+
+Patch 0001 in this directory (originally commit 4648e7a) adds the counter
+to SLZ_STATS; it applies on top of ../encoding/0001-0003.
+
+SLZ_STATS simulates brotli's ring of the last 4 distances (initialized to
+4, 11, 15, 16, shared by all calls of a stream) on the references slz
+emits, and counts the short distance codes they would use. On a miss, it
+also tries the 16 cached distances at the match position: if one gives
+the same length, a cache-aware encoder would have used it ("switch",
+counted as a hit, and the ring follows that choice); if one only gives a
+shorter match (>= 4), it is counted apart.
+
+% of references. code0 = last distance (incl. free), free = code 0 with
+an implicit distance (insert <= 9, copy <= 69), c1-3 = 2nd-4th last,
+c4-9 = last +-1..3, c10-15 = 2nd last +-1..3, hits = total incl. switch,
+switch = switched alone, hitbits = fixed-tree distance bits of the hits
+in bytes (what short codes would replace), short = misses with only a
+shorter cached match.
+
+  corpus  lvl k        totout      refs  code0    free    c1-3    c4-9  c10-15    hits  switch  hitbits   short
+  hap-org  1   16      354239     64437  3.58%   3.07%   4.50%   2.90%   3.34%  14.33%   7.45%    14340   0.81%
+  hap-org  1   32      336267     67698  3.52%   3.03%   4.22%   2.39%   3.16%  13.29%   7.61%    14653   0.80%
+  hap-org  1   4096    281718     76071  3.26%   2.75%   4.19%   1.86%   2.90%  12.21%   7.39%    15733   0.79%
+  hap-org  4   16      325039     71400  3.39%   2.92%   4.18%   2.75%   3.19%  13.50%   6.97%    14953   0.77%
+  hap-org  4   32      304658     73567  3.32%   2.87%   4.26%   2.30%   3.03%  12.91%   7.23%    15377   0.79%
+  hap-org  4   4096    280766     76105  3.29%   2.78%   4.21%   1.86%   2.90%  12.25%   7.43%    15803   0.79%
+  hap-org  T   16      275939     71387  3.37%   2.90%   4.18%   2.75%   3.19%  13.49%   6.95%    14928   0.77%
+  hap-org  T   32      260769     73563  3.31%   2.86%   4.26%   2.30%   3.03%  12.90%   7.22%    15368   0.78%
+  hap-org  T   4096    243184     76088  3.28%   2.77%   4.20%   1.86%   2.89%  12.24%   7.43%    15788   0.79%
+  silesia  1   16   111359081  14086021 10.21%   9.86%   9.00%   2.00%   2.27%  23.48%   9.09%  4602466   1.43%
+  silesia  1   32   107816032  14825368  9.42%   9.09%   8.62%   1.66%   2.17%  21.86%   9.14%  4663637   1.45%
+  silesia  1   4096  98783584  16598887  8.29%   8.00%   7.90%   1.24%   1.99%  19.42%   8.99%  4859597   1.41%
+  silesia  4   16   100476303  16615306  9.43%   9.05%   8.38%   1.85%   2.07%  21.73%   8.42%  5056625   1.30%
+  silesia  4   32    96588868  17351141  8.71%   8.36%   7.99%   1.54%   1.97%  20.21%   8.46%  5073478   1.31%
+  silesia  4   4096  91360519  18719547  7.77%   7.46%   7.44%   1.16%   1.81%  18.19%   8.41%  5137459   1.30%
+  silesia  T   16    99931392  15268296  9.13%   8.79%   8.27%   1.96%   2.20%  21.57%   8.47%  4605822   1.35%
+  silesia  T   32    95140431  16299687  8.56%   8.24%   7.94%   1.60%   2.06%  20.15%   8.53%  4755019   1.35%
+  silesia  T   4096  88247695  18087642  8.00%   7.70%   7.57%   1.20%   1.87%  18.64%   8.61%  5081347   1.33%
+
+(Without the switches, i.e. on slz's own choices only, hap-org -4 at
+32 kB gives 6.20% hits, 1.00% on the last distance.)
+
+Observations:
+  - on the HTML only 12-14% of the references can use the cache, even
+    when preferring cached distances on equal lengths; the last distance
+    alone is 3.3%. HTML repeats structures, but not at constant
+    distances. Half of the hits need the encoder to look for them;
+  - the fixed-tree distance bits at stake are ~15 kB of a 260-305 kB
+    output at 32 kB. With short codes costing ~3 bits (9.5k hits =
+    3.6 kB), the net saving would be ~4.5% of the output (11.8 kB of
+    260769 with -T), before any other effect of the format;
+  - silesia does better (18-23% of references, mostly the last distance
+    and the 2nd-4th ones) for a similar relative net saving (~5 MB of
+    distance bits at stake on ~96 MB);
+  - a cache-aware search costs up to 16 extra compares per reference
+    (fewer if limited to codes 0-3).
+
+
+6. Where this leaves the idea
+-----------------------------
+
+  - In haproxy's regime on HTML, the text tree already brings slz to
+    brotli -0/-1 ratios at about twice their speed, so the motivation
+    from the whole-file lzbench comparison does not hold there.
+  - Measured potential of the format itself so far: the distance cache,
+    ~4.5% of the output on HTML. Combined commands are mostly a CPU
+    matter, within the 16-19% of the time spent encoding.
+  - Unmeasured: the dictionary subset (the most promising for small
+    calls, since it is the only history a stateless encoder can use) and
+    literal context modeling (2-4 trees).
+  - The rule of thumb set on 2026-11-01 still applies: if a brotli
+    emitter only ends up 3-5% better than slz -T it's not worth it; 10%
+    or more would be.
+
+Next steps, in order:
+  1. dictionary coverage: on the literals left by slz -T at 16/32 kB,
+     count the bytes covered by dictionary words of 6+ bytes (identity
+     transform), and estimate the net saving at ~20-30 bits per word;
+  2. if 1 + the distance cache approach 10%: a prototype emitter in zenc
+     fed by the existing match finder (one profile, NBLTYPES=1,
+     NPOSTFIX=0, NDIRECT=0, one literal tree, static trained command and
+     distance trees, distance cache from the start), validated with the
+     reference decoder (brotli -d / python-brotli), per-call output
+     checked against a margin like the chunkrt test;
+  3. only then a minimal dictionary lookup and 2-4 literal contexts.
+
+
+Status and conclusions as of 2026-11-08:
+  - no real gain identified so far: in haproxy's regime the text tree
+    already gives brotli -0/-1 ratios on HTML at about twice their speed,
+    and the distance cache alone is worth ~4.5% of output. Only the
+    dictionary subset (step 1 above) remains to be measured before
+    dropping or pursuing the idea;
+  - the match finder is not where brotli's better levels could help us.
+    FIND_OPTIMAL_MATCH with all candidates does save a lot of bytes (at
+    32 kB with the fixed tree: -11.2% on hap-org.html, -8.4% on silesia),
+    and brotli -2's 6.6-8.5% lead over slz -T is in that range, so it most
+    likely comes from its search. But that search costs CPU we chose not
+    to spend, and none of it comes from the format. Several modern
+    implementations copy slz's matcher design, and lz4's own parse is no
+    better than slz -4's (../lz4/README, section 2), which suggests that slz is
+    close to optimal for its speed class.
+
+
+7. Commands used
+----------------
+
+Build of zenc used for all slz figures (Xeon W-2145, so with the JCC
+erratum padding; drop the two -Wa options on other machines):
+
+  F="-O3 -g -fomit-frame-pointer -march=native -mno-avx512f \
+     -Wa,-mbranches-within-32B-boundaries \
+     -Wa,-malign-branch=jcc+fused+jmp+call -Isrc -DSLZ_VERSION=\"x\""
+  gcc-15 $F -o zenc src/zenc.c src/slz_common.c src/slz.c
+  gcc-15 $F -DSLZ_STATS=1 -o zenc-stats src/zenc.c src/slz_common.c src/slz.c
+
+(make zenc USR_CFLAGS="-DSLZ_STATS=1" works as well.)
+
+Section 4, brotli and zlib (lzbench at commit 32ab077, brotli 1.2.0,
+zlib 1.3.2), -b<kB> compresses each block independently, -t1,1 sets the
+minimum time of each measurement to 1 second:
+
+  cd lzbench
+  for b in 4 16 32 1024; do
+      taskset -c 4 ./lzbench -b$b -t1,1 \
+          -ebrotli,0,1,2/slz_deflate,1,2,3/zlib,1,6 /tmp/hap-org.html
+  done
+
+Section 4, slz sizes and speeds (-T is the text tree, run at level 3
+internally whatever the level), best of 3 runs:
+
+  for o in "-1" "-4" "-4 -T"; do
+      for k in 4 16 32 1024; do
+          taskset -c 4 ./zenc $o -k $k -l 200 -t -v /tmp/hap-org.html
+      done
+  done
+
+zenc prints "totin=... totout=... ratio=...% ... <speed>MB/s saving ...";
+the ratio and the first MB/s figure are used.
+
+Section 5, distance cache (the ring is shared by all blocks of a zenc
+run, i.e. one stream):
+
+  for o in "-1" "-4" "-4 -T"; do
+      for k in 16 32 4096; do
+          ./zenc-stats $o -k $k -t -v /tmp/hap-org.html 2>&1 |
+              sed -n '/brotli distance cache/,/shorter only/p'
+      done
+  done
+
+The same with /dev/shm/silesia.tar for the silesia rows. The output of a
+single run looks like this (hap-org.html, -4 -k 32):
+
+  brotli distance cache (ring of the last 4 distances):
+    last (code 0)             2442    3.32%, of which 2108 (2.87%) with an implicit distance
+    2nd-4th (1-3)             3137    4.26%
+    last +-1..3               1689    2.30%
+    2nd +-1..3                2227    3.03%
+    total hits                9495   12.91%, fixed tree distance bits on hits: avg 12.96, 15377 bytes total
+      incl. switched          5319    7.23% (a cached distance gave the same length, counted above)
+    shorter only               580    0.79%, would lose 13.38 bytes on avg
