@@ -1457,39 +1457,41 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 					skip = rem >= skip ? skip : rem;
 
 					/* Note: by checking intervals smaller than the mask above, a hit resumes
-					 * at the start of the 256-byte chunk containing it, so <plit> is then no
-					 * longer a multiple of 2048 and the next check comes after 256 to 1792
+					 * at the start of the 64-byte chunk containing it, so <plit> is then no
+					 * longer a multiple of 2048 and the next check comes after 64 to 1984
 					 * literals if no match is found in between. This shortens the scan after
 					 * a false hit. Rewinding to the 2048 boundary instead showed almost no
-					 * size gains but was 0.3-0.8% slower.
+					 * size gains but was 0.3-0.8% slower. Checking every 64 bytes instead
+					 * of 256 makes level 4 0.05% smaller on silesia and 0.64% on a tar of
+					 * /usr/share/doc for 0.4-1.2% of speed.
 					 */
-					if (skip >= 256) {
-						long chunks = skip >> 8;
+					if (skip >= 64) {
+						long chunks = skip >> 6;
 
-						skip &= 255;
+						skip &= 63;
 						do {
-							uint32_t w = read_le32(in + pos + 252);
+							uint32_t w = read_le32(in + pos + 60);
 							uint32_t hw = slz_hash(w);
 
 							if (sizeof(long) >= 8) {
 								uint64_t old = refs[hw].by64;
 
-								if ((uint32_t)(old >> 32) == w && (unsigned long)(pos + 251 - (uint32_t)old) < 32768) {
+								if ((uint32_t)(old >> 32) == w && (unsigned long)(pos + 59 - (uint32_t)old) < 32768) {
 									skip = 0;
 									break;
 								}
-								refs[hw].by64 = ((uint64_t)(pos + 252)) + ((uint64_t)w << 32);
+								refs[hw].by64 = ((uint64_t)(pos + 60)) + ((uint64_t)w << 32);
 							} else {
-								if (refs[hw].by32.word == w && (unsigned long)(pos + 251 - refs[hw].by32.pos) < 32768) {
+								if (refs[hw].by32.word == w && (unsigned long)(pos + 59 - refs[hw].by32.pos) < 32768) {
 									skip = 0;
 									break;
 								}
-								refs[hw].by32.pos = pos + 252;
+								refs[hw].by32.pos = pos + 60;
 								refs[hw].by32.word = w;
 							}
-							pos += 256;
-							rem -= 256;
-							plit += 256;
+							pos += 64;
+							rem -= 64;
+							plit += 64;
 						} while (--chunks);
 					}
 					pos += skip;
@@ -2203,7 +2205,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
  *   1: blind skip ramp from 64 to 8128 bytes, 1-byte backward match, debt
  *      charged per group of literals;
  *   2: same, with a probe every 64 skipped bytes;
- *   3: skip in 2048-byte steps up to 28 kB, with a probe every 256 skipped
+ *   3: skip in 2048-byte steps up to 28 kB, with a probe every 64 skipped
  *      bytes, 2-byte backward match, debt charged per literal.
  * The compression levels are made of:
  *   level 1: encoder level 1, fixed tree only;
