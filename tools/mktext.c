@@ -1,5 +1,5 @@
 /*
- * Builds the huffman tree used for text contents (SLZ_CT_TEXT).
+ * Builds the huffman tree used for text contents (SLZ_CT_TEXT in slz.c).
  *
  * The tree is described by its code lengths, one line per alphabet in a text
  * file: the 288 literal/length code lengths, then the 30 distance code
@@ -563,6 +563,17 @@ static void generate(const char *name)
 			bits = code = 0;
 		printf("%s0x%06x,", (i % 6) ? " " : "\n\t", (bits << 16) | code);
 	}
+	printf("\n};\n\n");
+
+	/* What the text tree would save on each literal over the fixed
+	 * tree, see copy_lit_huff_generic_auto() in slz.c.
+	 */
+	printf("/* number of bits the text tree would save on each literal over the fixed\n"
+	       " * tree, see SLZ_AUTO_IN.\n"
+	       " */\n");
+	printf("static const int8_t lit_tsave[256] = {");
+	for (i = 0; i < 256; i++)
+		printf("%s%d,", (i % 16) ? " " : "\n\t", (i < 144 ? 8 : 9) - llens[i]);
 	printf("\n};\n\n");
 
 	/* The distance tables are indexed by the 5-bit reversed fixed code

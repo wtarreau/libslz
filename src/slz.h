@@ -66,17 +66,16 @@ enum {
 	SLZ_FMT_DEFLATE, /* RFC1951: raw deflate, and no crc */
 };
 
-/* Content types, which select the huffman tree used to encode the data. The
- * default one uses the fixed tree from RFC1951. The text one uses a tree
- * trained on web contents (html, css, js, json, svg...), which saves about 15%
- * of the huffman-coded bits on such contents and still works on any text, at
- * the expense of a header of about 80 bytes each time a block is opened. It
- * is not suited to binary contents, and is not worth it below 1-2 kB. It is
- * set using slz_set_content_type().
+/* Content types, a hint about the data to compress, see
+ * slz_set_content_type(). They also name the huffman tree used to encode
+ * them: the fixed tree from RFC1951, and a tree trained on web contents
+ * (html, css, js, json, svg...), which saves about 15% of the huffman-coded
+ * bits on such contents and still works on any text, at the expense of a
+ * header of about 80 bytes each time a block is opened.
  */
 enum {
-	SLZ_CT_GENERIC = 0, /* default: fixed huffman tree */
-	SLZ_CT_TEXT,        /* text contents: tree trained on web contents */
+	SLZ_CT_GENERIC = 0, /* default: no hint; also the fixed huffman tree */
+	SLZ_CT_TEXT,        /* mostly text contents; also the text tree */
 };
 
 struct slz_stream {
@@ -93,7 +92,7 @@ struct slz_stream {
 	unsigned char *outbuf; /* set by encode() */
 	uint32_t qbits; /* number of bits in queue, < 8 on 32-bit, < 32 on 64-bit */
 	uint32_t state;   /* one of slz_state */
-	uint8_t unused:1; /* free for future use */
+	uint8_t cur_tree:1; /* SLZ_CT_*: tree of the current block, see SLZ_AUTO_IN in slz.c */
 	uint8_t content_type:1; /* SLZ_CT_*, see slz_set_content_type() */
 	uint8_t format:2; /* SLZ_FMT_* */
 	uint8_t level:4;  /* 0 = no compression, 1..15 = compression */
@@ -106,14 +105,16 @@ struct slz_stream {
 	                     */
 	uint32_t crc32;
 	uint32_t ilen;
+	int32_t tree_save;    /* bits the other tree would have saved, see SLZ_AUTO_IN */
+	uint32_t tree_switch; /* switch to the other tree after the next match */
 };
 
 /* Maximum number of bytes by which the encoder's output may exceed the same
  * data sent as stored blocks, which is the input plus 5 bytes per 65535. It
  * comes from the 9-bit literals of the fixed huffman encoding, or from the
- * literals and the block headers of the text content type, may be reached
- * within a single call, and has to be added to the output buffer size of each
- * call. It is checked against SLZ_MAX_DEBT at build time in slz.c.
+ * literals and the block headers of the text tree (levels 2 and above), may
+ * be reached within a single call, and has to be added to the output buffer
+ * size of each call. It is checked against SLZ_MAX_DEBT at build time in slz.c.
  */
 #define SLZ_MAX_DEBT_BYTES 40
 
@@ -248,14 +249,14 @@ static inline int slz_flush(struct slz_stream *strm, void *buf)
 	return ret;
 }
 
-/* Sets the content type of stream <strm> to <type>, one of SLZ_CT_*, which
- * selects the huffman tree used to encode the next blocks. It is meant to be
- * called right after one of the init functions, which reset it to
- * SLZ_CT_GENERIC. It may also be called later, but only works when no block
- * is open, which is not guaranteed even after a flush since a flush doesn't
- * close a block if the output is already aligned. It returns 0 on success, or
- * -1 if a block is still open or the type is unknown, in which case nothing
- * is changed.
+/* Hints that the contents compressed with stream <strm> are mostly text when
+ * <type> is SLZ_CT_TEXT, or removes the hint with SLZ_CT_GENERIC (the
+ * default). From level 2 on, the encoder chooses the huffman tree on the fly
+ * anyway, and starts with the text one. With the hint, level 1 works as
+ * level 2 so that it can use the text tree, and starts with it. It is meant
+ * to be called right after one of the init functions, which reset it to
+ * SLZ_CT_GENERIC. It returns 0 on success, or -1 if a block was already
+ * opened or the type is unknown, in which case nothing is changed.
  */
 static inline int slz_set_content_type(struct slz_stream *strm, int type)
 {
@@ -263,6 +264,10 @@ static inline int slz_set_content_type(struct slz_stream *strm, int type)
 	    strm->state == SLZ_ST_FIXED || strm->state == SLZ_ST_LAST)
 		return -1;
 	strm->content_type = type;
+	if (strm->level >= 2 || (strm->level && type == SLZ_CT_TEXT))
+		strm->cur_tree = SLZ_CT_TEXT;
+	else
+		strm->cur_tree = SLZ_CT_GENERIC;
 	return 0;
 }
 

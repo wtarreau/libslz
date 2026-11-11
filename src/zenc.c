@@ -82,7 +82,8 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    "  -p         pre-heat: fault the input (mmap mode) and output buffers in\n"
 	    "             before compressing, and keep the input mapped between loops\n"
 	    "  -t         test mode: do not emit anything\n"
-	    "  -T         optimize for text contents (html, css, js, json, ...)\n"
+	    "  -T         hint that the contents are mostly text (html, css, js, ...),\n"
+	    "             level 1 then works as level 2\n"
 	    "  -v         increase verbosity\n"
 	    "\n"
 	    "  -D         use raw Deflate output format (RFC1951)\n"
@@ -122,8 +123,8 @@ int main(int argc, char **argv)
 	int level   = 2;
 	int verbose = 0;
 	int test    = 0;
-	int ctype   = SLZ_CT_GENERIC;
 	int format  = SLZ_FMT_GZIP;
+	int ctype   = SLZ_CT_GENERIC;
 	int force   = 0;
 	int fd = 0;
 	int error = 0;
