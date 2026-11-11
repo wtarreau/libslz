@@ -83,7 +83,7 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    "             before compressing, and keep the input mapped between loops\n"
 	    "  -t         test mode: do not emit anything\n"
 	    "  -T         hint that the contents are mostly text (html, css, js, ...),\n"
-	    "             level 1 then works as level 2\n"
+	    "             levels 1 and 2 then work as level 3\n"
 	    "  -v         increase verbosity\n"
 	    "\n"
 	    "  -D         use raw Deflate output format (RFC1951)\n"

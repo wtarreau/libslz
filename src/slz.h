@@ -252,9 +252,10 @@ static inline int slz_flush(struct slz_stream *strm, void *buf)
 /* Hints that the contents compressed with stream <strm> are mostly text when
  * <type> is SLZ_CT_TEXT, or removes the hint with SLZ_CT_GENERIC (the
  * default). From level 2 on, the encoder chooses the huffman tree on the fly
- * anyway, and starts with the text one. With the hint, level 1 works as
- * level 2 so that it can use the text tree, and starts with it. It is meant
- * to be called right after one of the init functions, which reset it to
+ * anyway, and starts with the text one. With the hint, levels 1 and 2 work
+ * as level 3, whose accounting of the references finds text with few
+ * literals, and level 1 starts with the text tree as well. It is meant to be
+ * called right after one of the init functions, which reset it to
  * SLZ_CT_GENERIC. It returns 0 on success, or -1 if a block was already
  * opened or the type is unknown, in which case nothing is changed.
  */

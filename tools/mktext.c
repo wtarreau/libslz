@@ -576,6 +576,37 @@ static void generate(const char *name)
 		printf("%s%d,", (i % 16) ? " " : "\n\t", (i < 144 ? 8 : 9) - llens[i]);
 	printf("\n};\n\n");
 
+	/* the same for the lengths, and for the distances, which only differ
+	 * by the code's length (the extra bits are the same), indexed by the
+	 * reversed 5-bit fixed code.
+	 */
+	{
+		int flens[NLIT];
+
+		for (i = 0; i < NLIT; i++)
+			flens[i] = i < 144 ? 8 : i < 256 ? 9 : i < 280 ? 7 : 8;
+		printf("/* number of bits the text tree would save on each match length, and on\n"
+		       " * each distance, indexed by the reversed 5-bit fixed code found in bits 5-9\n"
+		       " * of fh_dist_table[], see SLZ_AUTO_IN.\n"
+		       " */\n");
+		printf("static const int8_t len_tsave[259] = {\n\t0, 0, 0,");
+		for (i = 3; i < 259; i++) {
+			int c = 0;
+
+			while (c < 28 && len_base[c + 1] <= i)
+				c++;
+			printf("%s%d,", (i % 16) ? " " : "\n\t", flens[257 + c] - llens[257 + c]);
+		}
+		printf("\n};\n\n");
+		printf("static const int8_t dist_tsave[32] = {");
+		for (i = 0; i < 32; i++) {
+			int c = rev(i, 5);
+
+			printf("%s%d,", (i % 16) ? " " : "\n\t", c < NDIST ? 5 - dlens[c] : 0);
+		}
+		printf("\n};\n\n");
+	}
+
 	/* The distance tables are indexed by the 5-bit reversed fixed code
 	 * found in fh_dist_table[], see text_dist() in slz.c.
 	 */

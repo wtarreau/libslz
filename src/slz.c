@@ -590,6 +590,12 @@ static inline void copy_32b(struct slz_stream *__restrict strm, uint32_t x)
  *   - the fixed tree's literals sent in a huffman block add what the text
  *     tree would have saved on them, computed by the out-of-line function
  *     that sends them, and its stored blocks reset it (binary data);
+ *   - from level 3, the fixed tree's references add what the text tree
+ *     would have saved on their length and distance codes (len_tsave[] and
+ *     dist_tsave[]). On text with few literals, such as C headers made of
+ *     #defines, that's where nearly all of its savings are, which the
+ *     literals alone take too long to notice, if ever. It costs 0.2 to 1%
+ *     of speed for 0.02 to 0.8% of output, hence not at level 2;
  *   - the text tree's literals add their <lit_excess>, known when they are
  *     sent, i.e. as if the fixed tree took 8 bits for each of them, whether
  *     they are sent in a huffman block or in a stored one.
@@ -1703,6 +1709,20 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 			enqueue24(strm, dist >> 5, dist & 0x1f);
 #endif
 
+			/* from level 3, what the text tree would save on this
+			 * reference, see SLZ_AUTO_IN.
+			 */
+			if (auto_tree && level >= 2) {
+				int32_t save = strm->tree_save + len_tsave[mlen] + dist_tsave[(dist >> 5) & 31];
+
+				save = save < 0 ? 0 : save;
+				if (__builtin_expect(save > SLZ_AUTO_IN, 0)) {
+					strm->tree_switch = 1;
+					save = 0;
+				}
+				strm->tree_save = save;
+			}
+
 			/* The reference just used (code>>16)+(dist&0x1f) bits in place
 			 * of the 8*mlen bits these bytes would have taken as literals,
 			 * so it saves that much on the balance, which is saturated at
@@ -2220,9 +2240,11 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, 
 {
 	int level = strm->level;
 
-	/* mostly text: level 1 works as level 2, see slz_set_content_type() */
-	if (strm->content_type == SLZ_CT_TEXT && level == 1)
-		level = 2;
+	/* mostly text: levels 1 and 2 work as level 3, see
+	 * slz_set_content_type().
+	 */
+	if (strm->content_type == SLZ_CT_TEXT && level && level < 3)
+		level = 3;
 
 	if (level <= 1)
 		return _slz_rfc1951_encode_lev1(strm, out, in, ilen, more);
