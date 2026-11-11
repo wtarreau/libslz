@@ -1,0 +1,47 @@
+--- a/src/slz-enc.h
++++ b/src/slz-enc.h
+@@ -342,33 +342,33 @@
+ 				 * a false hit. Rewinding to the 2048 boundary instead showed almost no
+ 				 * size gains but was 0.3-0.8% slower.
+ 				 */
+-				if (skip >= 256) {
+-					long chunks = skip >> 8;
++				if (skip >= 64) {
++					long chunks = skip >> 6;
+ 
+-					skip &= 255;
++					skip &= 63;
+ 					do {
+-						uint32_t w = read_le32(in + pos + 252);
++						uint32_t w = read_le32(in + pos + 60);
+ 						uint32_t hw = slz_hash(w);
+ 
+ 						if (sizeof(long) >= 8) {
+ 							uint64_t old = refs[hw].by64;
+ 
+-							if ((uint32_t)(old >> 32) == w && (unsigned long)(pos + 251 - (uint32_t)old) < 32768) {
++							if ((uint32_t)(old >> 32) == w && (unsigned long)(pos + 59 - (uint32_t)old) < 32768) {
+ 								skip = 0;
+ 								break;
+ 							}
+-							refs[hw].by64 = ((uint64_t)(pos + 252)) + ((uint64_t)w << 32);
++							refs[hw].by64 = ((uint64_t)(pos + 60)) + ((uint64_t)w << 32);
+ 						} else {
+-							if (refs[hw].by32.word == w && (unsigned long)(pos + 251 - refs[hw].by32.pos) < 32768) {
++							if (refs[hw].by32.word == w && (unsigned long)(pos + 59 - refs[hw].by32.pos) < 32768) {
+ 								skip = 0;
+ 								break;
+ 							}
+-							refs[hw].by32.pos = pos + 252;
++							refs[hw].by32.pos = pos + 60;
+ 							refs[hw].by32.word = w;
+ 						}
+-						pos += 256;
+-						rem -= 256;
+-						plit += 256;
++						pos += 64;
++						rem -= 64;
++						plit += 64;
+ 					} while (--chunks);
+ 				}
+ 				pos += skip;

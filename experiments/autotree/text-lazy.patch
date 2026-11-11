@@ -1,0 +1,159 @@
+diff --git a/src/slz-enc.h b/src/slz-enc.h
+index 72c54ac..e9f9d09 100644
+--- a/src/slz-enc.h
++++ b/src/slz-enc.h
+@@ -69,6 +69,9 @@ long SLZ_ENC_FUNC(struct slz_stream *__restrict strm, unsigned char *out, const
+ #if SLZ_ENC_AUTO
+ 	long rem = ilen - start;
+ 	unsigned long pos = start;
++# if SLZ_TEXT_LAZY
++	unsigned long lacc = start; /* text: literals before it are in <lit_excess> */
++# endif
+ #else
+ 	long rem = ilen;
+ 	unsigned long pos = 0;
+@@ -189,8 +192,11 @@ long SLZ_ENC_FUNC(struct slz_stream *__restrict strm, unsigned char *out, const
+ 			 * bits the pending literals cost over 8 bits each, as a
+ 			 * signed value.
+ 			 */
+-			if (ctype == SLZ_CT_TEXT)
++			if (ctype == SLZ_CT_TEXT) {
++#if !(SLZ_ENC_AUTO && SLZ_TEXT_LAZY)
+ 				lit_excess += (text_huff[(unsigned char)word] & 15) - 8;
++#endif
++			}
+ 			else if (level >= 4) // levels 1-3 charge whole groups, see SLZ_MAX_DEBT
+ 				bal += ((unsigned char)word >= 144);
+ 			pos++;
+@@ -356,7 +362,11 @@ long SLZ_ENC_FUNC(struct slz_stream *__restrict strm, unsigned char *out, const
+ 				 */
+ 				if (__builtin_expect(ctype == SLZ_CT_TEXT ? !(plit & 63) : plit == 0xffc0, 0)) {
+ 					if (ctype == SLZ_CT_TEXT && plit != 0xffc0) {
++#if SLZ_TEXT_LAZY
++						if (high_bytes64(in + pos - 64) >= SLZ_TEXT_LAZY) {
++#else
+ 						if ((int32_t)lit_excess >= (int32_t)plit) {
++#endif
+ 							pos -= plit;
+ 							goto auto_switch;
+ 						}
+@@ -370,6 +380,9 @@ long SLZ_ENC_FUNC(struct slz_stream *__restrict strm, unsigned char *out, const
+ 					/* the text tree's <lit_excess> may be negative */
+ 					if (ctype == SLZ_CT_TEXT) {
+ 						lit_excess = 0;
++#if SLZ_ENC_AUTO && SLZ_TEXT_LAZY
++						lacc = pos;
++#endif
+ 						nvref = vplit = 0;
+ 					}
+ 					else
+@@ -395,6 +408,11 @@ long SLZ_ENC_FUNC(struct slz_stream *__restrict strm, unsigned char *out, const
+ 		 * block, a short match is not worth splitting it.
+ 		 */
+ 		if (ctype == SLZ_CT_TEXT) {
++#if SLZ_ENC_AUTO && SLZ_TEXT_LAZY
++			/* count the literals not counted yet */
++			lit_excess += text_excess(in + lacc, pos - lacc);
++			lacc = pos;
++#endif
+ 			if (text_lit_stored(strm, lit_excess) && mlen < 6)
+ 				goto send_as_lit;
+ 		}
+@@ -503,6 +521,9 @@ long SLZ_ENC_FUNC(struct slz_stream *__restrict strm, unsigned char *out, const
+ 					lit_excess += (dist & 0x1f) + (code >> 16) - 8 * (uint32_t)mlen;
+ 					plit += mlen;
+ 					vplit = plit;
++#if SLZ_ENC_AUTO && SLZ_TEXT_LAZY
++					lacc = pos + mlen;
++#endif
+ 					goto skip_ref;
+ 				}
+ 			}
+@@ -610,6 +631,9 @@ long SLZ_ENC_FUNC(struct slz_stream *__restrict strm, unsigned char *out, const
+ 
+ 					for (i = 0; i < back; i++)
+ 						lit_excess -= (text_huff[in[pos + i]] & 15) - 8;
++#if SLZ_ENC_AUTO && SLZ_TEXT_LAZY
++					lacc = pos;
++#endif
+ 				}
+ 			}
+ 		}
+@@ -698,6 +722,9 @@ long SLZ_ENC_FUNC(struct slz_stream *__restrict strm, unsigned char *out, const
+ 			code = strm->text_debt + (code >> 16) + (dist & 0x1f);
+ 			strm->text_debt = (code > 8 * (uint32_t)mlen) ? code - 8 * (uint32_t)mlen : 0;
+ 			lit_excess = 0;
++#if SLZ_ENC_AUTO && SLZ_TEXT_LAZY
++			lacc = pos + mlen;
++#endif
+ 		} else {
+ 			code = bal + (code >> 16) + (dist & 0x1f);
+ 			bal = (code > 8 * (uint32_t)mlen) ? code - 8 * (uint32_t)mlen : 0;
+@@ -746,12 +773,21 @@ long SLZ_ENC_FUNC(struct slz_stream *__restrict strm, unsigned char *out, const
+ 		/* we're reading the 1..3 last bytes */
+ 		plit += rem;
+ 		do {
+-			if (ctype == SLZ_CT_TEXT)
++			if (ctype == SLZ_CT_TEXT) {
++#if SLZ_ENC_AUTO && SLZ_TEXT_LAZY
++				pos++;
++#else
+ 				lit_excess += (text_huff[in[pos++]] & 15) - 8;
++#endif
++			}
+ 			else
+ 				bal += ((unsigned char)in[pos++] >= 144);
+ 		} while (--rem);
+ 	}
++#if SLZ_ENC_AUTO && SLZ_TEXT_LAZY
++	if (ctype == SLZ_CT_TEXT)
++		lit_excess += text_excess(in + lacc, pos - lacc);
++#endif
+ 
+ 	/* Now copy remaining literals or mark the end. The cost of switching to
+ 	 * a stored block depends on the current state and on the presence of
+diff --git a/src/slz.c b/src/slz.c
+index 210f2ab..b8d98d1 100644
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -1126,6 +1126,40 @@ static inline int text_lit_stored(const struct slz_stream *strm, int32_t excess)
+ 	        (int32_t)strm->text_debt + excess >= SLZ_TEXT_MAX_DEBT);
+ }
+ 
++/* Experimental: SLZ_TEXT_LAZY makes the text tree's encoder of levels 3 and
++ * above count <lit_excess> at each match from the literals not counted yet
++ * instead of one at a time, and check for binary data every 64 literals by
++ * the number of bytes >= 0x80 among them, at least SLZ_TEXT_LAZY.
++ */
++#ifndef SLZ_TEXT_LAZY
++# define SLZ_TEXT_LAZY 0
++#endif
++
++/* returns the cost of the <n> bytes at <p> with the text tree, relative to 8
++ * bits each.
++ */
++static inline int32_t text_excess(const unsigned char *p, unsigned long n)
++{
++	int32_t x = 0;
++
++	while (n--)
++		x += (int32_t)(text_huff[*p++] & 15) - 8;
++	return x;
++}
++
++/* returns the number of bytes >= 0x80 among the 64 at <p> */
++static inline uint32_t high_bytes64(const unsigned char *p)
++{
++	uint64_t a = 0, w;
++	int i;
++
++	for (i = 0; i < 64; i += 8) {
++		memcpy(&w, p + i, 8);
++		a += (w >> 7) & 0x0101010101010101ULL;
++	}
++	return (a * 0x0101010101010101ULL) >> 56;
++}
++
+ /* the encoder itself, see slz-enc.h */
+ #define SLZ_ENC_AUTO 0
+ #define SLZ_ENC_FUNC _slz_rfc1951_encode

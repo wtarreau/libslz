@@ -1,0 +1,22 @@
+--- a/src/slz-enc.h	2026-11-11 14:41:12.867963016 +0100
++++ b/src/slz-enc.h	2026-11-11 16:14:49.938096407 +0100
+@@ -742,6 +742,19 @@
+ 			strm->text_debt = (code > 8 * (uint32_t)mlen) ? code - 8 * (uint32_t)mlen : 0;
+ 			lit_excess = 0;
+ 		} else {
++#if SLZ_ENC_AUTO
++			{
++				int32_t t = strm->tree_save + (int32_t)(code >> 16) - (int32_t)(text_len[mlen] >> 16) +
++					(int32_t)(dist & 0x1f) - (int32_t)(text_dist_table[pos - last - 1] & 0x1f);
++				if (t < 0)
++					t = 0;
++				if (t > SLZ_AUTO_IN) {
++					strm->tree_switch = 1;
++					t = 0;
++				}
++				strm->tree_save = t;
++			}
++#endif
+ 			code = bal + (code >> 16) + (dist & 0x1f);
+ 			bal = (code > 8 * (uint32_t)mlen) ? code - 8 * (uint32_t)mlen : 0;
+ 			strm->debt = bal;

@@ -1,0 +1,20 @@
+--- a/src/slz.c	2026-11-11 13:37:08.397964082 +0100
++++ b/src/slz.c	2026-11-11 13:33:47.098645789 +0100
+@@ -599,7 +599,7 @@
+  * switch at once: this is binary data, which the fixed tree's encoder can
+  * skip and processes again from the first of them.
+  */
+-#define SLZ_AUTO_IN   1280
++#define SLZ_AUTO_IN   2560
+ #define SLZ_AUTO_OUT   256
+ 
+ /* accounts <d> more bits that the other tree would have saved on literals
+@@ -864,7 +864,7 @@
+ 		int32_t d = 0;
+ 
+ 		do {
+-			d += (int32_t)(fixed_huff[buf[pos]] & 15) - (int32_t)(text_huff[buf[pos]] & 15);
++			d += (buf[pos] & 0x80) ? -4 : 3; /* half-bits */
+ 			send_huff(strm, buf[pos++], ctype);
+ 		} while (pos < len);
+ 		auto_account(strm, d, ctype);

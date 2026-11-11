@@ -1,0 +1,967 @@
+diff --git a/src/slz.c b/src/slz.c
+index eaf1e30..f15c31a 100644
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -28,6 +28,31 @@
+ #include "slz-prv.h"
+ #include "tables.h"
+ 
++/* Debugging aid for the skip studies (experiments/statskip): with
++ * -DSLZ_TRACE, writes one 16-byte record per event to fd 3: a type ('M' for
++ * a match, 'S' for a skip step), the absolute input position (64 bits),
++ * and a length (32 bits): the match length in bits 0-15 and the number of
++ * bits of its distance code in bits 16-20, or the number of bytes skipped
++ * with bit 31 set when the skip was stopped by a hit.
++ */
++#ifdef SLZ_TRACE
++static void slz_trace(int type, unsigned long pos, uint32_t len)
++{
++	static FILE *f;
++	struct { uint32_t type, len; uint64_t pos; } rec = { type, len, pos };
++
++	if (!f)
++		f = fdopen(3, "w");
++	if (f)
++		fwrite(&rec, sizeof(rec), 1, f);
++}
++# define SLZ_TRACE_EV(t, p, l) slz_trace(t, strm->ilen + (p), l)
++# define SLZ_TRACE_DO(x) x
++#else
++# define SLZ_TRACE_EV(t, p, l) do { } while (0)
++# define SLZ_TRACE_DO(x)
++#endif
++
+ /* if PRECOMPUTE_TABLES not set, then tables.h does not provide fh_dist_table
+  * nor text_dist_table as we need to recompute them.
+  */
+@@ -579,6 +604,60 @@ static inline void copy_32b(struct slz_stream *__restrict strm, uint32_t x)
+ 	strm->outbuf += 4;
+ }
+ 
++/* Experimental: SLZ_AUTO_TREE chooses the huffman tree on the fly, within
++ * a call, between the fixed one and the text one, unless the text tree was
++ * forced with slz_set_content_type(). The literals sent with a tree are
++ * compared to what the other tree would have cost them, and the difference
++ * is accumulated in <auto_save> (a CUSUM, never below zero). Literals sent
++ * as a stored block with the fixed tree reset it (binary data). With the text
++ * tree, the encoder accounts each group of literals with its <lit_excess>,
++ * i.e. as if the fixed tree took 8 bits for each, whether they are sent with
++ * the tree or as a stored block. Above
++ * SLZ_AUTO_IN bits (fixed -> text) or SLZ_AUTO_OUT bits (text -> fixed), the
++ * encoder switches after the next match: it closes the current block, and
++ * the encoder for the other tree, which shares the same reference table,
++ * continues from there. This is all done
++ * outside of the encoder's loop, in the functions that send the literals.
++ * SLZ_AUTO_TLEVEL forces the level of the text tree's encoder (0: same as
++ * the fixed one).
++ */
++#ifndef SLZ_AUTO_TREE
++# define SLZ_AUTO_TREE 0
++#endif
++#ifndef SLZ_AUTO_IN
++# define SLZ_AUTO_IN 1280
++#endif
++#ifndef SLZ_AUTO_OUT
++# define SLZ_AUTO_OUT 256
++#endif
++#ifndef SLZ_AUTO_TLEVEL
++# define SLZ_AUTO_TLEVEL 0
++#endif
++
++#if SLZ_AUTO_TREE
++/* accounts <d> more bits that the other tree would have saved on literals
++ * sent with <ctype>, and requests a switch past the threshold.
++ */
++static inline void auto_account(struct slz_stream *__restrict strm, int32_t d, int ctype)
++{
++	int32_t s = strm->auto_save + d;
++
++	if (s < 0)
++		s = 0;
++	if (s > (ctype == SLZ_CT_TEXT ? SLZ_AUTO_OUT : SLZ_AUTO_IN)) {
++		strm->auto_sw = 1;
++		s = 0;
++	}
++	strm->auto_save = s;
++}
++
++/* bits saved by the text tree over the fixed one on byte <c> */
++static inline int32_t auto_tdelta(unsigned char c)
++{
++	return (int32_t)(fixed_huff[c] & 15) - (int32_t)(text_huff[c] & 15);
++}
++#endif
++
+ /* Everything below that depends on the huffman tree takes a <ctype> argument
+  * (SLZ_CT_*), that must be a constant in the encoder, so that each of its
+  * specialisations only contains the code for its own tree and names the
+@@ -655,6 +734,13 @@ static inline uint32_t len_code(long mlen, int ctype)
+ static inline __attribute__((always_inline))
+ void _copy_lit_small(struct slz_stream *__restrict strm, const void *buf, uint32_t len, int more, int ctype)
+ {
++#if SLZ_AUTO_TREE
++	/* stored literals with the fixed tree: binary data. With the text
++	 * tree, the encoder accounts them itself.
++	 */
++	if (ctype == SLZ_CT_GENERIC && strm->unused)
++		strm->auto_save = 0;
++#endif
+ 	if (ctype == SLZ_CT_TEXT) {
+ 		/* same as below with the text tree's EOB, which is not
+ 		 * zero: 3 to 21 bits.
+@@ -723,6 +809,10 @@ void _copy_lit(struct slz_stream *__restrict strm, const void *buf, uint32_t len
+ 
+ 	if (len <= 65535)
+ 		return copy_lit_small(strm, buf, len, more, ctype);
++#if SLZ_AUTO_TREE
++	if (strm->unused)
++		strm->auto_save = 0;
++#endif
+ 
+ 	if (strm->state != SLZ_ST_EOB)
+ 		send_eob(strm, ctype);
+@@ -795,6 +885,18 @@ void _copy_lit_huff(struct slz_stream *__restrict strm, const unsigned char *buf
+ 	}
+ 
+ 	pos = 0;
++#if SLZ_AUTO_TREE
++	if (ctype == SLZ_CT_GENERIC && strm->unused) {
++		int32_t d = 0;
++
++		do {
++			d += auto_tdelta(buf[pos]);
++			send_huff(strm, buf[pos++], ctype);
++		} while (pos < len);
++		auto_account(strm, d, ctype);
++		return;
++	}
++#endif
+ 	do {
+ 		send_huff(strm, buf[pos++], ctype);
+ 	} while (pos < len);
+@@ -840,6 +942,219 @@ static void reset_refs(union ref *refs, long count)
+ 	memset(refs, 0xFE, count);
+ }
+ 
++/* Experimental (experiments/statskip): SLZ_STAT_SKIP makes the literal skip of
++ * levels 1 and 2 depend on statistics of the 64 bytes just scanned, so that it
++ * only engages on random-looking data. Bits:
++ *   1: level 1: a skip step is only taken when the chunk looks random;
++ *   2: no ramp: when it looks random, the step is immediately the largest
++ *      one (levels 1 and 2);
++ *   4: level 1: each 64-byte chunk of a step is checked too, and the step
++ *      stops on the first one that doesn't look random;
++ *   8: level 2: same as 1. Without it, level 2 keeps its usual skip on
++ *      chunks that don't look random.
++ *  16: Willy's byte mode (levels 1 and 2), replacing all of the above: once
++ *      64 literals are pending, the following bytes are walked one by one
++ *      without any lookup, feeding avg = avg - (avg + 255) / 256 + x
++ *      (preset to 128 * 256) and mad = mad - (mad + 255) / 256 + |x - avg/256|
++ *      (preset to 64 * 256, the mean absolute deviation of random bytes).
++ *      The walk stops as soon as avg leaves 128 +/- SLZ_STAT_T or mad falls
++ *      below SLZ_STAT_M, and the main loop resumes SLZ_STAT_LAG bytes before
++ *      that point, since the averages take a few tens of bytes to react. The
++ *      bytes walked over are sent as literals (stored block).
++ *  64: with 16, the walk reads 8 bytes at a time, feeding their sum to the
++ *      average with 1/32 per step (same steady state), and ignores mad.
++ * 128: change detection in the skip steps of levels 1 and 2, see
++ *      slz_chunk_changed() (not with 16).
++ *  32: with 16, also on the text tree, where the walked bytes are charged
++ *      their exact cost in <lit_excess>, so that the usual decision sends
++ *      them in a stored block when they are not text.
++ * SLZ_STAT_FN picks the test:
++ *   1: mean within 128 +/- 16 (SWAR sum);
++ *   2: at least 52 distinct byte values;
++ *   3: mean within 128 +/- 16 and at most 2 bytes equal to the one 1, 2 or
++ *      4 positions before;
++ *   4: Willy's moving average avg = avg - avg/256 + x fed with the checked
++ *      chunks, within 128 +/- 8.
++ */
++#ifndef SLZ_STAT_SKIP
++# define SLZ_STAT_SKIP 0
++#endif
++#ifndef SLZ_STAT_FN
++# define SLZ_STAT_FN 1
++#endif
++#ifndef SLZ_STAT_T
++# define SLZ_STAT_T 16
++#endif
++#ifndef SLZ_STAT_M
++# define SLZ_STAT_M 48
++#endif
++#ifndef SLZ_STAT_LAG
++# define SLZ_STAT_LAG 64
++#endif
++/* time constant of the byte mode's averages: 1 << SLZ_STAT_SHIFT samples
++ * (8 = 256 as in Willy's formula, 6 = 64). The 8-byte walk needs >= 3.
++ */
++#ifndef SLZ_STAT_SHIFT
++# define SLZ_STAT_SHIFT 8
++#endif
++
++/* SLZ_STAT_SKIP & 128 (levels 1 and 2): change detection. Each 64-byte chunk
++ * of a skip step is summarized by the sum of its bytes and the number of
++ * bytes >= 0x80, and compared with a running reference of the chunks before
++ * it (preset from the last 64 bytes scanned, then ref = ref - ref/4 + cur).
++ * When the mean differs by more than SLZ_CHG_M or the count by more than
++ * SLZ_CHG_H, the data changed type: the step stops at the start of that
++ * chunk and the ramp restarts from zero. Level 1 gets a chunk loop for it,
++ * level 2 adds it to its probes.
++ */
++#ifndef SLZ_CHG_M
++# define SLZ_CHG_M 24
++#endif
++#ifndef SLZ_CHG_H
++# define SLZ_CHG_H 12
++#endif
++/* 1 = keep the ramp after a change instead of restarting it */
++#ifndef SLZ_CHG_KEEP
++# define SLZ_CHG_KEEP 0
++#endif
++
++#if SLZ_STAT_SKIP & 128
++static inline void slz_chunk_stats(const unsigned char *p, uint32_t *sum, uint32_t *hib)
++{
++	uint64_t a = 0;
++	uint32_t h = 0;
++	int i;
++
++	for (i = 0; i < 64; i += 8) {
++		uint64_t w;
++
++		memcpy(&w, p + i, 8);
++		a += (w & 0x00ff00ff00ff00ffULL) + ((w >> 8) & 0x00ff00ff00ff00ffULL);
++		h += __builtin_popcountll(w & 0x8080808080808080ULL);
++	}
++	*sum = (a * 0x0001000100010001ULL) >> 48;
++	*hib = h;
++}
++
++/* returns non-zero if the chunk at <p> differs from the reference, otherwise
++ * updates the reference.
++ */
++static inline int slz_chunk_changed(const unsigned char *p, uint32_t *rs, uint32_t *rh)
++{
++	uint32_t cs, ch;
++	int32_t ds, dh;
++
++	slz_chunk_stats(p, &cs, &ch);
++	ds = (int32_t)(4 * cs) - (int32_t)*rs;
++	dh = (int32_t)(4 * ch) - (int32_t)*rh;
++	if ((ds < 0 ? -ds : ds) > 4 * 64 * SLZ_CHG_M || (dh < 0 ? -dh : dh) > 4 * SLZ_CHG_H)
++		return 1;
++	*rs += cs - *rs / 4;
++	*rh += ch - *rh / 4;
++	return 0;
++}
++#endif
++
++/* SLZ_SKIP_PLIT: derive the skip ramp of levels 1 and 2 from <plit> instead
++ * of keeping <skip_ratio>, which is then neither kept nor reset on matches.
++ * SLZ_SKIP_PLIT=2 does the same at level 3 with its own ramp.
++ * SLZ_SKIP_OOL: implies SLZ_SKIP_PLIT, and moves the skip step (the probes
++ * of level 2) to slz_skip_step(), out of the encoder's loop.
++ */
++#ifndef SLZ_SKIP_OOL
++# define SLZ_SKIP_OOL 0
++#endif
++#ifndef SLZ_SKIP_PLIT
++# define SLZ_SKIP_PLIT SLZ_SKIP_OOL
++#endif
++
++#if SLZ_SKIP_OOL
++/* Skips up to <skip> bytes at <pos> (a multiple of 64 unless limited by the
++ * end), probing and indexing the last word of each 64-byte chunk at level 2
++ * and stopping at the start of the first chunk whose word is already in the
++ * window. Returns the number of bytes skipped.
++ */
++static __attribute__((noinline))
++long slz_skip_step(union ref *refs, const unsigned char *in, unsigned long pos, long skip, int level)
++{
++	unsigned long start = pos;
++	long chunks;
++
++	if (level != 2 || skip < 64)
++		return skip;
++
++	chunks = skip >> 6;
++	do {
++		uint32_t w = read_le32(in + pos + 60);
++		uint32_t hw = slz_hash(w);
++
++		if (sizeof(long) >= 8) {
++			uint64_t old = refs[hw].by64;
++
++			if ((uint32_t)(old >> 32) == w && (unsigned long)(pos + 59 - (uint32_t)old) < 32768)
++				return pos - start;
++			refs[hw].by64 = ((uint64_t)(pos + 60)) + ((uint64_t)w << 32);
++		} else {
++			if (refs[hw].by32.word == w && (unsigned long)(pos + 59 - refs[hw].by32.pos) < 32768)
++				return pos - start;
++			refs[hw].by32.pos = pos + 60;
++			refs[hw].by32.word = w;
++		}
++		pos += 64;
++	} while (--chunks);
++	return pos - start + (skip & 63);
++}
++#endif
++
++#if SLZ_STAT_SKIP
++static inline int slz_looks_random(const unsigned char *p, uint32_t *ewma)
++{
++#if SLZ_STAT_FN == 1 || SLZ_STAT_FN == 3
++	uint64_t a = 0, z = 0;
++	int i;
++
++	for (i = 0; i < 64; i += 8) {
++		uint64_t w;
++
++		memcpy(&w, p + i, 8);
++		a += (w & 0x00ff00ff00ff00ffULL) + ((w >> 8) & 0x00ff00ff00ff00ffULL);
++#if SLZ_STAT_FN == 3
++		{
++			uint64_t v1 = w ^ (w >> 8), v2 = w ^ (w >> 16), v4 = w ^ (w >> 32);
++			const uint64_t o = 0x0101010101010101ULL, h = 0x8080808080808080ULL;
++
++			z += __builtin_popcountll(((v1 - o) & ~v1 & h) & 0x0080808080808080ULL);
++			z += __builtin_popcountll(((v2 - o) & ~v2 & h) & 0x0000808080808080ULL);
++			z += __builtin_popcountll(((v4 - o) & ~v4 & h) & 0x0000000080808080ULL);
++		}
++#endif
++	}
++	a = (a * 0x0001000100010001ULL) >> 48;
++	(void)ewma;
++	return (a - (8160 - 1024)) <= 2048 && z <= 2;
++#elif SLZ_STAT_FN == 2
++	uint64_t m[4] = { 0, 0, 0, 0 };
++	int i;
++
++	(void)ewma;
++	for (i = 0; i < 64; i++)
++		m[p[i] >> 6] |= 1ULL << (p[i] & 63);
++	return __builtin_popcountll(m[0]) + __builtin_popcountll(m[1]) +
++	       __builtin_popcountll(m[2]) + __builtin_popcountll(m[3]) >= 52;
++#else
++	uint32_t e = *ewma;
++	int i;
++
++	for (i = 0; i < 64; i++)
++		e = e - ((e + 255) >> 8) + p[i];
++	*ewma = e;
++	/* e converges to about 256 * mean */
++	return (uint32_t)(e - (128 - 8) * 256) <= 16 * 256;
++#endif
++}
++#endif
++
++
+ /* Inserts position <p> of input buffer <in> into the reference table <refs>.
+  * Reads the 4 bytes at in[p], so the caller must guarantee that in[p + 3] is
+  * within the input buffer.
+@@ -1069,10 +1384,20 @@ static inline int text_lit_stored(const struct slz_stream *strm, int32_t excess)
+  * unaligned, short memcpy() calls must not be translated to AVX512 code.
+  */
+ static inline __attribute__((always_inline))
+-long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more, int level, int ctype)
++long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more, int level, int ctype
++#if SLZ_AUTO_TREE
++			 , unsigned long start, union ref *refs
++#endif
++			 )
+ {
++#if SLZ_AUTO_TREE
++	/* see _slz_auto_encode() */
++	long rem = ilen - start;
++	unsigned long pos = start;
++#else
+ 	long rem = ilen;
+ 	unsigned long pos = 0;
++#endif
+ 	unsigned long last;
+ 	const unsigned char *lastp;
+ 	uint32_t word = 0;
+@@ -1082,6 +1407,12 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 
+ #if SLZ_LITERAL_SKIP
+ 	long skip_ratio = 0;
++# if SLZ_SKIP_PLIT >= 2
++	(void)skip_ratio; /* only for some SLZ_STAT_SKIP variants */
++# endif
++#endif
++#if (SLZ_STAT_SKIP & 15) && !(SLZ_STAT_SKIP & 16)
++	uint32_t ewma = 128 * 256;
+ #endif
+ 	uint32_t plit = 0;
+ 	uint32_t bal; /* see SLZ_MAX_DEBT, generic tree only */
+@@ -1091,6 +1422,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 	uint32_t vplit = 0;      /* text tree only, <plit> after the last recorded reference */
+ 	struct text_vref vref[SLZ_TEXT_VREFS];
+ 	uint32_t dist, code;
++#if !SLZ_AUTO_TREE
+ 	union ref refs[1 << SLZ_HASH_BITS];
+ 
+ 	if (__builtin_expect(!strm->level, 0)) {
+@@ -1102,9 +1434,12 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 	}
+ 
+ 	reset_refs(refs, sizeof(refs));
++#endif
+ 	bal = strm->debt;
+ 
++#if !SLZ_AUTO_TREE
+ 	strm->outbuf = out;
++#endif
+ 
+ #ifndef UNALIGNED_FASTER
+  reload_word:
+@@ -1213,9 +1548,110 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 			/* never on text, where it would be too expensive to
+ 			 * leave the huffman block for so few literals.
+ 			 */
+-			if (ctype == SLZ_CT_GENERIC && level <= 2 && !(plit & 63)) {
++#if SLZ_STAT_SKIP & 16
++			if (((ctype == SLZ_CT_GENERIC && level <= 2) ||
++			     ((SLZ_STAT_SKIP & 32) && ctype == SLZ_CT_TEXT && plit < 0xffc0)) && !(plit & 63)) {
++				uint32_t avg = 128 << SLZ_STAT_SHIFT, mad = 64 << SLZ_STAT_SHIFT;
++				unsigned long p = pos, end = pos + rem;
++
++				/* the text tree flushes its pending literals when
++				 * <plit> reaches 0xffc0, which must remain reachable.
++				 */
++				if (ctype == SLZ_CT_TEXT && end - pos > 0xffbf - plit)
++					end = pos + 0xffbf - plit;
++				SLZ_TRACE_DO(unsigned long tpos = pos; uint32_t thit = 0x80000000u;)
++
++#if SLZ_STAT_SKIP & 64
++				/* 8 bytes at a time: the same average fed with their
++				 * sum, with 1/32 per step instead of 1/256 per byte.
++				 */
++				while (p + 8 <= end) {
++					uint64_t w, a;
++
++					memcpy(&w, in + p, 8);
++					a = (w & 0x00ff00ff00ff00ffULL) + ((w >> 8) & 0x00ff00ff00ff00ffULL);
++					a = (a * 0x0001000100010001ULL) >> 48;
++					avg = avg - ((avg + (1 << (SLZ_STAT_SHIFT - 3)) - 1) >> (SLZ_STAT_SHIFT - 3)) + (uint32_t)a;
++					if ((uint32_t)(avg - ((128 - SLZ_STAT_T) << SLZ_STAT_SHIFT)) > (2 * SLZ_STAT_T << SLZ_STAT_SHIFT))
++						break;
++					p += 8;
++				}
++				(void)mad;
++				if (p + 8 > end)
++					p = end;
++#else
++				while (p < end) {
++					uint32_t x = in[p];
++					int32_t d;
++
++					avg = avg - ((avg + (1 << SLZ_STAT_SHIFT) - 1) >> SLZ_STAT_SHIFT) + x;
++					d = (int32_t)x - (int32_t)(avg >> SLZ_STAT_SHIFT);
++					mad = mad - ((mad + (1 << SLZ_STAT_SHIFT) - 1) >> SLZ_STAT_SHIFT) + (d < 0 ? -d : d);
++					if ((uint32_t)(avg - ((128 - SLZ_STAT_T) << SLZ_STAT_SHIFT)) > (2 * SLZ_STAT_T << SLZ_STAT_SHIFT) ||
++					    mad < (SLZ_STAT_M << SLZ_STAT_SHIFT))
++						break;
++					p++;
++				}
++#endif
++				if (p < end)
++					p = (p - pos > SLZ_STAT_LAG) ? p - SLZ_STAT_LAG : pos;
++				SLZ_TRACE_DO(if (p == end) thit = 0;)
++				rem -= p - pos;
++				plit += p - pos;
++				if (ctype == SLZ_CT_TEXT) {
++					/* keep the exact cost of the pending literals,
++					 * which decides whether they leave as a stored
++					 * block.
++					 */
++					while (pos < p)
++						lit_excess += (text_huff[in[pos++]] & 15) - 8;
++				}
++				pos = p;
++				SLZ_TRACE_EV('S', tpos, (pos - tpos) | thit);
++				/* skipped bytes may only leave as a stored block */
++				if (ctype != SLZ_CT_TEXT)
++					bal += SLZ_MAX_DEBT + SLZ_CREDIT;
++# ifndef UNALIGNED_FASTER
++				goto reload_word;
++# else
++				continue;
++# endif
++			}
++#elif SLZ_STAT_SKIP & 15
++			int rnd = 0;
++#endif
++#if SLZ_STAT_SKIP & 16
++			else
++#endif
++			if (ctype == SLZ_CT_GENERIC && level <= 2 && !(plit & 63)
++#if (SLZ_STAT_SKIP & 15) && !(SLZ_STAT_SKIP & 16)
++			    && ((rnd = slz_looks_random(in + pos - 64, &ewma)) ||
++			        !(level == 1 ? (SLZ_STAT_SKIP & 1) != 0 : (SLZ_STAT_SKIP & 8) != 0))
++#endif
++			    ) {
++#if (SLZ_STAT_SKIP & 2) && !(SLZ_STAT_SKIP & 16)
++				if (rnd && !skip_ratio)
++					skip_ratio = 127;
++#endif
++#if SLZ_SKIP_PLIT
++				/* same ramp derived from the literals pending since
++				 * the last match: 0, 64, 192, 448, ... up to 8128.
++				 */
++				long skip = plit - 64 > 8128 ? 8128 : plit - 64;
++				skip = rem >= skip ? skip : rem;
++				SLZ_TRACE_DO(unsigned long tpos = pos; uint32_t thit = 0;)
++#else
+ 				long skip = rem >= skip_ratio * 64 ? skip_ratio * 64 : rem; // 0,64,192,...,8128: keeps plit aligned
++				SLZ_TRACE_DO(unsigned long tpos = pos; uint32_t thit = 0;)
+ 				skip_ratio = (skip_ratio * 2 + 1) & 127; // capped exponential: 0,1,3,7,... and stays at 127
++#endif
++#if SLZ_SKIP_OOL
++				skip = slz_skip_step(refs, in, pos, skip, level);
++				pos += skip;
++				rem -= skip;
++				plit += skip;
++				skip = 0;
++#endif
+ 				/* Level 2 still looks up and indexes the last word of
+ 				 * each whole 64-byte chunk it skips, and stops skipping
+ 				 * on the first one already present within the window,
+@@ -1228,11 +1664,63 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 				 * skip steps are 64 bytes apart, <plit> remains aligned
+ 				 * on them.
+ 				 */
+-				if (level == 2 && skip >= 64) {
++#if SLZ_STAT_SKIP & 4
++				if (level == 1 && skip >= 64) {
+ 					long chunks = skip >> 6;
+ 
+ 					skip &= 63;
+ 					do {
++						if (!slz_looks_random(in + pos, &ewma)) {
++							skip = 0;
++							SLZ_TRACE_DO(thit = 0x80000000u;)
++							break;
++						}
++						pos += 64;
++						rem -= 64;
++						plit += 64;
++					} while (--chunks);
++				}
++#endif
++#if SLZ_STAT_SKIP & 128
++				uint32_t crs, crh;
++
++				if (skip >= 64) {
++					slz_chunk_stats(in + pos - 64, &crs, &crh);
++					crs *= 4;
++					crh *= 4;
++				}
++				if (level == 1 && skip >= 64) {
++					long chunks = skip >> 6;
++
++					skip &= 63;
++					do {
++						if (slz_chunk_changed(in + pos, &crs, &crh)) {
++							skip = 0;
++							if (!SLZ_CHG_KEEP)
++								skip_ratio = 0;
++							SLZ_TRACE_DO(thit = 0x80000000u;)
++							break;
++						}
++						pos += 64;
++						rem -= 64;
++						plit += 64;
++					} while (--chunks);
++				}
++#endif
++				if (!SLZ_SKIP_OOL && level == 2 && skip >= 64) {
++					long chunks = skip >> 6;
++
++					skip &= 63;
++					do {
++#if SLZ_STAT_SKIP & 128
++						if (slz_chunk_changed(in + pos, &crs, &crh)) {
++							skip = 0;
++							if (!SLZ_CHG_KEEP)
++								skip_ratio = 0;
++							SLZ_TRACE_DO(thit = 0x80000000u;)
++							break;
++						}
++#endif
+ 						uint32_t w = read_le32(in + pos + 60);
+ 						uint32_t hw = slz_hash(w);
+ 
+@@ -1241,12 +1729,14 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 
+ 							if ((uint32_t)(old >> 32) == w && (unsigned long)(pos + 59 - (uint32_t)old) < 32768) {
+ 								skip = 0;
++								SLZ_TRACE_DO(thit = 0x80000000u;)
+ 								break;
+ 							}
+ 							refs[hw].by64 = ((uint64_t)(pos + 60)) + ((uint64_t)w << 32);
+ 						} else {
+ 							if (refs[hw].by32.word == w && (unsigned long)(pos + 59 - refs[hw].by32.pos) < 32768) {
+ 								skip = 0;
++								SLZ_TRACE_DO(thit = 0x80000000u;)
+ 								break;
+ 							}
+ 							refs[hw].by32.pos = pos + 60;
+@@ -1260,6 +1750,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 				pos += skip;
+ 				rem -= skip;
+ 				plit += skip;
++				SLZ_TRACE_EV('S', tpos, (pos - tpos) | thit);
+ 				/* skipped bytes may only leave as a stored block */
+ 				bal += SLZ_MAX_DEBT + SLZ_CREDIT;
+ # ifndef UNALIGNED_FASTER
+@@ -1270,8 +1761,19 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ # endif
+ 			}
+ 			else if (__builtin_expect(ctype == SLZ_CT_GENERIC && level == 3 && !(plit & 2047), 0)) {
++#if SLZ_SKIP_PLIT >= 2
++				/* derived from <plit> as well: 0, 4096, 16384, then
++				 * 28672 (the ramp kept in <skip_ratio> gives 0, 4096,
++				 * 12288, 28672). <plit> is not always a multiple of
++				 * 2048 here (see below), hence the rounding.
++				 */
++				long skip = 2 * (long)(plit & ~2047U) - 4096;
++				skip = skip > 28672 ? 28672 : skip;
++				skip = rem >= skip ? skip : rem;
++#else
+ 				long skip = rem >= skip_ratio * 4096 ? skip_ratio * 4096 : rem;
+ 				skip_ratio = (skip_ratio * 2 + 1) & 7; // capped exponential: 0,1,3,7 and stays at 7
++#endif
+ 
+ 				/* Note: by checking intervals smaller than the mask above, a hit resumes
+ 				 * at the start of the 256-byte chunk containing it, so <plit> is then no
+@@ -1332,7 +1834,27 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 				 * large as possible since each split costs 5 bytes on
+ 				 * top of the debt.
+ 				 */
++#if SLZ_AUTO_TREE && !defined(SLZ_AUTO_NOBIN)
++				/* with the text tree, checked every 64 literals
++				 * instead, which costs the same test
++				 */
++				if (__builtin_expect(ctype == SLZ_CT_TEXT ? !(plit & 63) : plit == 0xffc0, 0)) {
++					if (ctype == SLZ_CT_TEXT && plit != 0xffc0) {
++						/* binary data with the text tree: these
++						 * literals take at least 9 bits each, so
++						 * the fixed tree is at least as good and
++						 * can skip. Switch now and let it process
++						 * them again.
++						 */
++						if ((int32_t)lit_excess >= (int32_t)plit && strm->unused) {
++							pos -= plit;
++							goto auto_switch;
++						}
++						continue;
++					}
++#else
+ 				if (__builtin_expect(plit == 0xffc0, 0)) {
++#endif
+ 					copy_lit_small(strm, in + pos - plit, plit, 1, ctype);
+ 					plit = 0;
+ 					/* the text tree's <lit_excess> may be negative */
+@@ -1359,6 +1881,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 
+ 		/* found a matching entry */
+ 
++
+ 		/* if the pending literals are going to be sent as a stored
+ 		 * block, a short match is not worth splitting it.
+ 		 */
+@@ -1608,6 +2131,13 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 					debt = strm->text_debt + (int32_t)lit_excess;
+ 					strm->text_debt = debt > 0 ? debt : 0;
+ 				}
++#if SLZ_AUTO_TREE
++				/* what the fixed tree would have saved, counting
++				 * 8 bits per literal there, see SLZ_AUTO_TREE.
++				 */
++				if (strm->unused)
++					auto_account(strm, (int32_t)lit_excess, SLZ_CT_TEXT);
++#endif
+ 				nvref = vplit = 0;
+ 			}
+ 			else if (bal >= SLZ_SWITCH_COST + SLZ_CREDIT) {
+@@ -1671,6 +2201,16 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 			bal = (code > 8 * (uint32_t)mlen) ? code - 8 * (uint32_t)mlen : 0;
+ 			strm->debt = bal;
+ 		}
++		SLZ_TRACE_EV('M', pos, mlen | (dist & 0x1f) << 16); /* bits 16-20: distance bits */
++#if SLZ_AUTO_TREE && !defined(SLZ_AUTO_NOCHK)
++		/* switch to the other tree after this match if requested by
++		 * the literals sent before it, see SLZ_AUTO_TREE.
++		 */
++		if (__builtin_expect(strm->auto_sw, 0)) {
++			pos += mlen;
++			goto auto_switch;
++		}
++#endif
+ 	skip_ref:
+ 		rem -= mlen;
+ 		pos += mlen;
+@@ -1770,11 +2310,175 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 
+ 		plit = 0;
+ 	}
++#if SLZ_AUTO_TREE
++	(void)out;
++	return ilen;
++ auto_switch:
++	if (strm->state == SLZ_ST_FIXED) {
++		send_eob(strm, ctype);
++		strm->state = SLZ_ST_EOB;
++	}
++	strm->auto_sw = 0;
++	strm->auto_save = 0;
++	strm->content_type = (ctype == SLZ_CT_TEXT) ? SLZ_CT_GENERIC : SLZ_CT_TEXT;
++	return pos;
++#else
++ leave:
++	strm->ilen += ilen;
++	return strm->outbuf - out;
++#endif
++}
++
++#if SLZ_AUTO_TREE
++/* Calls the encoder for the tree in use (<content_type>) until the end of the
++ * input, switching to the other one when it returns earlier, see
++ * SLZ_AUTO_TREE. The reference table is shared by both. When the tree is not
++ * chosen automatically, the text one is used at level 3.
++ */
++#ifdef SLZ_AUTO_DEBUG
++/* bytes processed with each tree, and number of switches */
++static unsigned long long slz_auto_dbg[3];
++static void __attribute__((destructor)) slz_auto_dbg_dump(void)
++{
++	fprintf(stderr, "auto: fixed %llu text %llu switches %llu\n",
++		slz_auto_dbg[0], slz_auto_dbg[1], slz_auto_dbg[2]);
++}
++#endif
++
++/* one instance of the encoder per level and tree, sharing <refs> */
++#ifdef SLZ_AUTO_INL
++# define SLZ_AUTO_CORE_ATTR inline __attribute__((always_inline))
++#else
++# define SLZ_AUTO_CORE_ATTR __attribute__((noinline))
++#endif
++#define SLZ_AUTO_CORE(name, lev, ct)							\
++static SLZ_AUTO_CORE_ATTR								\
++unsigned long name(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in,	\
++		   long ilen, int more, unsigned long start, union ref *refs)		\
++{												\
++	return _slz_rfc1951_encode(strm, out, in, ilen, more, lev, ct, start, refs);	\
++}
++SLZ_AUTO_CORE(_slz_core_g1, 1, SLZ_CT_GENERIC)
++SLZ_AUTO_CORE(_slz_core_g2, 2, SLZ_CT_GENERIC)
++SLZ_AUTO_CORE(_slz_core_g3, 3, SLZ_CT_GENERIC)
++SLZ_AUTO_CORE(_slz_core_g4, 4, SLZ_CT_GENERIC)
++SLZ_AUTO_CORE(_slz_core_t1, 1, SLZ_CT_TEXT)
++SLZ_AUTO_CORE(_slz_core_t2, 2, SLZ_CT_TEXT)
++SLZ_AUTO_CORE(_slz_core_t3, 3, SLZ_CT_TEXT)
++SLZ_AUTO_CORE(_slz_core_t4, 4, SLZ_CT_TEXT)
++
++static inline __attribute__((always_inline))
++unsigned long _slz_auto_core(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in,
++			     long ilen, int more, unsigned long start, union ref *refs, int level, int ctype)
++{
++	if (ctype == SLZ_CT_TEXT)
++		return level <= 1 ? _slz_core_t1(strm, out, in, ilen, more, start, refs) :
++		       level == 2 ? _slz_core_t2(strm, out, in, ilen, more, start, refs) :
++		       level == 3 ? _slz_core_t3(strm, out, in, ilen, more, start, refs) :
++		                    _slz_core_t4(strm, out, in, ilen, more, start, refs);
++	return level <= 1 ? _slz_core_g1(strm, out, in, ilen, more, start, refs) :
++	       level == 2 ? _slz_core_g2(strm, out, in, ilen, more, start, refs) :
++	       level == 3 ? _slz_core_g3(strm, out, in, ilen, more, start, refs) :
++	                    _slz_core_g4(strm, out, in, ilen, more, start, refs);
++}
++
++static inline __attribute__((always_inline))
++long _slz_auto_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more, int level)
++{
++	union ref refs[1 << SLZ_HASH_BITS];
++	unsigned long pos = 0;
++	const int tlevel = SLZ_AUTO_TLEVEL ? SLZ_AUTO_TLEVEL : level;
++
++	strm->outbuf = out;
++	if (__builtin_expect(!strm->level, 0)) {
++		/* force to send as literals (eg to preserve CPU) */
++		if (ilen)
++			copy_lit(strm, in, ilen, more, strm->content_type);
++		goto leave;
++	}
++
++	reset_refs(refs, sizeof(refs));
++
++	/* only the savings of this call may pay for its blocks, see
++	 * SLZ_TEXT_CREDIT.
++	 */
++	if (strm->text_debt < SLZ_TEXT_CREDIT)
++		strm->text_debt = SLZ_TEXT_CREDIT;
++
++	if (strm->auto_sw && strm->unused) {
++		/* requested at the end of the previous call */
++		if (strm->state == SLZ_ST_FIXED) {
++			send_eob(strm, strm->content_type);
++			strm->state = SLZ_ST_EOB;
++		}
++		if (strm->state == SLZ_ST_EOB)
++			strm->content_type = !strm->content_type;
++		strm->auto_sw = 0;
++		strm->auto_save = 0;
++	}
++
++	do {
++#ifdef SLZ_AUTO_DEBUG
++		unsigned long dbg_start = pos;
++		int dbg_ct = strm->content_type;
++#endif
++		if (strm->content_type == SLZ_CT_TEXT) {
++			if (!strm->unused && tlevel != 3)
++				pos = _slz_core_t3(strm, out, in, ilen, more, pos, refs);
++			else
++				pos = _slz_auto_core(strm, out, in, ilen, more, pos, refs, tlevel, SLZ_CT_TEXT);
++		}
++		else
++			pos = _slz_auto_core(strm, out, in, ilen, more, pos, refs, level, SLZ_CT_GENERIC);
++#ifdef SLZ_AUTO_DEBUG
++		slz_auto_dbg[dbg_ct] += pos - dbg_start;
++		slz_auto_dbg[2] += pos < (unsigned long)ilen;
++#endif
++	} while (pos < (unsigned long)ilen);
+  leave:
+ 	strm->ilen += ilen;
+ 	return strm->outbuf - out;
+ }
+ 
++static __attribute__((noinline))
++long _slz_rfc1951_encode_lev1(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
++{
++	return _slz_auto_encode(strm, out, in, ilen, more, 1);
++}
++
++static __attribute__((noinline))
++long _slz_rfc1951_encode_lev2(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
++{
++	return _slz_auto_encode(strm, out, in, ilen, more, 2);
++}
++
++static __attribute__((noinline))
++long _slz_rfc1951_encode_lev3(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
++{
++	return _slz_auto_encode(strm, out, in, ilen, more, 3);
++}
++
++static __attribute__((noinline))
++long _slz_rfc1951_encode_lev4(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
++{
++	return _slz_auto_encode(strm, out, in, ilen, more, 4);
++}
++
++long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
++{
++	if (strm->content_type == SLZ_CT_TEXT && !strm->unused)
++		return _slz_rfc1951_encode_lev3(strm, out, in, ilen, more);
++
++	if (strm->level <= 1)
++		return _slz_rfc1951_encode_lev1(strm, out, in, ilen, more);
++	else if (strm->level <= 2)
++		return _slz_rfc1951_encode_lev2(strm, out, in, ilen, more);
++	else if (strm->level <= 3)
++		return _slz_rfc1951_encode_lev3(strm, out, in, ilen, more);
++	else
++		return _slz_rfc1951_encode_lev4(strm, out, in, ilen, more);
++}
++#else /* !SLZ_AUTO_TREE */
+ static __attribute__((noinline))
+ long _slz_rfc1951_encode_lev1(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
+ {
+@@ -1810,6 +2514,11 @@ long _slz_rfc1951_encode_text(struct slz_stream *__restrict strm, unsigned char
+ 	 */
+ 	if (strm->text_debt < SLZ_TEXT_CREDIT)
+ 		strm->text_debt = SLZ_TEXT_CREDIT;
++#if SLZ_AUTO_TREE
++	strm->unused = 1;
++	strm->auto_save = 0;
++	strm->auto_sw = 0;
++#endif
+ 	return _slz_rfc1951_encode(strm, out, in, ilen, more, 3, SLZ_CT_TEXT);
+ }
+ 
+@@ -1827,6 +2536,7 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 	else
+ 		return _slz_rfc1951_encode_lev4(strm, out, in, ilen, more);
+ }
++#endif /* SLZ_AUTO_TREE */
+ 
+ /* Initializes stream <strm> for use with raw deflate (rfc1951). The CRC is
+  * unused but set to zero. The compression level passed in <level> is set. This
+@@ -1845,6 +2555,11 @@ int slz_rfc1951_init(struct slz_stream *strm, int level)
+ 	strm->queue = 0;
+ 	strm->debt  = SLZ_CREDIT;
+ 	strm->text_debt = SLZ_TEXT_CREDIT;
++#if SLZ_AUTO_TREE
++	strm->unused = 1;
++	strm->auto_save = 0;
++	strm->auto_sw = 0;
++#endif
+ 	return 0;
+ }
+ 
+@@ -2101,6 +2816,11 @@ int slz_rfc1952_init(struct slz_stream *strm, int level)
+ 	strm->queue  = 0;
+ 	strm->debt   = SLZ_CREDIT;
+ 	strm->text_debt = SLZ_TEXT_CREDIT;
++#if SLZ_AUTO_TREE
++	strm->unused = 1;
++	strm->auto_save = 0;
++	strm->auto_sw = 0;
++#endif
+ 	return 0;
+ }
+ 
+@@ -2314,6 +3034,11 @@ int slz_rfc1950_init(struct slz_stream *strm, int level)
+ 	strm->queue  = 0;
+ 	strm->debt   = SLZ_CREDIT;
+ 	strm->text_debt = SLZ_TEXT_CREDIT;
++#if SLZ_AUTO_TREE
++	strm->unused = 1;
++	strm->auto_save = 0;
++	strm->auto_sw = 0;
++#endif
+ 	return 0;
+ }
+ 
+diff --git a/src/slz.h b/src/slz.h
+index aa94b77..861f8b3 100644
+--- a/src/slz.h
++++ b/src/slz.h
+@@ -106,6 +106,14 @@ struct slz_stream {
+ 	                     */
+ 	uint32_t crc32;
+ 	uint32_t ilen;
++#if defined(SLZ_AUTO_TREE) && SLZ_AUTO_TREE
++	/* experimental, see SLZ_AUTO_TREE in slz.c. <unused> above is set
++	 * when the tree is chosen automatically, and <content_type> is then
++	 * the tree in use.
++	 */
++	int32_t auto_save;  /* bits the other tree would have saved (CUSUM) */
++	uint32_t auto_sw;   /* switch to the other tree at the next match */
++#endif
+ };
+ 
+ /* Maximum number of bytes by which the encoder's output may exceed the same
+@@ -263,6 +271,11 @@ static inline int slz_set_content_type(struct slz_stream *strm, int type)
+ 	    strm->state == SLZ_ST_FIXED || strm->state == SLZ_ST_LAST)
+ 		return -1;
+ 	strm->content_type = type;
++#if defined(SLZ_AUTO_TREE) && SLZ_AUTO_TREE
++	strm->unused = (type == SLZ_CT_GENERIC);
++	strm->auto_save = 0;
++	strm->auto_sw = 0;
++#endif
+ 	return 0;
+ }
+ 

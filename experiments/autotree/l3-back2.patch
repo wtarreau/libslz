@@ -1,0 +1,11 @@
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -118,7 +118,7 @@
+  * compression speed due to the savings on encoding. The only way to disable
+  * this optimization is to comment out this line.
+  */
+-#define SLZ_BACKWARD_MATCH ((const int[]){ 0, 1, 1, 2, 8 })
++#define SLZ_BACKWARD_MATCH ((const int[]){ 0, 1, 2, 2, 8 })
+ 
+ /* Log2 of the size of the hash table used for the references table. */
+ #ifndef SLZ_HASH_BITS

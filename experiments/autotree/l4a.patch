@@ -1,0 +1,20 @@
+--- a/src/slz-enc.h
++++ b/src/slz-enc.h
+@@ -259,7 +259,7 @@
+ 			/* never on text, where it would be too expensive to
+ 			 * leave the huffman block for so few literals.
+ 			 */
+-			if (ctype == SLZ_CT_GENERIC && level <= 2 && !(plit & 63)) {
++			if (ctype == SLZ_CT_GENERIC && level <= 3 && !(plit & 63)) {
+ 				/* The step is derived from the literals pending since
+ 				 * the last match: 0, 64, 192, 448, ... up to 8128, i.e.
+ 				 * the capped exponential ramp, which keeps <plit>
+@@ -283,7 +283,7 @@
+ 				 * skip steps are 64 bytes apart, <plit> remains aligned
+ 				 * on them.
+ 				 */
+-				if (level == 2 && skip >= 64) {
++				if (level >= 2 && skip >= 64) {
+ 					long chunks = skip >> 6;
+ 
+ 					skip &= 63;

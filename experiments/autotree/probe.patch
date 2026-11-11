@@ -1,0 +1,139 @@
+--- a/src/slz.c	2026-11-11 14:54:00.078132529 +0100
++++ b/src/slz.c	2026-11-11 14:11:18.194257442 +0100
+@@ -600,6 +600,15 @@
+  * skip and processes again from the first of them.
+  */
+ #define SLZ_AUTO_IN   1280
++#ifndef SLZ_PROBE_MIN
++#define SLZ_PROBE_MIN 16384
++#endif
++#ifndef SLZ_PROBE_MAX
++#define SLZ_PROBE_MAX 1048576
++#endif
++#ifndef SLZ_PROBE_OK
++#define SLZ_PROBE_OK 16384
++#endif
+ #define SLZ_AUTO_OUT   256
+ 
+ /* accounts <d> more bits that the other tree would have saved on literals
+@@ -745,7 +754,7 @@
+ static __attribute__((noinline))
+ void copy_lit_small_generic_auto(struct slz_stream *__restrict strm, const void *buf, uint32_t len, int more)
+ {
+-	_copy_lit_small(strm, buf, len, more, SLZ_CT_GENERIC, 1);
++	_copy_lit_small(strm, buf, len, more, SLZ_CT_GENERIC, 0);
+ }
+ 
+ static __attribute__((noinline))
+@@ -816,7 +825,7 @@
+ static __attribute__((noinline))
+ void copy_lit_generic_auto(struct slz_stream *__restrict strm, const void *buf, uint32_t len, int more)
+ {
+-	_copy_lit(strm, buf, len, more, SLZ_CT_GENERIC, 1);
++	_copy_lit(strm, buf, len, more, SLZ_CT_GENERIC, 0);
+ }
+ 
+ static __attribute__((noinline,unused))
+@@ -886,7 +895,7 @@
+ static __attribute__((noinline))
+ void copy_lit_huff_generic_auto(struct slz_stream *__restrict strm, const unsigned char *buf, uint32_t len, int more)
+ {
+-	_copy_lit_huff(strm, buf, len, more, SLZ_CT_GENERIC, 1);
++	_copy_lit_huff(strm, buf, len, more, SLZ_CT_GENERIC, 0);
+ }
+ 
+ static __attribute__((noinline))
+@@ -1190,13 +1199,53 @@
+ 			strm->cur_tree = !strm->cur_tree;
+ 		strm->tree_switch = 0;
+ 		strm->tree_save = 0;
++		if (strm->cur_tree == SLZ_CT_GENERIC) {
++			if (strm->tree_run < SLZ_PROBE_OK)
++				strm->tree_probe = strm->tree_probe * 2 > SLZ_PROBE_MAX ? SLZ_PROBE_MAX : strm->tree_probe * 2;
++			else
++				strm->tree_probe = SLZ_PROBE_MIN;
++			strm->tree_save = strm->tree_probe;
++		}
++		else
++			strm->tree_run = 0;
+ 	}
+ 
+ 	do {
+-		if (strm->cur_tree == SLZ_CT_TEXT)
++		unsigned long start = pos;
++
++		if (strm->cur_tree == SLZ_CT_TEXT) {
+ 			pos = _slz_rfc1951_encode_auto_text(strm, out, in, ilen, more, pos, refs);
+-		else
+-			pos = _slz_rfc1951_encode_auto(strm, out, in, ilen, more, level, SLZ_CT_GENERIC, pos, refs);
++			strm->tree_run += pos - start;
++			if (strm->cur_tree != SLZ_CT_TEXT) {
++				/* left the text tree: a short run was a failed probe */
++				if (strm->tree_run < SLZ_PROBE_OK)
++					strm->tree_probe = strm->tree_probe * 2 > SLZ_PROBE_MAX ? SLZ_PROBE_MAX : strm->tree_probe * 2;
++				else
++					strm->tree_probe = SLZ_PROBE_MIN;
++				strm->tree_save = strm->tree_probe;
++			}
++		}
++		else {
++			long end = ilen;
++			int m = more;
++
++			if ((unsigned long)(ilen - pos) > (uint32_t)strm->tree_save) {
++				end = pos + strm->tree_save;
++				m = 1;
++			}
++			pos = _slz_rfc1951_encode_auto(strm, out, in, end, m, level, SLZ_CT_GENERIC, pos, refs);
++			strm->tree_save -= pos - start;
++			if (strm->tree_save <= 0) {
++				/* probe the text tree */
++				if (strm->state == SLZ_ST_FIXED) {
++					send_eob(strm, SLZ_CT_GENERIC);
++					strm->state = SLZ_ST_EOB;
++				}
++				strm->cur_tree = SLZ_CT_TEXT;
++				strm->tree_save = 0;
++				strm->tree_run = 0;
++			}
++		}
+ 	} while (pos < (unsigned long)ilen);
+ 
+ 	strm->ilen += ilen;
+@@ -1272,6 +1321,8 @@
+ 	strm->cur_tree = SLZ_CT_GENERIC;
+ 	strm->tree_save = 0;
+ 	strm->tree_switch = 0;
++	strm->tree_probe = SLZ_PROBE_MIN;
++	strm->tree_run = 0;
+ 	return 0;
+ }
+ 
+@@ -1531,6 +1582,8 @@
+ 	strm->cur_tree = SLZ_CT_GENERIC;
+ 	strm->tree_save = 0;
+ 	strm->tree_switch = 0;
++	strm->tree_probe = SLZ_PROBE_MIN;
++	strm->tree_run = 0;
+ 	return 0;
+ }
+ 
+@@ -1747,6 +1800,8 @@
+ 	strm->cur_tree = SLZ_CT_GENERIC;
+ 	strm->tree_save = 0;
+ 	strm->tree_switch = 0;
++	strm->tree_probe = SLZ_PROBE_MIN;
++	strm->tree_run = 0;
+ 	return 0;
+ }
+ 
+--- a/src/slz.h	2026-11-11 14:54:00.080132517 +0100
++++ b/src/slz.h	2026-11-11 14:11:09.558094101 +0100
+@@ -108,6 +108,7 @@
+ 	uint32_t ilen;
+ 	int32_t tree_save;    /* bits the other tree would have saved, see SLZ_AUTO_IN */
+ 	uint32_t tree_switch; /* switch to the other tree after the next match */
++	uint32_t tree_probe, tree_run;
+ };
+ 
+ /* Maximum number of bytes by which the encoder's output may exceed the same

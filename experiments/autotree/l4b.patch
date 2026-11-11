@@ -1,0 +1,56 @@
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -118,7 +118,8 @@
+  * compression speed due to the savings on encoding. The only way to disable
+  * this optimization is to comment out this line.
+  */
+-#define SLZ_BACKWARD_MATCH ((const int[]){ 0, 1, 1, 2, 8 })
++#define SLZ_BACKWARD_MATCH ((const int[]){ 0, 1, 1, 8, 8 })
++#define SLZ_BACK(l, c) ((c) == SLZ_CT_TEXT ? 2 : SLZ_BACKWARD_MATCH[l])
+ 
+ /* Log2 of the size of the hash table used for the references table. */
+ #ifndef SLZ_HASH_BITS
+--- a/src/slz-enc.h
++++ b/src/slz-enc.h
+@@ -586,7 +586,7 @@
+ 		 */
+ 		if (((ctype == SLZ_CT_TEXT && __builtin_expect(plit != vplit, 1)) ||
+ 		     (ctype != SLZ_CT_TEXT && __builtin_expect(plit != 0, 1))) &&
+-		    (last >= MAX_C(sizeof(long), SLZ_BACKWARD_MATCH[level]))) {
++		    (last >= MAX_C(sizeof(long), SLZ_BACK(level, ctype)))) {
+ 			long bmax = MIN(plit - (ctype == SLZ_CT_TEXT ? vplit : 0), 8); // keep it at 8, always faster
+ 			long back = 0;
+ 
+@@ -594,27 +594,27 @@
+ 				bmax = 258 - mlen;
+ 
+ #if defined(UNALIGNED_LE_OK)
+-			if (SLZ_BACKWARD_MATCH[level] == 2) { // 43.32%, best speed vs savings
++			if (SLZ_BACK(level, ctype) == 2) { // 43.32%, best speed vs savings
+ 				uint16_t x = *(uint16_t *)&in[pos - 2] ^ *(uint16_t *)(lastp - 2);
+ 				back = x & 0xff00 ? 0 : x ? 1 : 2;
+ 				if (back > bmax)
+ 					back = bmax;
+-			} else if (SLZ_BACKWARD_MATCH[level] == 3 || SLZ_BACKWARD_MATCH[level] == 4) { // 32 bits: 43.31% or 43.30%
++			} else if (SLZ_BACK(level, ctype) == 3 || SLZ_BACK(level, ctype) == 4) { // 32 bits: 43.31% or 43.30%
+ 				uint32_t x = *(uint32_t *)&in[pos - 4] ^ *(uint32_t *)(lastp - 4);
+ 				back = x & 0xffff0000u ?
+ 					x & 0xff000000u ? 0 : 1 :
+ 					x & 0xffffff00u ? 2 :
+-					x ? 3 : SLZ_BACKWARD_MATCH[level]; // 3 or 4, test eliminated at 3
++					x ? 3 : SLZ_BACK(level, ctype); // 3 or 4, test eliminated at 3
+ 				if (back > bmax)
+ 					back = bmax;
+-			} else if (SLZ_BACKWARD_MATCH[level] == 8) { // 64 bits: 43.30%
++			} else if (SLZ_BACK(level, ctype) == 8) { // 64 bits: 43.30%
+ 				uint64_t x = *(uint64_t *)&in[pos - 8] ^ *(uint64_t *)(lastp - 8);
+ 				back = x ? (__builtin_clzll(x) >> 3) : 8;
+ 				if (back > bmax)
+ 					back = bmax;
+ 			} else
+ #endif
+-			if (SLZ_BACKWARD_MATCH[level] == 1) { // single-byte match: 43.39%
++			if (SLZ_BACK(level, ctype) == 1) { // single-byte match: 43.39%
+ 				if (in[pos - 1] == lastp[-1])
+ 					back++;
+ 				if (back > bmax)

@@ -1,0 +1,1153 @@
+Huffman tree chosen on the fly (levels 3 and above)
+===================================================
+
+Follows experiments/statskip, sections 13 and 14, where the choice was
+simulated (treesim) then prototyped (SLZ_AUTO_TREE). The work went through
+several versions of the series, all restarting from master (v1.4-dev5):
+
+- the first series (sections 1 to 20):
+    OPTIM: slz: derive the literal skip ramp of levels 1 and 2 from plit
+    OPTIM: slz: derive level 3's literal skip ramp from plit too
+    slz: renumber the compression levels to make room for a new level 3
+    MEDIUM: slz: choose the huffman tree on the fly from level 3
+  then more commits named in the sections below. Level 3 is a copy of level
+  2 with the automatic choice, the former levels 3 and 4 become 4 and 5 with
+  it too, and levels 1 and 2 are unchanged, since speed matters less from
+  level 3 on;
+- the second series, a clean version of the first, and the third series,
+  with one encoder function (section 21);
+- the final series (sections 21 to 26), which is the one merged: 4 levels,
+  the tree chosen from level 2, one encoder function without slz-enc.h,
+  streams starting with the text tree, and the content type kept as a hint.
+
+Commits of the earlier series are named by their subjects followed by the
+series they belong to. Two experiments are kept as patches: ramp-l1.patch
+(section 22) and auto-tbl.patch (section 27).
+
+All measurements: Xeon W-2145, CPU 2, gcc 13 -O3 -march=native with
+-Wa,-mbranches-within-32B-boundaries -Wa,-malign-branch=jcc+fused+jmp+call,
+best of 5 (experiments/statskip/bench.sh) unless stated otherwise.
+
+
+1. Keeping levels 1 and 2 identical
+-----------------------------------
+
+The first version passed <autom>, <start> and the shared table to the single
+always-inline encoder, constant for levels 1 and 2. Their output was the
+same, but their code was not: measured with epad.sh (4 .text paddings x 3
+runs, builds alternated), level 1 lost 0.2-0.3% and level 2 0.6-0.8%,
+consistently over all paddings. Bisecting showed no single culprit: each
+piece of auto-only code, dead once the constants are folded, changed the
+register allocation, and only removing all of them restored it. gcc runs
+its early passes on the body before inlining it, while <autom> is still a
+variable.
+
+The encoder's body thus moved to src/slz-enc.h, included twice by slz.c,
+with SLZ_ENC_AUTO = 0 (_slz_rfc1951_encode, levels 1-2 and -T) and 1
+(_slz_rfc1951_encode_auto), the auto-only parts under #if. Levels 1 and 2
+then produce exactly the same instructions as before (padding prefixes
+aside), and epad.sh measures -0.08% to +0.23% on silesia, web and linux.
+
+The text tree's encoder for levels 3-5 is a single noinline function shared
+by the three levels: with one inlined copy per level, level 5 was 6% slower
+than level 4 on linux and web (code placement), and sharing it costs
+nothing at levels 3-4 (silesia -5: 449 -> 463, linux 498 -> 527, web
+704 -> 743 MB/s).
+
+
+2. Results
+----------
+
+Output and speed vs the level each one replaces ("choose the huffman tree
+on the fly from level 3" vs "renumber the compression levels", first
+series):
+
+               silesia          doc.tar          linux 200MB      web
+  -3 (was -2)  -6.02% 541->497  -2.37% 1040->950  -12.55% 567->526 -11.80% 800->742
+  -4 (was -3)  -5.99% 514->478  -2.37%  899->834  -12.30% 559->528 -11.62% 788->744
+  -5 (was -4)  -5.98% 496->463  -2.39%  653->588  -12.23% 557->527 -11.56% 788->743
+
+Level 3 is 1.7% smaller than -T on silesia and 4.6% faster, the same size
+on text and 2.6% slower. Levels 1, 2 and -T are unchanged (same output,
+same code). Round trips checked with gzip, zlib and raw deflate at levels
+3-5, and with 1 kB blocks (switches across calls).
+
+
+3. Cheaper fixed tree accounting (fixed-bit7.patch, rejected)
+------------------------------------------------------------
+
+Replacing the per-literal comparison of both trees' code lengths, in the
+fixed tree's out-of-line literal emitter, by bit 7 alone (+1.5 bits per
+byte < 0x80, -2 bits above, switch at 1280 bits): silesia -3 +0.18% larger
+and 0.7% faster (499 -> 503), doc.tar 0.09% smaller, same speed. The
+accounting of the fixed tree is not where the time goes.
+
+
+4. Counting <lit_excess> at the match (text-lazy.patch, rejected)
+------------------------------------------------------------------
+
+Avoiding the text tree's per-literal <lit_excess> in the fast path was
+tried. In the text encoder of levels 3-5, the literals are counted
+instead at each match, from a position <lacc> up to which they are already
+counted, and the binary test every 64 literals counts the bytes >= 0x80
+among the last 64 (SWAR, switch at 16 or more). Same output within 0.002%,
+but slower everywhere: silesia -3 499 -> 486, doc.tar 954 -> 922, linux
+528 -> 507, web 744 -> 718 MB/s (-2.5 to -4%). The add per literal in the
+loop costs less than a separate loop at each match.
+
+
+5. Where the remaining cost is
+------------------------------
+
+On linux, nearly all of it in the text tree: master -T (level 4's matcher,
+non-shared table) runs at 540 MB/s, level 3 at 526-528, level 2 at 567.
+So 5% is the text tree itself and 2.4% the shared table (its address is
+an argument of the text encoder, held in a register, where -T addresses
+its own table from the stack pointer).
+
+
+6. Why silesia and doc.tar lose more speed than size
+----------------------------------------------------
+
+Except on linux and web, level 3 lost more speed than size. Measured on
+the Xeon W, at -3, MB/s, best of 5 alternated runs. The "linux" file here
+is linux-7.0.tar (719 MB/s at the old level 3, not the lin200 sample of
+section 2). Builds:
+  r   = "renumber the compression levels" (first series, no automatic
+        tree)
+  c   = "choose the huffman tree on the fly from level 3" (first series)
+  ff  = c with SLZ_AUTO_IN = 1<<30: never leaves the fixed tree, same
+        output as r, but pays all the automatic tree's plumbing
+  na  = ff without the fixed tree's accounting
+  tt  = c starting with the text tree and never leaving it
+
+              r       na      ff      c       tt
+  silesia   541.1   528.3   507.3   499.5   460.6
+  doc.tar  1036.4  1014.5   982.4   953.2   593.7
+  linux     719.4   706.2   687.5   671.7   672.7
+  web       800.1   785.1   765.9   744.9   750.5
+
+So at -3 on silesia, the 7.7% loss splits into about 2.4% for the
+structure (r -> na), 4% for the fixed tree's accounting (na -> ff,
+including 0.8% for the call to auto_account() alone), and only 1.5% for
+the text tree itself (ff -> c). These costs are paid on every byte the
+fixed tree encodes, whether or not the text tree is ever chosen, so they
+weigh most where the gain is smallest. doc.tar's text segments really are
+text (674 of 690 segments have fewer than 1% bytes >= 0x80, mostly 4 kB or
+larger), so there's no ping-pong between trees. The text tree's encoder
+taking 63% of the time for 38% of the bytes is normal: the fixed tree
+skips the PNG images, while the text bytes go through the matcher.
+
+The text encoder's level doesn't matter: level 2, 3 or 5 matching for
+the text tree is within +0.4% / -1.2% in speed and 0.1% in size of
+level 4.
+
+Two fixes, both with unchanged output and same code for levels 1-2:
+
+- "let the fixed tree's encoder own the reference table from level 3"
+  (first series): the wrapper owning the reference table passed it by
+  pointer to the fixed tree's encoder, and once inlined gcc kept that
+  pointer in %r14 instead of addressing the table from %rsp, spilling the
+  stream pointer (54 stack accesses in level 3 vs 35 in level 2). An empty
+  asm on the pointer, or inlining the text encoder in level 3 as well,
+  didn't change that. Now the fixed tree's encoder owns the table and
+  calls the text one. With no accounting and no switch, level 3 is then
+  within 0.5% of r (538.5 vs 541.1 on silesia). This replaces the 2.4%
+  "shared table" of section 5.
+
+- "account the text tree's savings with one addition per literal" (first
+  series): the fixed tree's accounting took two lookups, a subtraction and
+  an addition per literal. A 64-bit fixed_auto[] table holding the code in
+  its low half and the saved bits + 16 in its high half leaves a single
+  64-bit addition. Forced to the fixed tree: no accounting 539.3, old
+  accounting 521.6, 32-bit packed table (16+16, shift and mask) 514.7 on
+  the base before the previous fix, 64-bit table 528.3. Section 3's
+  conclusion was wrong: the fixed tree's accounting did cost about 4%, and
+  bit 7 alone was still an operation per literal.
+
+Result, MB/s (output identical to c):
+
+          silesia               doc.tar               linux                web
+        r     c    now        r     c    now        r     c    now        r     c    now
+  -3  541.2 498.3 510.1   1035.3 952.6 962.7    719.0 671.8 674.7    798.9 744.0 746.8
+  -4  513.4 478.0 489.9    894.9 832.7 840.6    705.7 669.1 672.9    787.7 744.4 747.3
+  -5  495.9 462.7 476.2    653.4 604.7 630.8    706.6 671.0 674.2    786.9 744.5 745.8
+
+So -3 now loses 5.8% speed for 6.0% size on silesia, but still 7.0% for
+2.4% on doc.tar. What's left: about 2% for the accounting even with one
+addition per literal, and the text tree's own cost (rs64ff -> now: 3.7%
+silesia, 5.2% doc.tar, 4.9% linux, 5.2% web).
+
+Rejected:
+
+- probe.patch (against c): no accounting in the fixed tree at all.
+  It runs for a budget of bytes, then tries the text tree, whose own
+  accounting (already free) decides to stay or not, doubling the budget
+  after each failed attempt (text run shorter than SLZ_PROBE_OK). doc.tar
+  wants frequent attempts and silesia rare ones, and no setting matches
+  the accounting on both: 16k-1M-16k gives silesia +0.57% larger, doc.tar
+  +1.37%; 1k-64k-1k gives doc.tar +0.00% but silesia +1.80%. It's only
+  faster where it's larger, since it spends more time in the fixed tree.
+
+- Sampling one literal in 4 for the accounting: same speed as the 32-bit
+  packed table, +0.01% on silesia, -0.1 to -0.3% on doc.tar and linux.
+
+About removing level T (and the ctype argument): the encoder's body still
+needs ctype as a constant for the text instance of levels 3-5, but once
+the forced text tree is gone it could be derived from SLZ_ENC_AUTO (2 for
+text, 0-1 for fixed). That wouldn't change the code generated, since it's
+already constant in each instance. Not done.
+
+
+7. All levels, before and after
+-------------------------------
+
+The ratios and speeds of all 5 levels on the 4 corpora. "Before" is r
+(levels renumbered, -3 identical to -2), "now" is the one-addition
+accounting above. Xeon W, MB/s, best of 5 alternated runs, ratio = output /
+input. -T is from r, for reference.
+
+                 before          now          now vs before
+  silesia     ratio   MB/s   ratio   MB/s    size     speed
+    -1       46.61%  621.5  46.61%  622.4   +0.00%   +0.14%
+    -2       43.56%  540.8  43.56%  539.5   +0.00%   -0.24%
+    -3       43.56%  541.1  40.93%  509.8   -6.02%   -5.78%
+    -4       43.18%  513.3  40.59%  489.6   -5.99%   -4.62%
+    -5       43.11%  496.4  40.53%  476.4   -5.98%   -4.03%
+    -T       41.64%  475.4
+
+  doc.tar
+    -1       69.18% 1152.3  69.18% 1154.7   +0.00%   +0.21%
+    -2       64.23% 1035.7  64.23% 1035.1   +0.00%   -0.06%
+    -3       64.23% 1034.5  62.71%  965.5   -2.37%   -6.67%
+    -4       64.51%  897.0  62.98%  849.1   -2.37%   -5.34%
+    -5       64.01%  653.7  62.48%  631.3   -2.39%   -3.43%
+    -T       62.51%  625.1
+
+  linux-7.0.tar
+    -1       23.36%  723.8  23.36%  726.5   +0.00%   +0.37%
+    -2       23.35%  718.6  23.35%  717.5   +0.00%   -0.15%
+    -3       23.35%  718.4  20.79%  674.1  -10.95%   -6.17%
+    -4       23.28%  707.3  20.76%  672.9  -10.83%   -4.86%
+    -5       23.27%  706.9  20.76%  673.1  -10.77%   -4.78%
+    -T       20.61%  683.8
+
+  web
+    -1       20.13%  803.3  20.13%  802.9   +0.00%   -0.05%
+    -2       20.10%  800.2  20.10%  797.9   +0.00%   -0.29%
+    -3       20.10%  799.2  17.73%  745.9  -11.80%   -6.67%
+    -4       20.05%  787.5  17.72%  744.3  -11.62%   -5.49%
+    -5       20.04%  787.1  17.72%  747.2  -11.56%   -5.07%
+    -T       17.72%  762.2
+
+Reading it:
+- vs -2, the new -3 costs 6-7% speed for 2.4% (doc.tar) to 11.8% (web)
+  less output. That's the real price, and -2 stays available as is.
+- The new -3 is smaller and faster than the old -4 and -5 on all 4
+  corpora (e.g. silesia 40.93% at 510 vs 43.11% at 496, doc.tar 62.71% at
+  966 vs 64.01% at 654), so the old -4/-5 have no remaining use.
+- vs -T, the new -3 is smaller and faster on silesia (40.93% vs 41.64%,
+  510 vs 475) and doc.tar (same ratio within 0.2%, 966 vs 625), and
+  slightly larger and slower on linux (20.79% vs 20.61%, -1.4%) and web
+  (same ratio, -2.1%).
+- The new -4 and -5 bring almost nothing over the new -3: 0.3-0.6 points
+  on silesia, under 0.1 point on linux and web, for 4-7% of speed. That is
+  a matcher issue, independent of the tree choice.
+
+
+8. Literal runs with the text tree
+----------------------------------
+
+Does plit rarely reach 64 with text? Counted at -3 from
+the lengths passed to the text tree's literal emitters (runs replayed
+through the recorded references, text_replay(), are not counted):
+
+              runs <8   <16    <32    <64    >=64   lits in runs >=64  64-checks  binary exits
+  silesia     95.34%   4.16%  0.47%  0.04%  0.005%   0.16%               211         18
+  doc.tar     87.74%   9.80%  2.18%  0.24%  0.03%    0.79%               962        673
+  linux       90.89%   7.78%  1.21%  0.10%  0.01%    0.22%              2608          2
+  web         91.09%   7.25%  1.38%  0.25%  0.02%    0.81%              1008          2
+
+So it's true: in text, a run of 64 literals is rare (at most 0.03% of the
+runs, under 1% of the literals), and the check every 64 literals runs a
+few hundred to a few thousand times per corpus. On doc.tar 70% of these
+checks leave for the fixed tree, on the other corpora nearly none.
+
+
+9. Four remarks on sections 7-8
+-------------------------------
+
+doc.tar: not a standard corpus. It's a plain tar of /usr/share/doc on
+this machine, built for the skipping study (experiments/statskip) because
+47% of it is .gz files mixed with short text files, i.e. many short
+incompressible areas. It is not representative of what one would try to
+compress, which is why it behaves so differently from linux.
+
+linux vs -T (20.79% vs 20.61%): 359 MB of linux-7.0.tar (22%), in 225
+zenc calls of 4 MB, stay in the fixed tree, e.g. the AMD register headers
+under drivers/gpu/drm/amd/include/asic_reg/. On one such 4 MB chunk, -3
+gives 443673 bytes and -T 410846 (-7.4%). There the text tree saves
+nothing on literals (upper case and '_' take 8 bits in both trees), the
+whole gain is on the length and distance codes, and the fixed tree only
+accounted literals. So knowledge was indeed lost. match-acct.patch adds
+to <tree_save>, at each match of the fixed tree at levels 3-5, the
+difference between both trees' length and distance codes:
+
+            -3 now          + match accounting      -T
+  silesia   40.93%  510.1   40.84%  499.4 (-2.1%)   41.64%
+  doc.tar   62.71%  965.2   62.56%  954.9 (-1.1%)   62.51%
+  linux     20.79%  675.4   20.63%  671.5 (-0.6%)   20.61%
+  web       17.73%  749.0   17.72%  749.4 ( 0.0%)   17.72%
+
+It is a load, two lookups and a store per match in the hot loop, written
+for the measurement only, not optimized.
+
+Leaving the text tree on plit alone: replacing the 64-literal test
+"lit_excess >= plit" by an unconditional exit (like level 1 relying on
+plit only) is larger everywhere (silesia +0.03%, doc.tar +0.12%, linux
++0.21%, web +0.38%) and slower (silesia -3.2%, doc.tar -4.5%), from the
+extra exits and rescans. And <lit_excess> stays needed per literal anyway
+for the stored block decision of the text tree.
+
+Level 1 + automatic tree (level 3 calling the auto encoder with level 1
+for the fixed tree; the text tree's encoder stays at level 4, and running
+it at level 1 changes nothing in speed and costs 0.2% on linux):
+
+                    l1+auto         l1+auto+match acct
+  silesia         43.98%  581.6     43.92%  569.8
+  doc.tar         67.73% 1064.6     67.61% 1058.1
+  linux           20.80%  676.6     20.64%  672.0
+  web             17.73%  748.9     17.73%  747.7
+
+vs level 1 (46.61% 622, 69.18% 1154, 23.36% 726, 20.13% 803), and level
+2 (43.56% 540, 64.23% 1035, 23.35% 718, 20.10% 800).
+
+Why levels 4 and 5 are useless, and why l1+auto gives the same speed and
+ratio as -3 on linux and web: all of them share the same text tree
+encoder (level 4), which encodes nearly all of these files. The level
+only applies to the fixed tree's segments. The text encoder itself runs at
+670-750 MB/s on these whatever its level (section 6: levels 2, 3 and 5
+within about 1%), so that's the ceiling of every automatic level on text.
+
+
+10. Is it the tree's cost that keeps linux in the fixed tree?
+-------------------------------------------------------------
+
+The question: maybe we rarely save enough bits on literals to pay for
+the text tree's header, because we look up references too often, and
+stopping the lookups after some plit on compressible text would build a
+long literal run that pays for it earlier.
+
+Counted with the fixed tree forced (and both accountings measured, not
+used), what the text tree would have saved:
+
+                  literals     matches      bytes in    saved on      saved on
+                               (count)      matches     literals      matches
+  amd 4 MB chunk     35506       155413      4153710     2898 bits    243380 bits
+  linux-7.0.tar   88722229    115147824   1553046376    75.4 Mbit    277.1 Mbit
+  silesia         27761139     18372598    167529349   -18.7 Mbit     52.6 Mbit
+
+On the AMD headers, the literals are 0.85% of the bytes and the text tree
+saves 0.08 bit per literal: there is nothing to gain on them, however long
+the runs. 99% of the bytes are in matches, and that's where the text tree
+saves its 30 kB (7.4%): its length and distance codes are shorter for this
+data. The 624-bit header would be paid back within about 10 kB of it.
+Turning matches into literals would cost far more than the header. So the
+header isn't what keeps us in the fixed tree. The fixed tree's accounting
+just didn't see the matches. Over all of linux, 79% of the text tree's
+savings are on matches. On silesia the literals are a net loss, and the
+gain is entirely on matches.
+
+Both accountings are needed though: matches only (no literal accounting)
+gives linux 338972783 (vs 338950285 with both), web 33252627 (vs 33251594),
+but silesia 88221525 (+1.9% vs both) and doc.tar 45238927 (+0.3%).
+
+About the cost of fixed_auto[] (2 kB): the previous code read fixed_huff[]
+and text_huff[] (576 bytes each) for each literal. The 1 kB 16+16-bit
+version measured slower than the 2 kB one (514.7 vs 528.3 on silesia,
+fixed tree forced), from the extra shift and mask. The saved bits per
+literal range from -3 to +3, so they would fit in the 3 unused bits of
+fixed_huff[] (512 bytes), but extracting them and masking the code costs
+the same extra operations as the 16+16 version. Not measured.
+
+
+11. Text first, the AMD chunk, and the table lookups
+----------------------------------------------------
+
+Another idea: considering the text tree's header as a mandatory cost at
+the beginning of each block, sending literals with it or as plain (stored)
+literals when they don't pay, and the fixed tree only when the literal run
+is too short to warrant a switch.
+
+Text tree + stored is what -T does, and treesim's optimum over T and S is
+the same as -T within 0.01% (section 13 of experiments/statskip/README).
+With level 2's matches, it's 3.29% under -2 on silesia, where the optimum
+over F, T and S is 5.66% under -2. So on silesia 2.4 points come from the
+fixed tree. It wins in the binary areas with matches (probably the
+executables and databases in silesia, not checked per file), where the
+literals are short runs between matches
+that stored blocks can't take, and where the text tree's codes for bytes
+>= 0x80 and for long matches are longer. The fixed tree can't be used for
+one short run either: inside a text block it needs the EOB, a fixed block,
+then the 624-bit header again to come back. That's why the choice has to
+be per area. The optimum counts these transitions exactly and still needs
+F. On doc.tar, linux and web, T+S alone is at most 0.04% from the optimum.
+
+The AMD chunk is C headers (register #defines), not firmware:
+
+  slz -2    443673    slz -T   410846
+  gzip -1   367046    gzip -6  264706
+
+Its literals are 0.85% of the bytes, so the text tree's literal codes don't
+matter there, and its length/distance codes already save 7.4% over the
+fixed tree. The remaining 12% to gzip -1 comes from gzip's matching and
+its trees computed for this data, not from switching. JavaScript is in
+web (js, css, html), where -3 is within 0.03% of -T.
+
+Lookups per literal: in the fixed tree's emitter at levels 3+, only
+fixed_auto[] is read (it replaced both fixed_huff[] and text_huff[]). In
+the text tree, text_huff[] is read for <lit_excess> then again when
+sending, from the same cache line. So it's one table per literal in each
+case already.
+
+Per match, the accounting of section 9 read text_len[] (1 kB) and
+text_dist_table[] (128 kB). The difference only depends on the length
+(259 values, -3 to +7 bits) and on the distance code (32 values, the
+extra bits are the same in both trees, -5 to +1), so two int8 tables of
+259 and 32 bytes give it (match-acct-small.patch). Same sizes within 706
+bytes, and:
+
+            -3 now     big tables       small tables
+  silesia   509.7    498.8 (-2.1%)    505.0 (-0.9%)
+  doc.tar   964.7    951.9 (-1.3%)    954.9 (-1.0%)
+  linux     673.4    669.8 (-0.5%)    670.8 (-0.4%)
+  web       747.8    747.2 (-0.1%)    746.3 (-0.2%)
+
+for -0.22%, -0.23%, -0.77% and -0.02% in size.
+
+
+12. Which level for a level 5
+-----------------------------
+
+The proposed layout: 1 and 2 as in master, 3 = 1 + auto tree, 4 = 2 +
+auto tree + small-table match accounting, 5 = master's level 3 or 4 with
+the same. Measured with match-acct-small.patch, where the first series' -3,
+-4 and -5 run master's levels 2, 3 and 4 for the fixed tree (ratio, MB/s):
+
+            master 2 + auto   master 3 + auto   master 4 + auto
+  silesia   40.84%  504.4     40.50%  481.8     40.44%  469.7
+  doc.tar   62.56%  955.7     62.86%  850.2     62.37%  628.8
+  linux     20.63%  670.0     20.63%  670.0     20.63%  670.5
+  web       17.72%  747.6     17.72%  747.4     17.72%  747.9
+
+On linux and web the three are the same, since the text tree's encoder
+(always at level 4) does nearly everything. On silesia, master's level 3
+saves 0.34 point for 4.5% of speed, master's level 4 only 0.06 point more
+for another 2.5%. On doc.tar, master's level 3 is larger than level 2 (it
+was already the case in master: 64.51% vs 64.23%), and level 4 is 34%
+slower than level 2 for 0.19 point.
+
+
+13. All candidates in one run, and the order of the levels
+----------------------------------------------------------
+
+A level 3 made of level 1 + auto tree, faster than level 2 but larger on
+silesia, would be confusing since neither level would always be better.
+And how does level 4 do without match accounting?
+All candidates in one paired run (ratio, MB/s, best of 5, Xeon W); "mc" is
+match-acct-small.patch:
+
+              master 1        master 2        1+auto          1+auto+mc       2+auto          2+auto+mc       3+auto+mc
+  silesia   46.61%  624.0   43.56%  540.1   43.98%  581.5   43.92%  575.4   40.93%  509.1   40.84%  504.3   40.50%  484.7
+  doc.tar   69.18% 1155.8   64.23% 1034.3   67.73% 1067.1   67.61% 1060.5   62.71%  965.4   62.56%  958.9   62.86%  847.0
+  linux     23.36%  726.4   23.35%  718.2   20.80%  675.3   20.64%  670.4   20.79%  674.2   20.63%  669.6   20.63%  670.2
+  web       20.13%  806.2   20.10%  798.4   17.73%  747.1   17.73%  747.0   17.73%  747.0   17.72%  748.0   17.72%  747.7
+
+- Match accounting makes 2+auto smaller on all four (silesia -0.09 point,
+  doc.tar -0.15, linux -0.16, web -0.01) for 0.7-0.9% of speed (none on
+  web). Without it, level 4 is less good everywhere, as expected.
+- 1+auto is not between levels 2 and 4 in any useful way: on silesia and
+  doc.tar it's larger than level 2 (43.98% vs 43.56%, 67.73% vs 64.23%)
+  and faster, on linux and web it's much smaller than level 2 and slower,
+  and there it's identical to 2+auto (same text encoder). So it's never
+  better than level 2 in both size and speed, which is the confusing case.
+- 2+auto+mc is smaller and slower than level 2 on all four, so it keeps
+  the levels ordered. 3+auto+mc is smaller than it on silesia only,
+  identical on linux and web, and larger on doc.tar (as master's level 3
+  already was vs level 2).
+
+
+14. What differentiates levels 1 and 2, and intermediate level 3s
+-----------------------------------------------------------------
+
+In the first series, levels 1 and 2 only differ by the probing during a
+literal skip (slz-enc.h, "level >= 2 && skip >= 64"): both use the same
+skip ramp derived from plit (0, 64, 192, 448, ... up to 8128 bytes), the
+same backward match (1 byte) and the same debt accounting (whole groups
+charged at once). Level 1 skips blindly, level 2 still looks up and
+indexes the last word of each skipped 64-byte chunk and stops at the first
+one found in the window. So the 3 points between them on silesia are the
+probing.
+
+Two knobs for an intermediate level, each with auto tree and
+match-acct-small.patch, at -3 (ratio, MB/s, one paired run):
+  c512/c1k/c2k: level 1's blind skip with the ramp capped at 512, 1024 or
+                2048 bytes instead of 8192;
+  st256/st128:  level 2's probing every 256 or 128 bytes instead of 64.
+
+              1+auto+mc      c2k            c1k            c512           st256          st128          2+auto+mc
+  silesia   43.92% 575.4   43.08% 561.1   42.38% 532.6   41.96% 520.0   41.21% 516.3   40.97% 509.8   40.84% 506.3
+  doc.tar   67.61% 1060.3  64.87% 965.5   63.85% 929.5   63.17% 903.6   63.03% 936.4   62.72% 941.8   62.56% 958.8
+  linux     20.64% 670.4   20.63% 671.0   20.63% 670.7   20.63% 670.2   20.63% 670.0   20.63% 670.9   20.63% 670.7
+  web       17.73% 748.1   17.73% 746.9   17.73% 748.4   17.73% 747.6   17.73% 747.4   17.72% 746.6   17.72% 746.9
+
+- On linux and web they're all the same: the text tree's encoder does
+  nearly everything and never skips. A level 3 can only differ from level
+  4 on mixed or binary data.
+- On silesia they all sit on one line, about 0.1 point of ratio per 1% of
+  speed, from 1+auto to 2+auto. No variant beats the line.
+- c1k is smaller than level 2 and slower on all four (silesia 42.38% at 533
+  vs 43.56% at 540), so it would keep levels 2 -> 3 ordered, and it's
+  between 2 and 4 on silesia. But on doc.tar it's slower than level 4 (930
+  vs 959), as are c512 and the sparser probing (st128 942, st256 936): with
+  less probing or shorter blind steps, the .gz files are walked over in
+  more, shorter skips. Only c2k is as fast as level 4 there (965).
+
+
+15. Could 1+auto sit between levels 1 and 2?
+--------------------------------------------
+
+The concern is 1+auto itself: smaller than level 2 everywhere on text
+but slower there, larger on silesia but faster. To stay between levels 1
+and 2 it would have to be faster than level 2 on text too. On text,
+levels 1 and 2 run at nearly the same speed (linux 726 vs 718, web 806 vs
+798) since the skip almost never triggers, so the text tree's encoder
+would have to be as fast as the fixed tree's one, about 7% faster than
+now.
+
+Where its time goes, on linux-7.0.tar (1+auto+mc, MB/s, sizes are off for
+the stripped builds):
+
+                                   linux           web
+  level 1                        23.36%  726.3   20.13%  806.8
+  level 2                        23.35%  718.1   20.10%  797.9
+  1+auto+mc                      20.64%  671.0   17.73%  747.8
+  - no lit_excess per literal    20.76%  672.4   17.86%  747.4
+  - and no auto_account per run  20.61%  678.6   17.72%  757.6
+
+The table lookup per literal for <lit_excess> costs nothing measurable.
+The accounting per literal run costs 1-1.3%. perf stat on linux, whole
+zenc run:
+
+                  cycles    instructions   branches   branch-misses  L1D misses
+  level 2         10.67 G     19.45 G       2.476 G     154.3 M        327.7 M
+  1+auto+mc       11.40 G     22.82 G       2.461 G     157.8 M        340.6 M
+  without both    11.25 G     21.91 G       2.436 G     158.0 M        343.7 M
+
+Same branches, mispredicts and cache misses: the text tree's encoder only
+executes 17% more instructions (3.4 G more, about 2 per input byte). With
+both removed, 2.45 G remain, about 21 instructions per match (115 M
+matches): the text tree's per-match decision (cost with <lit_excess>,
+text_lit_stored(), <text_debt> kept in the stream, references recorded
+while no block is open, <lit_excess> corrected after a backward
+extension). That's where a lighter text path for level 3 would have to
+cut.
+
+
+16. A layout without master's level 2
+-------------------------------------
+
+1+auto is better than 1+auto+mc (+1.06% speed for +0.14% size on
+silesia), hence the proposal of dropping master's level 2 instead. No new
+measurement, numbers from section 13 (one paired run) and, for a possible
+level 5, section 12 (another run):
+
+  level  content       silesia          doc.tar          linux            web
+  1      master 1      46.61%  624.0    69.18% 1155.8    23.36%  726.4    20.13%  806.2
+  2      1+auto        43.98%  581.5    67.73% 1067.1    20.80%  675.3    17.73%  747.1
+  3      2+auto+mc     40.84%  504.3    62.56%  958.9    20.63%  669.6    17.72%  748.0
+  4      3+auto+mc     40.50%  484.7    62.86%  847.0    20.63%  670.2    17.72%  747.7
+  (5     4+auto+mc     40.44%  469.7    62.37%  628.8    20.63%  670.5    17.72%  747.9)
+  dropped: master 2    43.56%  540.1    64.23% 1034.3    23.35%  718.2    20.10%  798.4
+
+- Each level is smaller and slower than the previous one, except 3 -> 4 on
+  doc.tar (larger), and 2 -> 3 -> 4 on linux and web, which are the same
+  within noise (the same text tree encoder does nearly everything).
+- Master's level 2 is still faster than 1+auto on linux and web (718 vs
+  675, 798 vs 747), but there level 1 is faster still for the same size,
+  so it brings nothing on text. On silesia and doc.tar it sits between
+  1+auto and 2+auto, as a middle point rather than the best at anything.
+
+Truth table as in the current code (level = proposed level):
+
+  level                     1         2         3         4          (5)
+  fixed tree's matcher      master 1  master 1  master 2  master 3   master 4
+  literal skip (fixed)      ramp      ramp      ramp +    2048 steps none
+                            0..8128   0..8128   64 B      + 256 B
+                            blind     blind     probes    probes,
+                                                          up to 28 kB
+  backward match (bytes)    1         1         1         2          8
+  debt per literal (>=144)  no        no        no        yes        yes
+  automatic tree            no        yes       yes       yes        yes
+  match accounting          no        no        yes       yes        yes
+
+  With the automatic tree, the text tree's encoder is the same for all
+  levels: master 3's matcher (backward match 2), no skip, stored blocks
+  for literal runs that don't pay, references recorded while no block is
+  open, and every 64 literals a switch to the fixed tree if they average
+  9 bits or more.
+
+
+17. Levels 1 to 4 implemented
+-----------------------------
+
+"new level layout, automatic tree from level 2, 4 levels" (first series)
+sets the layout of section 16 without level 5 (it brings little at an
+unbounded cost on incompressible data since it never skips), and "account
+the text tree's savings on references from level 3" (first series) adds
+the small-table match accounting at levels 3 and 4. The
+encoders' <level> argument is back to master's numbers (skip, backward
+match and debt settings), mapped to the compression levels in a comment
+above _slz_rfc1951_encode_lev1(). Each level's output is identical to the
+configuration measured before, level 1's code is unchanged.
+
+Final numbers, Xeon W, best of 5, ratio and MB/s:
+
+  level   silesia          doc.tar          linux            web
+  1       46.61%  621.8    69.18% 1151.8    23.36%  724.9    20.13%  805.8
+  2       43.98%  581.7    67.73% 1067.8    20.80%  675.8    17.73%  748.2
+  3       40.84%  506.9    62.56%  957.4    20.63%  671.3    17.72%  748.3
+  4       40.50%  485.5    62.86%  848.8    20.63%  671.4    17.72%  748.2
+
+Next: revisit level 4's literal skip to get closer to master's
+level 4 at little cost (e.g. probing every 64 bytes), try an 8-byte
+backward match at level 4, and a 2-byte one at level 3.
+
+Note: zenc's default level is 2, which is now level 1 + automatic tree.
+
+
+18. 2-byte backward match at level 3 (l3-back2.patch)
+-----------------------------------------------------
+
+Level 3 is the only user of the encoder's level 2, so it's one entry of
+SLZ_BACKWARD_MATCH (1 -> 2). Other levels unchanged (same output). Paired
+run, best of 5:
+
+            1 byte           2 bytes          size     speed
+  silesia   40.84%  505.1    40.81%  504.8   -0.07%   -0.06%
+  doc.tar   62.56%  956.2    62.56%  958.0   -0.01%   +0.19%
+  linux     20.63%  671.1    20.63%  671.3   -0.00%   +0.03%
+  web       17.72%  748.0    17.72%  745.8   +0.00%   -0.29%
+
+Speed within noise, a small gain on silesia only. On linux and web the
+text tree's encoder does nearly everything and already uses 2 bytes (it
+runs at the encoder's level 3), so only the fixed tree's segments change.
+
+
+19. Level 4: probing every 64 bytes and 8-byte backward match
+-------------------------------------------------------------
+
+l3-back2.patch (section 18) was dropped. Level 4 is the encoder's level 3:
+skip in 2048-byte steps up to 28 kB with a probe every 256 bytes, 2-byte
+backward match, debt per literal. The text tree's encoder also runs at the
+encoder's level 3, so the 8-byte variants keep it at 2 bytes (otherwise
+levels 2-3 would change too). "Probe every 64" was tried both ways:
+  A  (l4a.patch):  level 3's skip (ramp up to 8128, probe every 64 bytes);
+  A2 (l4a2.patch): level 4's 2048-byte steps, probing every 64 bytes
+                   instead of 256;
+  B  (l4b.patch):  8-byte backward match, current skip;
+  C  (l4c.patch):  A + B.
+Levels 1-3 and -T unchanged (same output). Level 4, paired run, best of 5:
+
+            current         A               A2              B               C
+  silesia   40.50%  487.0   40.81%  496.8   40.48%  481.4   40.49%  483.7   40.80%  494.3
+  doc.tar   62.86%  849.5   62.56%  948.3   62.46%  846.2   62.86%  848.1   62.55%  947.2
+  linux     20.63%  670.8   20.63%  670.9   20.63%  671.2   20.63%  670.8   20.63%  671.1
+  web       17.72%  747.6   17.72%  749.0   17.72%  748.7   17.72%  747.7   17.72%  747.8
+
+  vs current  size/speed:
+  silesia                   +0.76% +2.0%    -0.05% -1.2%    -0.03% -0.7%    +0.72% +1.5%
+  doc.tar                   -0.48% +11.6%   -0.64% -0.4%    -0.00% -0.2%    -0.49% +11.5%
+
+- A turns level 4 into level 3 with a 2-byte backward match and the debt
+  per literal: on silesia it's 40.81% vs level 3's 40.84%. It's the skip
+  that makes level 4 smaller, so A removes the difference between the two
+  levels (and C as well).
+- B, the 8-byte backward match, gains 0.03% on silesia for 0.7% of speed.
+- A2 is the only one going in level 4's direction: 0.05% smaller on
+  silesia for 1.2% of speed (master 4 + auto + mc was 40.44% at 470,
+  section 12), and 0.64% smaller on doc.tar, where level 4 then becomes
+  smaller than level 3 (62.46% vs 62.56%) instead of larger.
+- Nothing changes on linux and web (text tree's encoder).
+
+A2 was applied in "probe every 64 skipped bytes at level 4" (first series).
+A, B and C were dropped.
+
+
+20. A2 + 8-byte backward match at level 4
+-----------------------------------------
+
+A2+B was missing. l4b.patch on top of A2 (text tree's
+encoder kept at 2 bytes, levels 1-3 and -T unchanged). Level 4, paired
+run, best of 5:
+
+            A2              A2+B            size      speed
+  silesia   40.48%  477.7   40.47%  475.5   -0.032%   -0.46%
+  doc.tar   62.46%  845.5   62.45%  844.2   -0.015%   -0.15%
+  linux     20.63%  668.1   20.63%  668.8   -0.001%   +0.10%
+  web       17.72%  745.0   17.72%  744.2   -0.000%   -0.11%
+
+Same as B alone on the 256-byte probing (section 19): 0.03% on silesia,
+speed within noise to -0.5%. The probing doesn't change what the backward
+extension finds, the two are independent.
+
+Applied in "extend matches up to 8 bytes backwards at level 4" (first
+series), the text tree keeping 2 bytes.
+
+
+21. One encoder function, without slz-enc.h
+-------------------------------------------
+
+The second series (clean version of the first) and the third series. In
+the first and second series, the encoder's body was in slz-enc.h,
+included three times by slz.c (SLZ_ENC_AUTO 0, 1, 2): fixed tree only,
+automatic tree's fixed side, and a noinline text side receiving the fixed
+side's reference table by pointer. The triple include was rejected
+outright: one function, the tree chosen by "if" blocks the way the literal
+skip uses <level>, constant arguments describing behaviour and only used
+as conditions, never pointers.
+
+  - Passing the reference table by pointer to one shared inlined body had
+    already been measured as a dead end months ago (it turns direct stack
+    accesses into indirect loads), and was again here: no retry.
+  - First attempt (WIP, on the third series): one loop, a constant <tree>
+    plus a runtime <text> variable for the tree in use, a label restarting
+    the loop at the switch. Output identical to the second series'
+    "choose the huffman tree on the fly from level 2", level 1 at the
+    same speed (620.4 -> 620.5 MB/s on silesia, 6 instructions shorter),
+    but levels 2-4 slower, MB/s, best of 5 alternated, second series ->
+    first attempt:
+
+      level   silesia                  linux-7.0
+        2     581.0 -> 540.3 (-7.0%)   650.0 -> 605.1 (-6.9%)
+        3     510.3 -> 491.7 (-3.6%)   648.9 -> 626.9 (-3.4%)
+        4     490.5 -> 480.9 (-2.0%)   647.5 -> 637.4 (-1.6%)
+
+    Level 2 started at -10.5%: the backward match length had become a
+    runtime choice (2 bytes for text, 1 for fixed). backward_match(), an
+    inline helper called once per tree with a constant length, brought it
+    to -7%. The rest is the "if (text)" tests, not mispredictions: 7.4%
+    more instructions and 17% more branches at level 2, same mispredicts.
+    60% of level 2's time on silesia is in the text tree, whose code had
+    been specialized and now tested <text> at every step. Testing the tree
+    only every 64 literals gave more branches, not fewer.
+  - The approach that worked (WIP, on the third series): one function with
+    two parts, a fixed tree part and a text tree part, each with its own
+    loop holding only its own tree's code, and gotos between them
+    (switch_to_text, switch_to_fixed: close the block, then jump). Both
+    index the same local reference table. Output identical to the second
+    series, level 1 407 instructions instead of 409. MB/s, best of 5
+    alternated, second series -> two-part encoder:
+
+      level   silesia                  linux-7.0
+        1     592.6 -> 593.3 (+0.1%)   694.5 -> 696.8 (+0.3%)
+        2     554.1 -> 560.6 (+1.2%)   649.1 -> 658.7 (+1.5%)
+        3     491.6 -> 492.4 (+0.2%)   648.6 -> 655.8 (+1.1%)
+        4     471.8 -> 478.3 (+1.4%)   647.8 -> 655.8 (+1.2%)
+       -T     454.6 -> 451.6 (-0.7%)   652.5 -> 649.6 (-0.4%)
+
+    (-T's code only differs by two instructions; within noise.)
+
+The two-part encoder's argument, first named "autom", became <auto_tree>
+in the encoder and <track_save> in the copy_lit*() helpers, where it means
+adding what the text tree would have saved on the fixed tree's literals to
+<tree_save>, or resetting it when they go out as a stored block.
+
+
+22. Level 1 on Arrow Lake
+-------------------------
+
+Runs on ARL, silesia, -D -1 -l 4 (same output everywhere), best of 4:
+
+  commit                MB/s    vs master   level 1 code
+  master (v1.4-dev5)    941.2   -           419 instructions
+  plit ramp (1)         932.9   -0.9%       409
+  new level 2 (2)       920.2   -2.2%       identical to (1)
+  third series' tip     929.9   -1.2%       407
+
+  (1) "derive the literal skip ramp of levels 1 and 2 from plit"
+  (2) "shift levels 2 and 3 to 3 and 4 to make room for a new level 2",
+      final as "insert a new level between levels 1 and 2, shifting 2 and
+      3 to 3 and 4"
+
+(1) and (2) compile level 1 to the same code but differ by 1.4%, so at
+least that step is code placement. -falign-functions=64 on the tip was
+worse (930.7 MB/s). The suspicion was the plit ramp itself (it was neutral
+on the Xeon). ramp-l1.patch gives level 1 master's separate skip_ratio
+ramp back while levels 2-4 keep the plit one: level 1's output is
+identical, its code is 420 instructions (master 419), and levels 2-4
+compile to the third series' code.
+
+ARL binaries of master and of the final series' tip (gcc 15.2 -march=
+arrowlake-s -O3 -fomit-frame-pointer, read from their DWARF producer, and
+rebuilt to the same code) show the cause. Since (1), gcc keeps
+plit + 1 in another register for the ramp and the code after the loop, so
+each literal without a match costs an extra "mov %edx,%esi" and a "jmp"
+back, and the hash hit becomes a taken jump over the function's exit code,
+which gcc placed inside the loop. Master's literal block falls into the
+loop head instead, and the hit falls through. gcc 13 on the Xeon makes the
+same change, where it costs nothing. With ramp-l1.patch on top of the
+final series, level 1's loop is master's again
+with gcc 15, its output is master's, and levels 2-4 keep the tip's code
+(level 4 only differs by alignment padding).
+
+That was not the cause: on ARL, the patched level 1 gave 916.1 MB/s
+against 930.1 for the final series' tip (master 941). Counted on the Xeon
+with the ARL binaries (perf, silesia, -D -1), the three run the same number
+of instructions within 0.2% (master 3.178G, tip 3.182G, ramp-l1 3.184G);
+the tip has 8.4% more branches than master, the patched one 1.8%
+more, and branch misses are the same within 2%. So the code is
+equivalent and the difference is in how the front end takes the layout.
+On the Xeon the same sources built with the ARL build's flags give, best
+of 5, MB/s:
+
+                        master   tip      ramp-l1
+  ARL build's flags      587.6    558.1    562.5
+  + JCC flags            610.6    599.9    603.9
+  + JCC flags and
+    -falign-labels=64    584.8    585.1    589.5
+
+The JCC erratum explains most of the Xeon gap, and -falign-labels=64
+removes the rest (at a cost for all three), which points to branch target
+placement, as on the Zen 4.
+
+ARL runs with -falign-labels=64 added, silesia, -D -1:
+
+                          without   with -falign-labels=64
+  master                   941.2      914.6
+  ramp-l1                  916.1      914.3
+
+Once the branch targets are aligned, master and ramp-l1 run at the
+same speed: level 1's 1% on ARL is the placement of branch targets, master
+having a lucky layout, and not the code. The ramp experiment is dropped,
+level 1 keeps the plit ramp. Levels 2-4 lose 3-5% with the flag (padding),
+so it's no fix either.
+
+Same ARL runs at the other levels (third series' tip, MB/s): levels 2-4
+are better at similar or better ratios than master's, level 3 at the same
+speed as master's 3 with 2.3 points less, level 2 0.4 points smaller than
+master's 2 and 9% faster:
+
+  silesia   master                 3rd tip
+    1       46.61%  940.1          46.61%  928.0
+    2       43.56%  830.0          43.98%  905.3
+    3       43.17%  794.4          40.84%  793.3
+    4       43.11%  746.9          40.47%  757.0
+
+
+23. 8-byte backward match in the text tree's part
+-------------------------------------------------
+
+Does the 8-byte backward match help text (HTML tags)? Scratch build where
+the text tree's part uses 8 bytes, against the third series' tip, Xeon:
+
+                    size      MB/s
+  web.cat -2       -0.060%   717.6 -> 710.4  -1.0%
+  web.cat -3       -0.060%   724.1 -> 709.2  -2.1%
+  web.cat -4       -0.060%   720.1 -> 709.1  -1.5%
+  linux-7.0 -2     -0.062%   653.8 -> 648.5  -0.8%
+  linux-7.0 -3     -0.066%   658.8 -> 643.8  -2.3%
+  linux-7.0 -4     -0.066%   653.9 -> 643.9  -1.5%
+  silesia -2       -0.018%   557.3 -> 552.7  -0.8%
+  silesia -3       -0.020%   490.4 -> 482.8  -1.5%
+  silesia -4       -0.021%   463.2 -> 457.7  -1.2%
+
+A check on haproxy's HTML documentation (hap-org.html, 932561 bytes)
+found it brings nothing either. The text tree's part keeps 2 bytes.
+
+
+24. Starting with the text tree
+-------------------------------
+
+On large files, the automatic tree came close to the former forced text
+tree (-T) but never reached it. ARL runs with the third series' tip, -D:
+
+               linux-7.0 (-p)     silesia (-l 4)     hap-org.html (-l 1000)
+    1          23.36%  1039.4     46.61%  929.0      30.21%  868.2
+    2          20.80%  1010.0     43.98%  907.3      26.11%  838.1
+    3          20.63%  1010.0     40.84%  795.7      26.10%  840.0
+    4          20.63%  1019.3     40.47%  763.2      26.09%  844.6
+   -T          20.61%  1019.4     41.64%  755.7      26.08%  844.4
+
+Level 4 is always about as small as -T or smaller, and about as fast or
+faster; on silesia level 3 is both faster and smaller than -T. What was
+missing was the start: every stream started with the fixed tree, which
+took 1280 bits of evidence to switch. On small objects that is a constant
+loss of about 160 bytes per stream (8% at 4 kB). Single stream made of the
+first N bytes, -D, bytes, third series' tip:
+
+                    -1      -2      -4      -T
+  hap-org  2 kB     1197    1197    1222    1060
+           4 kB     2277    2240    2094    1932
+          16 kB     5756    5206    5060    4899
+          64 kB    19523   17361   17216   17054
+  web.cat  4 kB     1492    1492    1514    1350
+          16 kB     5872    5549    5253    5088
+          64 kB    17324   15653   15356   15192
+
+Starting with the text tree from level 2 gives exactly -T's output on
+these at levels 2 to 4 (hap-org.html 1060, 1932, 4899, 17054; web.cat
+1350 at 4 kB). Level 1 must never start with it: it has no text part,
+but flush and finish send the end of block code of <cur_tree>, so the
+stream would be corrupt. Hence, in the three init functions:
+
+  strm->cur_tree = (strm->level >= 2) ? SLZ_CT_TEXT : SLZ_CT_GENERIC;
+
+Large files are neutral: silesia, linux and web change by at most 0.0014%
+in size, and speed by -0.3% to +0.3% at levels 2-4 (Xeon). ARL runs with
+the text start (-D):
+
+               hap-org.html       silesia            linux-7.0
+    2          26.08%  837.4      43.98%  904.7      20.80%  1009.3
+    3          26.08%  833.0      40.84%  794.8      20.63%  1003.0
+    4          26.08%  835.1      40.47%  758.0      20.63%  1007.8
+
+Random data is unchanged (the first literals go out as stored blocks
+anyway). The start of a binary object costs about 80 bytes, until the text
+part gives up after 64 binary literals: start of an ELF binary, -2, 1155
+-> 1234 bytes at 4 kB, 9426 -> 9506 at 16 kB, 36310 -> 36389 at 64 kB.
+haproxy mostly compresses text types, so this is a win there.
+
+
+25. The content type as a hint
+------------------------------
+
+The third series had removed slz_set_content_type() and zenc -T, since the
+encoder no longer needs to be told. It was brought back: haproxy detects
+text from the content-type, and at level 1, which has no text tree, that
+benefit would be lost. Level 1 + automatic tree already exists, it's level
+2, so the hint only needs a dispatch rule in slz_rfc1951_encode(), not a
+new encoder.
+
+Which level for a text stream: level 2 can't reach -T on linux (20.80%
+vs 20.61%) even when it starts with the text tree, because it has no match
+accounting: once the fixed tree takes over on a binary area, it rarely
+notices the low-literal text that follows, such as the AMD headers
+(section 11). Level 3 gets 20.63% at about level 2's speed on text. Level
+4 was considered (section 24: on linux and HTML it's smaller and faster
+than -2 and -3), but level 3 is enough ("fast and highly compressed, not
+too heavy skips"), and on non-text data a wrong content type then
+only costs level 3's speed.
+
+So SLZ_CT_TEXT makes levels 1 and 2 work as level 3 (level 0 stays
+uncompressed), and level 1 starts with the text tree as well. zenc's -T
+is that hint, no longer exclusive with the level, so that zenc keeps
+testing the internal API: -1 -T and -2 -T give the same output as -3.
+
+
+26. The final series
+--------------------
+
+From master (v1.4-dev5), the content type API never removed, each change
+in the commit it belongs to:
+
+  slz: derive the literal skip ramp of levels 1 and 2 from plit
+  slz: derive level 3's literal skip ramp from plit too
+  slz: remove level 4
+  slz: insert a new level between levels 1 and 2, shifting 2 and 3 to 3 and 4
+  slz: choose the huffman tree on the fly from level 2
+  slz: account the text tree's savings on references from level 3
+  slz: probe every 64 skipped bytes at level 4
+  slz: extend matches up to 8 bytes backwards at level 4
+  slz: pass the backward match length to the encoder
+
+"choose the huffman tree on the fly from level 2" brings the two-part
+encoder, the text start and the hint (level 1 -> 2 at that point);
+"account the text tree's savings on references from level 3" raises the
+hint to level 3 with the match accounting. Level 1's output is master's
+throughout. The final tree is the same as the third series plus its "start
+with the text tree, and bring back the content type as a hint", apart from
+a comment reflow. Each commit was checked for output (round trips at
+all levels with and without -T, unchanged levels identical), level
+functions' code (objdump), and paired timings, given in each message.
+
+Before (after the new level is inserted, same level number) and after (the
+last commit), Xeon W, best of 5 alternated, ratio and MB/s:
+
+  silesia     before           after
+    1         46.61%  591.7    46.61%  590.3   -0.2%
+    2         46.61%  592.5    43.98%  558.0   -5.8%
+    3         43.56%  517.3    40.84%  488.9   -5.5%
+    4         43.18%  491.9    40.47%  463.4   -5.8%
+  linux-7.0
+    1         23.36%  695.2    23.36%  692.9   -0.3%
+    2         23.36%  695.2    20.80%  655.6   -5.7%
+    3         23.35%  690.1    20.63%  658.7   -4.6%
+    4         23.28%  678.4    20.63%  652.7   -3.8%
+  web
+    1         20.13%  762.7    20.13%  759.7   -0.4%
+    2         20.13%  764.6    17.73%  721.4   -5.7%
+    3         20.10%  759.1    17.72%  725.1   -4.5%
+    4         20.05%  747.2    17.72%  718.3   -3.9%
+  hap-org.html
+    1         30.21%  590.0    30.21%  588.3   -0.3%
+    2         30.21%  589.9    26.08%  547.7   -7.2%
+    3         30.21%  584.4    26.08%  552.6   -5.4%
+    4         30.12%  573.6    26.08%  548.3   -4.4%
+
+Before, level 2 is a copy of level 1, and levels 3-4 are master's 2-3
+with the plit ramps. Levels 2-4 trade 4 to 7% of speed for 2.6 to 4.1
+points of ratio; level 1 is within -0.4%, the same code as before apart
+from the level bitfield test at entry and code placement.
+
+ARL run of the tip (-D, MB/s; -T same output as -3 at levels 1-3,
+as -4 at level 4):
+
+         linux-7.0 (-p)     silesia (-l 4)     silesia -T
+    1    23.36%  1040.1     46.61%  931.0      40.84%  793.7
+    2    20.80%  1008.0     43.98%  905.7      40.84%  794.4
+    3    20.63%  1004.7     40.84%  794.1      40.84%  793.6
+    4    20.63%  1005.5     40.47%  758.3      40.47%  757.8
+
+hap-org.html (-l 1000): 30.21% 868.5, then 26.08% at 837.6, 834.4 and
+832.6 MB/s for levels 2-4, i.e. the former -T's ratio at 1-1.4% below its
+844.4 MB/s, and within 0.3% of the text start test (837.4, 833.0, 835.1).
+
+Same sizes as the Xeon, and speeds within 0.3% of the third series' tip
+plus text start on ARL (sections 22, 24). Level 1 remains 1.1% below master
+(941.2), which is what ramp-l1.patch was meant to test (section 22: it's
+branch target placement).
+
+27. fixed_auto[] in 32 bits or less (auto-tbl.patch)
+----------------------------------------------------
+
+The code of this experiment (SLZ_AUTO_TBL) is auto-tbl.patch, against the
+final series before lit_tsave[] was folded into it.
+
+The concern: fixed_auto[] (256 x u64 = 2 kB) could weigh on
+the L1 cache, and cost on 32-bit machines (64-bit loads and additions).
+Its low 32 bits hold the fixed code (fixed_huff[]'s format, 13 bits at
+most) and its high ones the bits the text tree would save, plus 16; one
+64-bit addition per literal sums both, the codes never reaching the high
+half (65535 x 0x1fff < 2^29). With 32 bits the codes' sum would spill into
+the save field, so each variant reads it separately. The saves only range
+from -3 to +3. SLZ_AUTO_TBL selects, in _copy_lit_huff():
+
+  0  fixed_auto[], u64, 2 kB (current)
+  A  fixed_auto32[], u32, 1 kB: save + 16 in bits 24-31, code below;
+     sum += e >> 24, and the code masked
+  B  fixed_huff[] (u16, 576 bytes, already used by level 1) for the code,
+     and lit_tsave[], int8, 256 bytes, for the save
+  C  fixed_auto16[], u16, 512 bytes: save + 3 in bits 13-15, code below;
+     sum += e >> 13, and the code masked
+
+Output identical in all four, 64-bit and 32-bit (-m32), levels 2-4, 4 kB
+blocks and 3000-byte inputs, on silesia, linux, web, hap-org.html, random
+data and an ELF binary; 32-bit round trips checked.
+
+64-bit, Xeon, best of 5, the four alternated in each round, MB/s:
+
+                 0        A               B               C
+  silesia -2   558.1   556.2 -0.3%    558.6 +0.1%    557.7 -0.1%
+          -3   489.0   484.5 -0.9%    489.1 +0.0%    488.2 -0.2%
+          -4   462.6   459.1 -0.8%    461.9 -0.2%    460.0 -0.6%
+  linux   -2   656.6   656.6 +0.0%    656.6 +0.0%    656.5 -0.0%
+          -3   658.9   658.4 -0.1%    659.0 +0.0%    659.0 +0.0%
+          -4   652.2   652.3 +0.0%    649.9 -0.4%    650.4 -0.3%
+  web     -2   721.1   720.1 -0.1%    719.4 -0.2%    722.8 +0.2%
+          -3   724.3   724.9 +0.1%    726.0 +0.2%    728.1 +0.5%
+          -4   720.0   719.7 -0.0%    717.6 -0.3%    717.5 -0.3%
+  hap-org -2   547.7   549.7 +0.4%    548.4 +0.1%    548.5 +0.1%
+          -3   555.3   553.6 -0.3%    552.5 -0.5%    555.7 +0.1%
+          -4   549.5   548.7 -0.1%    547.1 -0.4%    548.6 -0.2%
+
+32-bit (-m32, same machine): the first run showed up to +9% at level 2 on
+text for B and C, where the table isn't even read (text tree). Levels 2-4
+compile to identical code in the four builds, but B and C move them by 32
+bytes, as the literal function changes size. With -falign-functions=64
+(all level functions at the same offset, only the literal function
+differs), MB/s:
+
+                 0        A               B               C
+  silesia -2   408.1   414.1 +1.5%    409.0 +0.2%    391.4 -4.1%
+          -3   348.8   352.7 +1.1%    347.4 -0.4%    328.3 -5.9%
+          -4   326.4   331.0 +1.4%    330.0 +1.1%    303.8 -6.9%
+  linux   -2   482.3   482.3 +0.0%    482.0 -0.1%    480.7 -0.3%
+          -3   465.0   464.8 -0.0%    464.2 -0.2%    464.8 -0.0%
+          -4   466.1   465.7 -0.1%    466.0 -0.0%    465.6 -0.1%
+  hap-org -2   397.2   397.4 +0.1%    397.8 +0.2%    396.8 -0.1%
+          -3   385.5   385.5 +0.0%    384.7 -0.2%    383.8 -0.4%
+          -4   386.1   386.6 +0.1%    387.2 +0.3%    386.8 +0.2%
+
+C's loss is an i386 register shortage: gcc spills the 16-bit entry
+("mov %dx,(%esp)") and reloads it on 32 bits ("mov (%esp),%ecx"), a store
+that can't be forwarded to the wider load, on every literal.
+
+- 64-bit: no gain from any variant; the 2 kB table shows no L1 effect on
+  the Xeon (32 kB L1D, the benchmark alone). Under haproxy, with other code
+  competing for L1, it could differ; that isn't measured here.
+- 32-bit x86: A gains 1.1-1.5% where the fixed tree's literals matter
+  (silesia), B is neutral, C loses 4-7%. Text is unaffected.
+- Not measured here: ARL, and 32-bit ARM, which has more registers than
+  i386. The runs below cover ARL and the Cortex-A72 (64-bit).
+- If a variant is taken, A halves the table and is the only one faster on
+  32-bit; B has the smallest footprint (256 bytes beyond fixed_huff[]) and
+  is neutral. mktext would then generate the chosen table instead of
+  deriving it from fixed_auto[] as this experiment does.
+
+Runs on other machines, silesia, -D, one run each, MB/s:
+
+  Cortex-A72 (-p)  master   0       A               B
+    1              167.1    167.6   168.7 +0.7%     169.7 +1.3%
+    2              144.3    160.4   162.1 +1.1%     160.8 +0.2%
+    3              139.0    136.8   137.9 +0.8%     137.9 +0.8%
+    4              133.1    131.4   132.1 +0.5%     130.9 -0.4%
+
+  ARL (-l 4)                0       A               B
+    1                       929.7   928.1 -0.2%     930.5 +0.1%
+    2                       905.4   904.8 -0.1%     905.8 +0.0%
+    3                       792.9   791.6 -0.2%     794.9 +0.3%
+    4                       757.5   754.5 -0.4%     757.2 -0.0%
+
+Level 1 doesn't use the table and its code is the same in all builds, yet
+it moves by 1.3% on the A72 and 0.3% on ARL: that's the noise of these
+single runs. Within it, A is about 1% faster on the A72 and slightly
+slower on ARL (as on the Xeon, -0.8% at levels 3-4 on silesia), B is
+neutral on both. B is neutral everywhere measured (Xeon 64 and 32-bit,
+ARL, A72), with the smallest footprint and no new code table, only the
+256-byte lit_tsave[] next to fixed_huff[]: it's the one to take.
+
+
+Runs on ARL, EPYC (gcc 15) and Altra, silesia, -D -l 2, best of 4
+consecutive runs of each build, MB/s (C = SLZ_AUTO_TBL=3):
+
+  level 1          0        A               B               C
+    ARL          931.8    931.4 -0.0%     931.3 -0.1%     932.3 +0.1%
+    EPYC         567.0    571.0 +0.7%     571.5 +0.8%     572.6 +1.0%
+  level 3
+    ARL          794.9    792.3 -0.3%     795.2 +0.0%     787.9 -0.9%
+    EPYC         480.5    475.7 -1.0%     475.9 -1.0%     472.4 -1.7%
+    Altra        312.5    315.9 +1.1%     314.1 +0.5%     313.2 +0.2%
+
+(Altra didn't differ at level 1.) Level 1 doesn't read the table and its
+code is the same in all builds, so EPYC's +0.7 to +1.0% there is layout,
+as large as the level 3 differences on EPYC and Altra, which therefore
+can't be told from layout. ARL's level 1 is flat (±0.1%), so its level 3
+column is the most telling: C -0.9%, A -0.3%, B equal. C is the slowest
+at level 3 on both x86 machines, despite its level 1 lead. B is equal on
+ARL, slightly ahead on Altra, and 1% behind on EPYC, where A is too.
+
+Run on the Cortex-A720 (gcc 15), silesia, -D -3 -l 2, best of 4,
+MB/s:
+
+                 0        A               B               C
+  level 3      441.9    448.6 +1.5%     450.2 +1.9%     449.2 +1.7%
+
+There the 64-bit table is clearly the slowest. B is the only variant never
+clearly worse anywhere (equal on ARL, the Xeon and 32-bit x86, 1% behind
+on EPYC within its layout noise, ahead on the Altra and A720), with the
+smallest footprint: it was folded into "choose the huffman tree on the fly
+from level 2", mktext -g generating lit_tsave[] instead of fixed_auto[].
+The output of every commit of the series is unchanged, and the level
+functions compile to the same code (level 4 only differs by placement).
+

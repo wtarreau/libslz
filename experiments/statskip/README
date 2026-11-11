@@ -1,0 +1,714 @@
+Statistics-based literal skip
+=============================
+
+2026-11-11, on top of v1.4-dev5. All figures
+are from the Xeon W-2145 (Skylake), zenc -D, 4 MB blocks, unless stated
+otherwise. Nothing here is merged; the code was in src/slz.c under
+SLZ_STAT_SKIP and SLZ_TRACE, both off by default (the default build is
+byte-identical to master). It is now in statskip.patch, which applies to
+v1.4-dev5 and also holds SLZ_SKIP_PLIT and SLZ_AUTO_TREE
+(sections 11 to 14).
+
+
+1. The idea
+-----------
+
+The proposal: incompressible data are generally pseudo-random, so the
+average of their bytes is close to 128. Instead of exponential skip jumps,
+once a certain number of literals are pending, walk the following bytes one
+by one ("byte mode"), feeding a moving average preset to 128*256:
+
+    avg = avg - (avg + 255) / 256 + x
+
+which converges to 256 times the mean, possibly with a similar measure of
+the spread, and stop as soon as it leaves a band around 128 (or the spread
+drops). The goal: shorter jumps than the exponential ones, and a cheaper
+search for the end of the incompressible area. And if it works, use it on
+the text tree too, which never skips today and is slower on silesia for
+that reason, so that it can fly over short random areas.
+
+The spread as written, var = var - (var + 255) / 256 + (x - avg), averages
+to zero on any data since x - avg is signed. It was replaced by the mean
+absolute deviation: mad = mad - (mad + 255) / 256 + |x - avg/256|, preset to
+64*256, the value for random bytes.
+
+
+2. What the current skip does
+-----------------------------
+
+Levels 1 and 2 (generic tree only) check every 64 pending literals without a
+match, and skip 0, 64, 192, ... up to 8128 bytes, doubling at each check and
+reset by a match. Level 1 skips blindly. Level 2 probes the last word of
+each 64-byte chunk of a step, indexes it, and stops on the first one already
+in the window. Level 3 does the same with 256-byte chunks and up to 28 kB.
+The text tree never skips.
+
+Corpora (all in /dev/shm):
+  silesia.tar   211947520 bytes
+  lin200.tar    first 211947520 bytes of the Linux tarball
+  web.cat       187621710 bytes of web files
+  doc.tar       72089600 bytes, tar of /usr/share/doc on this machine:
+                47% of it is .gz files mixed with short text files, a
+                good case of short incompressible areas
+  icons.tar     37928960 bytes, tar of /usr/share/icons and pixmaps
+
+Ground truth: zenc built with -DSLZ_TRACE -DSLZ_LITERAL_SKIP=0 records every
+match found when every byte is looked up (levels 1 and 2 are then
+identical). "Incompressible" below means a byte within a run of at least
+1024 literals of that trace. Share of each input:
+
+                 matched   incompressible
+  silesia         78.1%        9.2%
+  doc.tar         45.3%       46.7%
+  icons.tar       93.8%        0.2%
+  lin200.tar      92.5%        0.0%
+  web.cat         95.2%        0.0%
+
+Within silesia, the incompressible bytes are almost all in x-ray (99.9%
+of it, 8.5 MB), sao (89%, 7.3 MB), mozilla (6%) and samba (6%).
+
+Baseline (best of 3, output bytes and MB/s, -l 3, first run without the JCC
+flags):
+
+                     -1 skip      -1 no skip    -2 skip      -2 no skip
+  silesia   out   296350698      279019092    276981102     279019092
+            MB/s      559.0          465.0        472.7         452.6
+  doc.tar   out   149616624      140716524    138919776     140716524
+            MB/s     1043.9          526.3        913.2         520.3
+
+Level 1's blind skip costs 6.2% of output on silesia. Level 2's probed skip
+is smaller than no skip at all, since the skipped random bytes leave as
+stored blocks instead of 9-bit fixed huffman literals. On data without
+incompressible parts (linux, web, icons) both skips cost 1-4% of speed
+compared with no skip (first run, partly layout noise).
+
+Where they lose, from skipcmp (share of the bytes the no-skip build matched
+that are skipped, i.e. lost to the skip):
+
+                 level 1    level 2
+  mr              68%        1.6%
+  ooffice         11%        0.7%
+  mozilla         6.8%       0.7%
+  osdb            4.6%       0.05%
+  doc.tar        12.5%       0.66%
+
+The level-1 loss comes from the blind skip starting inside compressible
+data, after 64 literals in a row (mr is an MRI image: 80% matched, yet
+2202 skip steps there), and overshooting by up to 8 kB. Level 2 already
+locates the end of an incompressible area within 64 bytes (most episodes
+overshoot by 0 bytes); what it pays is the ramp at the start: 2.9% of
+doc.tar's incompressible bytes and 10% of mozilla's are still looked up one
+by one.
+
+
+3. Do byte statistics tell incompressible chunks apart?
+-------------------------------------------------------
+
+sigstat.c evaluates signals on every 64-byte chunk against the ground
+truth. "recall" is the share of incompressible bytes a skip relying on the
+signal would pass over, "lost" the share of matched bytes in chunks it
+would wrongly pass over. Selected thresholds:
+
+                                silesia          doc.tar
+                              recall  lost    recall  lost
+  ewma256 |mean-128| <= 8      31.4   0.20     88.4   1.03
+  ewma256 |mean-128| <= 16     49.6   0.67     96.6   2.19
+  ewma256 mad >= 60            90.2  18.3      97.1   2.81
+  chunk |mean-128| <= 16       42.9   1.56     88.0   1.81
+  chunk sd >= 60               90.7  19.9      99.7   1.20
+  chunk eq1+eq2+eq4 <= 2       44.2   4.73     93.5   3.24
+  chunk distinct >= 52         26.4   0.08     96.6   0.54
+  chunk hibit |n-32| <= 8      60.5   4.95     95.2   0.97
+  mean<=28 && sd>=60 && eq<=3  47.0   0.86     96.5   0.70
+
+(ewma256 is the proposed average and the mad above, carried over all bytes;
+eq counts bytes equal to the one 1, 2 or 4 before; distinct is the number
+of distinct values in the chunk.)
+
+  - The spread alone is useless: 18-20% of silesia's matched bytes are in
+    chunks with a random-like spread (x86 code, binaries). Combined with
+    the mean it changes almost nothing.
+  - The proposed average is the second best signal after the distinct
+    count.
+  - On silesia, recall stays low whatever the signal, because the
+    statistics detect random data, while what matters to slz is the
+    absence of repeats. Per member: x-ray (12-bit samples in 16 bits, mean
+    and spread nowhere near random) is never detected, sao (floats) is
+    detected in proportion to its few matches, ooffice never, while the
+    compressed parts in mozilla (80%), samba (85-90%) and reymont (99%) are
+    found with 0.1-0.4% lost. On doc.tar, the .gz members are found at
+    88-97% recall.
+
+So statistics cannot replace the probes of level 2: x-ray and sao are only
+seen by a lookup. They can only be a complement.
+
+
+4. Variants implemented
+-----------------------
+
+SLZ_STAT_SKIP bits (see the comment above slz_looks_random() in slz.c):
+   1  level 1: a skip step is only taken if the 64 bytes just scanned look
+      random (the "gate");
+   2  no ramp: when they do, the step is immediately the largest one;
+   4  level 1: each 64-byte chunk of a step is tested too, and the step
+      stops on the first that doesn't look random;
+   8  level 2: gate as in 1;
+  16  the byte mode, levels 1 and 2, replacing all of the above: once
+      64 literals are pending, walk without any lookup while
+      |avg/256 - 128| <= SLZ_STAT_T and mad >= SLZ_STAT_M, then resume the
+      main loop SLZ_STAT_LAG bytes before the stop (the averages take a few
+      tens of bytes to react). The walked bytes are pending literals marked
+      for a stored block;
+  32  with 16, on the text tree too: the walked bytes are charged their exact
+      cost in <lit_excess>, so the usual decision sends them stored, and the
+      walk stops before <plit> reaches the 0xffc0 flush point;
+  64  with 16, the walk reads 8 bytes at a time and feeds their sum (SWAR)
+      with 1/32 per step, same steady state, no mad.
+SLZ_STAT_FN picks the chunk test of bits 1-8: 1 mean +/- 16, 2 >= 52
+distinct values, 3 mean +/- 16 and eq <= 2, 4 the proposed average (+/- 8)
+fed with the tested chunks.
+
+All variants round-trip (gzip -dc | cmp) at levels 1 and 2 on silesia and
+doc.tar, and the text ones with -T on silesia, doc.tar and lin200.
+
+
+5. Output sizes
+---------------
+
+Level 1, relative to master's level 1 (and to master's level 2 after the
+slash for the byte mode), -l 1:
+
+                      silesia    doc.tar   lin200    web     icons
+  no skip              -5.85      -5.95    -0.10    -0.20    -0.84
+  gate (s1, any fn)    -5.5       -2.2     -0.10    -0.20    -0.5
+  no ramp (s2)         +0.4..+2.7 +5..+7    0.00    +0.0..+0.5 +2..+4
+  gate+ramp (s3)       -3.4..-5.2 +2.4..+2.7    -0.10    -0.2     +3.6..+4.8
+  gate+end (s5, fn2)   -5.97      -7.32    -0.10    -0.20    -0.89
+  byte t8 m0 g64       -6.70/-0.17 -7.25/-0.11 -0.08/-0.03 -0.19/-0.04 -0.90/-0.03
+  byte t4 m0 g64       -6.79/-0.28 -7.40/-0.27 -0.08/-0.03 -0.19/-0.04 -0.91/-0.03
+  byte t16 m48 g64     -6.04/+0.53 -7.07/+0.09 -0.07/-0.01 -0.13/+0.01 -0.85/+0.02
+  byte t24 m48 g64     -4.82/+1.83 -6.94/+0.22  0.00/+0.05 -0.04/+0.10 -0.77/+0.10
+  mad only m56 g64     +7.92/+15.5 -5.60/+1.67 ...
+
+  - The gate removes most of level 1's loss on silesia but not on doc.tar,
+    where the blind 8 kB steps still overshoot; testing every chunk of a
+    step (s5) fixes that, and gives smaller output than no skip at all.
+  - The byte mode at +/- 8 and a 64-byte lag is smaller than master's
+    level 2 on every corpus. The mad threshold barely matters, the
+    average is what stops the walk. A 64-byte lag is better than 32 or 0,
+    longer lags add little. Tighter bands give smaller output (see 6 for
+    why they cost speed).
+  - Level 2 with "no ramp when random" (s2) costs only +0.04%.
+  - In byte mode levels 1 and 2 give the same output (no probes).
+
+Text tree (-T, level 2), master vs walk:
+
+                   silesia     doc.tar     lin200      web
+  master          176495354    90121850   108204160   66488512
+  w112 t8         +0.08%       -0.05%      +0.00%      +0.00%
+  w112 t12        +0.13%       -0.04%      +0.00%      +0.01%
+  w112 t16        +0.21%       -0.02%      +0.01%      +0.02%
+
+
+6. Where the byte mode stops
+----------------------------
+
+skipcmp on doc.tar (byte mode, mad off, 64-byte lag):
+
+                steps   skipped  lost   inc looked up  overshoot
+  t4 (bytes)   237459    33.6%   0.19%     30.2%        0.31%
+  t8 (bytes)    52768    46.2%   0.54%      5.0%        1.61%
+  t16 (bytes)    8915    48.7%   0.90%      0.8%       14.0%
+  t8 (words)    48473    46.2%   0.54%      5.1%        1.72%
+  t12 (words)   16558    48.2%   0.76%      1.6%        5.65%
+  t16 (words)    8605    48.7%   0.89%      0.8%       14.6%
+  master -2     20131    47.3%   0.66%      2.9%        4.60%
+
+With a 256-byte time constant, the average of random bytes wanders with
+sigma = 73.9 * sqrt(1/511) = 3.3. At +/- 8 the walk stops falsely about
+every 600 bytes, each stop costing the 64-byte lag plus 64 looked-up bytes
+before the next walk. At +/- 16 false stops are rare, but noticing the
+end takes longer than the lag (text averages around 100, so the average
+needs about 200 bytes to leave 128 +/- 16), hence the 14% overshoot. There
+is no band that gets both; the 8-byte version has the same profile.
+
+On silesia the walk is entered about 170000-210000 times and mostly stops
+at once; x-ray and sao are looked up byte by byte (77-87% of silesia's
+incompressible bytes, against 0.8% at master's level 1 and 4.1% on x-ray
+at level 2).
+
+
+7. Speed
+--------
+
+Best of 5, builds alternated, -l 2, CPU 2, gcc -O3 -march=native with
+-Wa,-mbranches-within-32B-boundaries -Wa,-malign-branch=jcc+fused+jmp+call.
+Noise: s5f2 at level 2 produces the same output as master and measures
+538.3/538.1, 1032.2/1036.0, 567.2/569.6, 795.6/801.4, so within 0.7%.
+(Without the JCC flags, builds with identical output differed by up to
+6.7%; those first figures are not used.)
+
+Level 1, MB/s:
+                   silesia   doc.tar   lin200    web
+  master            607.1    1130.5    560.3    786.4
+  no skip           516.0     626.2    574.7    810.2
+  byte t12          503.5     700.4    564.4    792.9
+  words t8          506.3     948.6    554.4    779.9
+  words t12         510.6     964.9    555.0    780.0
+  words t16         529.3     971.2    555.4    780.6
+  gate+end s5f2     492.7     768.7    562.8    791.0
+  master -2         538.1    1036.0    569.6    801.4
+
+Level 2, MB/s:
+                   silesia   doc.tar   lin200    web
+  master            538.1    1036.0    569.6    801.4
+  no ramp s2f2      539.3    1035.9    570.1    804.0
+  words t8..t16    508-529    949-972   ~555     ~781
+
+Text tree (-T), MB/s:
+                   silesia   doc.tar   lin200    web
+  master            476.8     626.2    540.8    763.4
+  byte t12 (w48)    471.8     552.0    541.6    765.5
+  words t8          486.0     707.7    541.8    764.8
+  words t12         489.6     715.0    541.8    764.8
+  words t16         494.8     716.0    541.5    765.2
+
+  - On the generic tree, the byte mode is slower than master's level 2
+    everywhere: -2 to -6% on silesia, -6 to -8% on doc.tar, -2.6% on linux
+    and web. Only at +/- 8 is its output smaller (-0.18% on silesia, -0.10%
+    on doc.tar); at +/- 16, the fastest, silesia is 0.8% larger. Its level 1 gets level 2's ratio at
+    lower speed than level 2, so it brings nothing over using level 2.
+    The probe of level 2 costs one hash per 64 bytes, while any statistic
+    must read every byte, and the probe also sees x-ray and sao, which no
+    statistic does. The 2.5% on linux and web, where almost nothing is
+    walked, is either the entry test or code placement, not determined.
+  - The 8-byte walk is much faster than the byte walk on doc.tar (949-972
+    vs 700), the per-byte dependency chain (about 3-4 cycles per byte) being
+    the limit of the latter.
+  - Level 2 without the ramp on random-looking chunks gains nothing
+    measurable (the ramp is already cheap).
+  - On the text tree, the idea works: with the 8-byte walk, doc.tar
+    goes from 626 to 708-716 MB/s (+13-14%), silesia from 477 to 486-495
+    (+2-4%), linux and web unchanged within noise, and output changes by
+    -0.05% to +0.21%. The byte-at-a-time walk loses 12% on doc.tar there.
+
+
+8. Conclusions
+--------------
+
+  - Byte statistics detect random data, not the absence of repeats.
+    x-ray and sao, most of silesia's incompressible bytes, look nothing
+    like random data, so a statistic can't replace level 2's probes, only
+    complement them.
+  - On the generic tree, the byte mode at +/- 8 gives smaller output
+    than master's level 2 (-0.1 to -0.3%) but is slower than it everywhere
+    (-2.6 to -8%). Level 2's probing at 64-byte granularity is already a
+    cheap and accurate end-of-area search; the exponential part only
+    shapes how often 64 bytes are looked up between steps.
+  - The moving average cannot be both quiet and fast with a 256-byte time
+    constant: +/- 8 stops falsely every ~600 random bytes, +/- 16 overshoots
+    the end by ~200 bytes. The spread adds nothing over the mean.
+  - On the text tree it is a real gain: +13% on doc.tar and +2-4% on
+    silesia with -T, nothing lost on linux and web, output within +0.2%.
+    That is the part worth pursuing: bits 16|32|64 with SLZ_STAT_T = 8 to
+    12 and a 64-byte lag. To be confirmed on the ARL and the EPYC.
+  - Not tried: level 2's probe skip on the text tree instead of the walk
+    (the skipped bytes would need an estimated rather than exact
+    <lit_excess>), and the 8-byte walk as a complement to level 2's probes
+    (walk while random, probe when not).
+
+
+9. Commands
+-----------
+
+Tools (build with gcc -O2, sigstat needs -lm):
+
+  zenc-trace0 -D -1 < f 3> f.t0     # zenc built with -DSLZ_TRACE -DSLZ_LITERAL_SKIP=0
+  zenc-trace  -D -1 < f 3> f.t1     # zenc built with -DSLZ_TRACE [variant flags]
+  sigstat f f.t0 [gap [from to]]
+  skipcmp <size of f> f.t0 f.t1 [gap [from to]]
+
+The silesia member offsets for from/to come from:
+
+  tar tvRf silesia.tar | awk '{print $2*512+512, $NF}'
+
+Builds: build.sh <dir> builds master, no-skip and the s<S>f<F> variants;
+the byte-mode builds were:
+
+  gcc -O3 -march=native -fomit-frame-pointer -Wall \
+      -Wa,-mbranches-within-32B-boundaries \
+      -Wa,-malign-branch=jcc+fused+jmp+call -Iinclude -Isrc \
+      -DSLZ_STAT_SKIP=80 -DSLZ_STAT_T=8 -DSLZ_VERSION='"x"' \
+      -o zenc-w80t8 src/zenc.c src/slz_common.c src/slz.c
+
+(16 = byte walk, 80 = 8-byte walk, 48/112 = the same plus the text tree;
+SLZ_STAT_M=0 disables the mad test of the byte walk, SLZ_STAT_LAG defaults
+to 64.)
+
+Speed: bench.sh <cpu> <runs> <level|T> <file> <zenc>...
+
+10. Follow-up: averaging over 64 samples
+----------------------------------------
+
+Averaging over fewer samples (64 instead of 256) was suggested.
+SLZ_STAT_SHIFT sets the time constant to 1 << SLZ_STAT_SHIFT samples (8 by
+default, which builds byte-identical to the above; 6 = 64, 7 = 128). The
+8-byte walk then feeds the sum of 8 bytes with 1/8 per step at shift 6.
+
+With 64 samples, the average of random bytes wanders twice as much (sigma
+about 6.6), so the band must be about twice as wide for the same false
+stops, but it notices the end of random data about 4 times sooner. skipcmp
+on doc.tar (8-byte walk, level 1):
+
+                         steps   inc looked up  overshoot  lost
+  64 samples, +/-16, g64  101401      12.8%       0.84%    0.37%
+  64 samples, +/-16, g32   81249       8.8%       0.93%    0.43%
+  64 samples, +/-24, g64   21669       2.3%       4.4%     0.66%
+  256 samples, +/-12, g64  16558       1.6%       5.65%    0.76%
+  master -2                20131       2.9%       4.6%     0.66%
+
+Output (-l 1), relative to master's level 2 for the generic tree and to
+master -T for the text tree:
+
+                          generic tree         text tree (-T)
+                        silesia  doc.tar     silesia  doc.tar
+  256 samples +/- 8      -0.18   -0.11       +0.079   -0.053
+  256 samples +/- 12     +0.08   +0.01       +0.129   -0.042
+  64 samples +/-12 g32   -0.26   -0.23       -0.023   -0.085
+  64 samples +/-16 g64   -0.26   -0.18       +0.016   -0.040
+  64 samples +/-20 g64   -0.14   -0.10       +0.049   -0.036
+  64 samples +/-24 g64   -0.01   -0.04       +0.062   -0.027
+  128 samples +/-16 g64  -0.03   -0.05       +0.040   -0.036
+
+(linux and web: between -0.08% and +0.03% everywhere.) At a given speed, 64 samples costs about half the size of 256
+samples. Lags of 16 and 32 are slightly worse than 64 at this time
+constant too.
+
+Speed, best of 5, JCC flags, MB/s, all with the 8-byte walk:
+
+                         -2 silesia  doc   lin200  web  |  -T silesia  doc   lin200  web
+  master                   538.9   1036.8  569.9  801.0 |    476.3   625.9  540.5  761.7
+  256 samples +/- 8        508.1    947.1  554.9  780.9 |    485.8   708.2  541.5  764.9
+  256 samples +/- 12       512.7    965.3  555.0  780.8 |    490.0   715.4  541.8  765.1
+  64 samples +/-12 g32     504.9    882.9  554.7  780.8 |    482.0   681.9  541.8  764.2
+  64 samples +/-16 g32     506.2    935.5  555.3  781.5 |    485.6   705.0  541.8  765.1
+  64 samples +/-16 g64     505.0    917.5  554.7  780.6 |    483.0   695.6  541.8  765.3
+  64 samples +/-20 g64     508.0    948.4  554.8  780.4 |    486.4   707.9  541.9  764.9
+  64 samples +/-24 g64     512.1    960.2  555.1  780.8 |    489.1   712.9  541.4  765.0
+  128 samples +/-16 g64    511.9    960.0  555.2  780.5 |    488.6   713.0  541.6  765.0
+
+  - Generic tree: no change to the conclusion. Every setting is slower
+    than master's level 2 (-5 to -6% on silesia, -7 to -15% on doc.tar).
+    The -2.6% on linux and web is the same for every setting, including
+    those that walk almost nothing there, so it doesn't come from the walk
+    itself (code placement or the added state, not determined).
+  - Text tree: 64 samples at +/- 24 runs as fast as 256 samples at +/- 12
+    (713 vs 715 MB/s on doc.tar, +14% over master; 489 vs 490 on silesia,
+    +2.7%) for half the size cost on silesia (+0.06% instead of +0.13%).
+    128 samples at +/- 16 is equivalent. The smallest output, 64 samples
+    at +/- 12 with a 32-byte lag, even beats master on silesia (-0.02%)
+    but gains only +9% on doc.tar.
+  - Suggested setting for the text tree: SLZ_STAT_SKIP=112,
+    SLZ_STAT_SHIFT=6, SLZ_STAT_T=24, SLZ_STAT_LAG=64.
+
+Another question was whether, on the text tree, the average could decide
+between plain literals and the text huffman tree (an average far below 128
+meaning text). The text encoder already decides it from the exact cost of
+each pending literal (<lit_excess>, one table lookup per byte), so the
+average could only approximate a number it already has. Where it could
+help is choosing the tree itself, i.e. a per-block automatic -T, keeping
+in mind that it tells text from binary, not whether either
+repeats. Not tried.
+
+
+11. Follow-up: change detection between adjacent blocks
+-------------------------------------------------------
+
+The next idea: what we want is to know where to stop skipping, so
+compare the average of each 64-byte block with that of its neighbour, and
+stop skipping (and stop the exponential growth) when it changes, which
+means the data changed type. Unlike the randomness tests, this doesn't need
+the data to look random, so it can keep skipping x-ray.
+
+He also noted that text averages between 0x20 and 0x7e, so an average
+leaving that band means very different data. On the text tree that could
+serve to detect binary, as in section 10's automatic -T; it isn't more
+precise than the high-bit count below, which is 0 on text.
+
+The mean of 64 random bytes has sigma 9.2, so two adjacent blocks differ
+with sigma 13, while a .gz to text transition is only about 128 -> 90-100.
+So SLZ_STAT_SKIP & 128 compares each chunk with a running reference of the
+chunks before it (preset from the last 64 bytes scanned, ref = ref - ref/4
++ cur, sigma of the difference about 10), and adds a second count from the
+same SWAR pass: the number of bytes >= 0x80, 32 +/- 4 on random data, 0 on
+text, stable on x-ray. A change in the mean by more than SLZ_CHG_M or in
+the count by more than SLZ_CHG_H stops the step at that chunk and restarts
+the ramp (SLZ_CHG_KEEP=1 keeps it). Level 1 gets a chunk loop for it, level
+2 adds it to its probes.
+
+Output (-l 1, %), level 1 vs master -1 / vs master -2, and level 2 vs
+master -2:
+
+                  -1 silesia      -1 doc.tar     -2 silesia  -2 doc.tar
+  m16 h8        -6.56/-0.03    -7.27/-0.13       -0.217      -0.203
+  m24 h8        -6.39/+0.16    -7.23/-0.08       -0.186      -0.192
+  m24 h12       -5.94/+0.64    -7.19/-0.04       -0.169      -0.175
+  m255 h8       -6.32/+0.24    -7.15/+0.00       -0.167      -0.178
+  m32 h12       -4.83/+1.82    -7.13/+0.02       -0.137      -0.142
+  m40 h16       -4.37/+2.32    -7.10/+0.06       -0.104      -0.086
+  (linux, web, icons: -0.01% to +0.15%)
+
+  - Level 1 reaches level 2's ratio: mr's slices keep changing between
+    background and tissue, so its 68% loss goes away.
+  - Level 2 gets 0.1-0.2% smaller on silesia and doc.tar.
+  - The count of bytes >= 0x80 alone (m255) does almost as well as both.
+
+But it stops too often. skipcmp on doc.tar, level 2:
+
+                       steps   inc looked up  overshoot  lost
+  m16 h8              275630      49.8%        0.22%     0.14%
+  m24 h8              192986      34.5%        0.41%     0.20%
+  m255 h8             177758      31.7%        0.52%     0.24%
+  m24 h8 keep         88471       15.1%        1.19%     0.34%
+  m255 h16            22611        3.3%        4.08%     0.57%
+  m255 h24            20314        2.9%        4.53%     0.62%
+  master              20131        2.9%        4.60%     0.66%
+
+At h8 (1.9 sigma) random data trips the detector on 1 chunk in 16 and each
+trip restarts the ramp. At h16-h24, where false stops are rare, it behaves
+like master and the gain shrinks to 0.03-0.09%.
+
+Speed, best of 5, JCC flags, MB/s:
+
+                    silesia      doc.tar      lin200        web
+                    -1    -2     -1    -2     -1    -2     -1    -2
+  master          606.2 536.0 1078.7 989.2  555.2 568.4  784.9 800.0
+  no skip         516.0 514.6  599.5 599.6  574.4 573.7  809.4 808.7
+  m16 h8          447.1 504.9  642.4 744.2  496.9 556.9  703.1 786.0
+  m24 h8          448.8 506.1  696.9 797.9  497.5 556.1  702.7 786.6
+  m255 h8         452.0 507.1  709.6 809.6  496.6 556.7  702.4 786.4
+  m24 h64         459.3 510.3  763.9 859.9  494.6 557.3  702.0 785.2
+
+  - On doc.tar, the false stops cost 13-25% at level 2.
+  - Level 1 loses 10% on linux and web, where it skips almost nothing:
+    this is pure code generation, the chunk loop added to the hot
+    function. Level 2 loses 2% there for the same reason.
+  - Rejected. The size gain is real but needs the low thresholds, which
+    are the ones that stop on noise.
+
+
+12. Follow-up: the skip's own cost on data that never skips
+-----------------------------------------------------------
+
+Master's skip costs speed where nothing is skipped (lin200, web): at level
+1, perf shows 4.3% more instructions and 2.6% more cycles than the no-skip
+build on lin200, with the same number of branches and mispredicts. The
+literal path is fine (the plit & 63 test macro-fuses into a single branch);
+the cost is register pressure in the match path: level 1's function has 55
+stack references against 32 without the skip, and <skip_ratio> is reset at
+every match.
+
+The ramp 0, 64, 192, 448, ... 8128 is exactly skip = plit - 64 (capped at
+8128), since <plit> counts the literals pending since the last match and a
+step adds to it. SLZ_SKIP_PLIT=1 computes it that way, so <skip_ratio>
+disappears from levels 1 and 2 with its reset in the match path.
+SLZ_SKIP_OOL=1 additionally moves level 2's probe loop into a noinline
+function.
+
+  - Level 1 output is byte-identical to master (no probes, same ramp);
+    level 2 differs after probe hits (master keeps growing the ratio) and
+    is 0.003-0.008% smaller.
+  - Stack references in _slz_rfc1951_encode_lev1 / lev2:
+                      master   plit   no skip
+      gcc 13 native     55      34      32        (level 1)
+      gcc 14 native     48/59   41/46   39
+      gcc 15 native     63/65   38/49   36
+      gcc 15 ARL flags  46/58   30/33   29
+    (no-skip level 2 is folded into level 1.)
+  - perf on lin200, gcc 13: level 1 3.466 -> 3.382 Gcycles (-2.4%; no skip
+    3.369), level 2 unchanged in cycles for 4% fewer instructions; gcc 14
+    and 15: -1.4 to -2.6% instructions, -0.4 to -1.0% cycles.
+
+Speed, best of 5, JCC flags, gcc 13, MB/s:
+
+                    silesia      doc.tar        lin200        web
+                    -1    -2     -1     -2      -1    -2     -1    -2
+  master          606.3 537.3  1126.0 1028.5  557.0 567.5  784.7 801.1
+  no skip         515.6 515.3   625.2  616.8  573.9 572.7  807.7 808.3
+  plit            620.0 538.3  1149.5 1037.0  571.2 568.0  801.8 800.0
+  ool             610.6 534.9  1134.2  984.5  563.5 563.5  788.5 796.1
+
+  - plit: level 1 +2.1 to +2.5% on every corpus, level 2 neutral (-0.1 to
+    +0.8%), and the code is simpler (one state variable less). Worth
+    merging after a check on the ARL; ARL-flag builds show the same drop
+    in stack references.
+  - ool is worse than plit everywhere (-4% at level 2 on doc.tar).
+
+Level 3 with SLZ_SKIP_PLIT=2 (ramp 0, 4096, 16384, 28672 derived from
+<plit>, instead of 0, 4096, 12288, 28672; 52 -> 48 stack references), and
+gcc 15 builds of plit at levels 1 and 2, best of 5, JCC flags, MB/s:
+
+                      silesia   doc.tar   lin200    web
+  -3 master            509.6     885.4    555.2    782.4
+  -3 plit2             514.1     898.9    559.0    789.6
+     output           +0.008%   +0.030%    0        0
+  -1 gcc15 master      607.7    1129.0    561.2    789.1
+  -1 gcc15 plit        613.3    1135.9    563.7    791.3
+  -2 gcc15 master      535.6    1026.8    562.2    790.4
+  -2 gcc15 plit        540.6    1035.5    568.3    798.7
+
+  - Level 3: +0.7 to +1.5% for 0.01-0.03% more output.
+  - gcc 15: +0.3 to +0.9% at level 1, +0.8 to +1.1% at level 2: smaller
+    than with gcc 13 at level 1, but positive everywhere.
+  - So deriving the ramp from <plit> wins with every compiler tried, at
+    every level that skips, for an identical (level 1) or nearly identical
+    output. To be confirmed on the ARL and the EPYC before merging; the
+    three pieces (levels 1-2, level 3) can be merged separately.
+
+
+13. Follow-up: choosing between the fixed and the text tree on the fly
+----------------------------------------------------------------------
+
+The question was whether the encoder could choose the tree on the fly
+(text tree for text areas, fixed tree or stored for binary ones)
+independently of the level, and whether a literal run should be split
+where its cost starts to grow (first part with the tree, rest stored)
+instead of being sent whole one way or the other.
+
+treesim takes a file and the matches an encoder emitted for it (SLZ_TRACE
+now stores the distance code's bit count in bits 16-20 of 'M' records), and
+computes the size of every way of encoding the literals between these same
+matches: fixed tree (F), text tree (T) or stored (S). Opening T costs its
+624-bit header, leaving it 11 bits (EOB), a stored block 42 bits. The model
+reproduces master's -T output within 0.006% (45063489 vs 45060925 bytes on
+doc.tar), so its costs are right. Policies, all deciding once per literal
+run:
+  - "T whole": master -T (run sent in T, or stored, whole);
+  - "split": the run cut at the minimum of its running excess over 8 bits
+    (the best possible cut for prefix-in-tree + stored-tail);
+  - full accounting: switch tree when the other one would have saved more
+    than a threshold (CUSUM of the per-literal and per-length difference),
+    needs both costs of each literal;
+  - bit 7: same CUSUM, entering T fed only by bit 7 of the literals (+1.5
+    bit below 0x80, -2 bits above), leaving T either the same way or with
+    the exact cost (nearly free there: lit_excess is already computed and
+    the fixed cost is 8 + (c >= 144));
+  - the exact optima over all block sequences (dynamic programming), with
+    all three block types or restricted.
+
+Sizes in bytes, relative to master's real -2 and -T outputs, using the
+matches of level 2 (with its skip):
+
+                              silesia          doc.tar          lin200          web
+                              vs-2   vs-T      vs-2  vs-T       vs-2   vs-T     vs-2   vs-T
+  T whole (= split)          -3.29  +1.18     -2.37 +0.33     -10.86  +1.95   -10.20  +1.86
+  full acct, 2560/64 bits    -5.53  -1.16     -2.07 +0.64     -10.85  +1.95   -10.13  +1.94
+  full acct, 640/64 bits     -5.55  -1.18     -2.43 +0.27     -10.86  +1.95   -10.17  +1.90
+  bit 7 in / bit 7 out       -4.84  -0.45     -1.98 +0.73     -10.86  +1.95   -10.20  +1.86
+    (5120/128 half-bits)
+  bit 7 in / exact out       -5.27  -0.89     -1.98 +0.73     -10.86  +1.95   -10.20  +1.87
+    (5120 / 640)
+  bit 7 in / exact out       -4.76  -0.35     -2.44 +0.26     -10.86  +1.95   -10.20  +1.86
+    (1280 / 2560)
+  optimum F+T+S              -5.66  -1.30     -2.65 +0.04     -10.86  +1.95   -10.20  +1.86
+  optimum F+T (no stored)    -5.07  -0.68     +1.49 +4.30     -10.86  +1.95   -10.20  +1.86
+  optimum F+S                -0.01  +4.61     -0.00 +2.76      -0.00 +14.36    -0.01 +13.42
+
+With the matches of -T (level 3, no skip), the optimum is -1.83% under -T on
+silesia and -0.48% on doc.tar, the best practical policies -1.69% and
+-0.26%; nothing changes on linux and web.
+
+  - Splitting a run at its minimum excess gains nothing: at most 115 bytes
+    on silesia, and even the optimum over T and S is the same as master's
+    whole-run decision within 0.01%. Stored blocks do matter (without them,
+    doc.tar is 4% larger), but within a run there is almost never a tail
+    worth more than reopening the text tree (about 680 bits, i.e. 230
+    bytes at +3 bits each); the binary areas where it would be are long
+    and already sent whole as stored.
+  - Choosing the tree on the fly is worth it on mixed data: with level 2's
+    matches, silesia would be 5.5% smaller than master -2 and 1.2% smaller
+    than master -T (level 3); doc.tar 2.4% smaller than -2. On pure text
+    (linux, web), the gain over -2 is that of -T itself (-10 to -11%), and
+    the remaining +1.9% to -T is level 3's matching, not the tree choice.
+  - Bit 7 alone gets 60% of the possible gain on silesia, without looking
+    up any per-literal cost. Using the exact cost to leave T (nearly free
+    in T) gets 85-95% of it. The thresholds pull in opposite directions:
+    silesia wants a slow entry into T (5120 half-bits, i.e. 3.4 kB of
+    ASCII), doc.tar a fast one (1280); none of them loses anything on
+    linux and web (one switch at the start).
+  - Not measured: the speed. The text tree costs a table lookup per
+    literal, which the generic levels don't do today; how much of the
+    text tree's speed loss remains once binary areas go back to the
+    generic skip is what an implementation would tell.
+
+Commands:
+
+  zenc-trace -D -2 < f 3> f.2.tr     # zenc built with -DSLZ_TRACE
+  treesim f f.2.tr
+
+
+14. Follow-up: SLZ_AUTO_TREE, the tree chosen on the fly in the encoder
+-----------------------------------------------------------------------
+
+The next step was to try it in the code, without affecting -1's speed,
+possibly trading a percent of speed at -2 for a few percent of size.
+
+Design (src/slz.c, all under SLZ_AUTO_TREE, off by default, default build
+byte-identical):
+  - each level has one encoder instance per tree; a dispatcher allocates
+    and resets the reference table, and calls the instance for the tree in
+    use (<content_type>) until the end of the input, switching when it
+    returns early. Not per call: zenc and lzbench pass a whole file at once.
+  - the fixed tree's literals sent with copy_lit_huff() add what the text
+    tree would have saved on them (one table lookup per literal, out of the
+    loop) to a CUSUM in the stream; its stored blocks reset it. The text
+    tree's literals add their <lit_excess>, already known, at each flush.
+  - past SLZ_AUTO_IN (1280) or SLZ_AUTO_OUT (256) bits, the encoder closes
+    its block after the next match and returns.
+  - with the text tree, 64 pending literals averaging 9 bits or more switch
+    at once, the encoder for the fixed tree processing them again (binary
+    data: it can skip). This is tested in place of the 0xffc0 flush test
+    (0xffc0 is a multiple of 64), so it adds no test per literal.
+  - SLZ_AUTO_TLEVEL=3 runs the text tree at level 3 whatever the level, as
+    -T does: smaller and 1-1.5% faster than at levels 1-2.
+  - slz_set_content_type(SLZ_CT_TEXT) still forces the text tree (-T).
+
+What the plumbing cost, with -T (identical output), MB/s on silesia/lin200:
+  master                                            476 / 540
+  instances inlined in the levels, check before
+    the match decisions (keeps h, last, ent live)   432 / 491
+  noinline instances, refs passed by pointer        437 / 498
+  same, check after the match is emitted            460 / 527
+  instances inlined, check after                    463 / 530
+Per-byte accounting of the text tree's literals in its emitters cost 3%,
+replaced by <lit_excess> at the flush; a separate binary test per literal
+cost 6%, folded into the 0xffc0 test for free.
+
+Result, SLZ_AUTO_TREE=1 SLZ_AUTO_TLEVEL=3 SLZ_AUTO_INL, best of 5, JCC
+flags, size change and speed vs master at the same level:
+
+            silesia          doc.tar          lin200           web
+            size   MB/s      size   MB/s      size    MB/s     size    MB/s
+  -1       -5.64%  606->563  -2.10% 1129->1045 -12.59% 560->524 -11.92% 786->737
+                   (-7.1%)          (-7.4%)           (-6.4%)          (-6.2%)
+  -2       -6.02%  539->493  -2.37% 1032->942  -12.55% 569->528 -11.81% 799->744
+                   (-8.5%)          (-8.7%)           (-7.2%)          (-6.9%)
+  -3       -5.99%  510->479  -2.37%  886->835  -12.30% 555->530 -11.62% 781->750
+                   (-6.2%)          (-5.7%)           (-4.5%)          (-4.0%)
+
+Compared to master -T, auto -2 is 1.68% smaller and 3.5% faster on silesia,
+0.33% larger and 50% faster on doc.tar, and the same size and 2.2-2.3%
+slower on linux and web.
+
+  - The ratio is there: -2 gets -T's ratio on text and better than it on
+    silesia, -1 almost the same.
+  - The speed is not: -7 to -9% at levels 1 and 2. Most of it is the text
+    tree itself: master -T is already 5% slower than master -2 on linux
+    and web, and auto -2 runs within 2.3% of master -T there. The rest is
+    the shared reference table (2-3% with identical output) and the
+    accounting of the fixed tree's literals.
+  - So -1 can't take it as is without losing its speed; -2 would trade
+    7-9% of speed for 2.4-12.5% of size. Getting closer to that target
+    needs a faster text tree encoder in the first place (e.g. computing
+    <lit_excess> at the match from the pending bytes instead of in the
+    literal path), and removing the shared table's cost.
