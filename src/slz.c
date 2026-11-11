@@ -1080,9 +1080,6 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 	uint32_t h;
 	uint64_t ent;
 
-#if SLZ_LITERAL_SKIP
-	long skip_ratio = 0;
-#endif
 	uint32_t plit = 0;
 	uint32_t bal; /* see SLZ_MAX_DEBT, generic tree only */
 	uint32_t lit_excess = 0; /* text tree only, see SLZ_TEXT_STORED_COST */
@@ -1281,8 +1278,15 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 # endif
 			}
 			else if (__builtin_expect(ctype == SLZ_CT_GENERIC && level == 3 && !(plit & 2047), 0)) {
-				long skip = rem >= skip_ratio * 4096 ? skip_ratio * 4096 : rem;
-				skip_ratio = (skip_ratio * 2 + 1) & 7; // capped exponential: 0,1,3,7 and stays at 7
+				/* derived from <plit> as well: 0, 4096, 16384, then
+				 * 28672 (the former ramp gave 0, 4096, 12288, 28672).
+				 * <plit> is not always a multiple of 2048 here (see
+				 * below), hence the rounding.
+				 */
+				long skip = 2 * (long)(plit & ~2047U) - 4096;
+
+				skip = skip > 28672 ? 28672 : skip;
+				skip = rem >= skip ? skip : rem;
 
 				/* Note: by checking intervals smaller than the mask above, a hit resumes
 				 * at the start of the 256-byte chunk containing it, so <plit> is then no
@@ -1634,9 +1638,6 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 			plit = 0;
 		}
 
-#if SLZ_LITERAL_SKIP
-		skip_ratio = 0;
-#endif
 		/* use mode 01 - fixed huffman */
 		if (strm->state == SLZ_ST_EOB) {
 			strm->state = SLZ_ST_FIXED;
