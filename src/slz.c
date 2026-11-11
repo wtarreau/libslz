@@ -1793,14 +1793,21 @@ long _slz_rfc1951_encode_lev1(struct slz_stream *__restrict strm, unsigned char 
 	return _slz_rfc1951_encode(strm, out, in, ilen, more, 1, SLZ_CT_GENERIC);
 }
 
+/* level 2 temporarily uses level 1's encoder */
 static __attribute__((noinline))
 long _slz_rfc1951_encode_lev2(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
+{
+	return _slz_rfc1951_encode(strm, out, in, ilen, more, 1, SLZ_CT_GENERIC);
+}
+
+static __attribute__((noinline))
+long _slz_rfc1951_encode_lev3(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
 {
 	return _slz_rfc1951_encode(strm, out, in, ilen, more, 2, SLZ_CT_GENERIC);
 }
 
 static __attribute__((noinline))
-long _slz_rfc1951_encode_lev3(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
+long _slz_rfc1951_encode_lev4(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
 {
 	return _slz_rfc1951_encode(strm, out, in, ilen, more, 3, SLZ_CT_GENERIC);
 }
@@ -1828,8 +1835,10 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, 
 		return _slz_rfc1951_encode_lev1(strm, out, in, ilen, more);
 	else if (strm->level <= 2)
 		return _slz_rfc1951_encode_lev2(strm, out, in, ilen, more);
-	else
+	else if (strm->level <= 3)
 		return _slz_rfc1951_encode_lev3(strm, out, in, ilen, more);
+	else
+		return _slz_rfc1951_encode_lev4(strm, out, in, ilen, more);
 }
 
 /* Initializes stream <strm> for use with raw deflate (rfc1951). The CRC is
