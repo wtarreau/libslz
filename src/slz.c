@@ -110,19 +110,6 @@ static uint32_t text_dist_table[32768];
 # define SLZ_LITERAL_SKIP 1
 #endif
 
-/* Enables growing a match backwards over the literals that are still pending,
- * see slz_rfc1951_encode(). Costs a little CPU on every match and gains about
- * 1% of output. Tests show that matching up to 2 bytes brings almost optimal
- * results at minimal extra cost, and that compression gains at 1 byte are
- * higher than the CPU increase they cause, and tend to result in higher
- * compression speed due to the savings on encoding. The only way to disable
- * this optimization is to comment out this line. It's indexed by the
- * encoder's level (see _slz_rfc1951_encode_lev1()) and only applies to the
- * fixed tree. At level 3 (compression level 4), 8 bytes save 0.03% over 2 on
- * silesia for 0.5% of speed. The text tree always uses 2 bytes.
- */
-#define SLZ_BACKWARD_MATCH ((const int[]){ 0, 1, 1, 8 })
-
 /* Log2 of the size of the hash table used for the references table. */
 #ifndef SLZ_HASH_BITS
 # define SLZ_HASH_BITS 13
@@ -1221,12 +1208,13 @@ long backward_match(const unsigned char *in, unsigned long pos, const unsigned c
  * unaligned, short memcpy() calls must not be translated to AVX512 code.
  *
  * <level> is the encoder's level, not the compression level, see
- * _slz_rfc1951_encode_lev1(). <auto_tree> is zero to only use the fixed tree,
- * or non-zero to choose between the fixed and the text trees on the fly (see
- * SLZ_AUTO_IN). Both must be constants. Each tree has its own part below.
+ * _slz_rfc1951_encode_lev1(), and <bmatch> the fixed tree's backward match
+ * length. <auto_tree> is zero to only use the fixed tree, or non-zero to
+ * choose between the fixed and the text trees on the fly (see SLZ_AUTO_IN).
+ * All three must be constants. Each tree has its own part below.
  */
 static inline __attribute__((always_inline))
-long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more, int level, int auto_tree)
+long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more, int level, int bmatch, int auto_tree)
 {
 	long rem = ilen;
 	unsigned long pos = 0;
@@ -1604,7 +1592,6 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 			    (dist & 0x1f) + (code >> 16) + SLZ_SWITCH_COST > 8 * mlen)
 				goto send_as_lit;
 
-#if defined(SLZ_BACKWARD_MATCH)
 			/* Compare queued literals in case the previous ones were not
 			 * found due to hash collisions but still match. We don't go
 			 * further than 8 bytes so that we can find them in a single
@@ -1628,16 +1615,18 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 			 * used all along in all operations. Multiple attempts have shown
 			 * that it's both easier and faster this way than changing then
 			 * rolling back offsets when we finally give up and send_as_lit.
+			 * It is disabled when <bmatch> is zero.
 			 */
-			if (__builtin_expect(plit != 0, 1) &&
-			    (last >= MAX_C(sizeof(long), SLZ_BACKWARD_MATCH[level]))) {
+			if (bmatch &&
+			    __builtin_expect(plit != 0, 1) &&
+			    (last >= MAX_C(sizeof(long), bmatch))) {
 				long bmax = MIN(plit, 8); // keep it at 8, always faster
 				long back;
 
 				if (bmax > 258 - mlen)
 					bmax = 258 - mlen;
 
-				back = backward_match(in, pos, lastp, bmax, SLZ_BACKWARD_MATCH[level]);
+				back = backward_match(in, pos, lastp, bmax, bmatch);
 
 				if (back) {
 					/* OK now we're certain to use the match, we must rewind the
@@ -1659,7 +1648,6 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 					code = len_code(mlen, SLZ_CT_GENERIC);
 				}
 			}
-#endif // SLZ_BACKWARD_MATCH // otherwise 43.83%
 
 			/* first, copy pending literals */
 			if (plit) {
@@ -2001,7 +1989,6 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 				}
 			}
 
-#if defined(SLZ_BACKWARD_MATCH)
 			/* Compare queued literals, see the fixed tree's loop. Only
 			 * those after the last recorded reference may be used.
 			 */
@@ -2036,7 +2023,6 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 						lit_excess -= (text_huff[in[pos + i]] & 15) - 8;
 				}
 			}
-#endif // SLZ_BACKWARD_MATCH // otherwise 43.83%
 
 			/* first, copy pending literals */
 			if (plit) {
@@ -2199,44 +2185,52 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 	return strm->outbuf - out;
 }
 
-/* The <level> argument of the encoders is not the compression level, it sets
- * the literal skip, the backward match and the debt accounting (see
- * SLZ_BACKWARD_MATCH, SLZ_MAX_DEBT and the literal skip in
- * _slz_rfc1951_encode()):
- *   1: blind skip ramp from 64 to 8128 bytes, 1-byte backward match, debt
- *      charged per group of literals;
+/* The <level> argument of the encoder is not the compression level, it sets
+ * the fixed tree's literal skip and debt accounting (see SLZ_MAX_DEBT and the
+ * literal skip in _slz_rfc1951_encode()):
+ *   1: blind skip ramp from 64 to 8128 bytes, debt charged per group of
+ *      literals;
  *   2: same, with a probe every 64 skipped bytes;
  *   3: skip in 2048-byte steps up to 28 kB, with a probe every 64 skipped
- *      bytes, 8-byte backward match, debt charged per literal.
+ *      bytes, debt charged per literal.
+ * Its <bmatch> argument is the number of bytes a match may be grown
+ * backwards over the pending literals with the fixed tree (0 to disable it).
+ * It costs a little CPU on every match and gains about 1% of output. Tests
+ * show that matching up to 2 bytes brings almost optimal results at minimal
+ * extra cost, and that compression gains at 1 byte are higher than the CPU
+ * increase they cause, and tend to result in higher compression speed due to
+ * the savings on encoding. At compression level 4, 8 bytes save 0.03% over 2
+ * on silesia for 0.5% of speed.
  * The compression levels are made of:
- *   level 1: encoder level 1, fixed tree only;
- *   level 2: encoder level 1, automatic tree (see SLZ_AUTO_IN);
- *   level 3: encoder level 2, automatic tree;
- *   level 4: encoder level 3, automatic tree.
- * With the automatic tree, the text tree always works as at level 3.
+ *   level 1: encoder level 1, 1-byte backward match, fixed tree only;
+ *   level 2: encoder level 1, 1-byte backward match, automatic tree (see
+ *            SLZ_AUTO_IN);
+ *   level 3: encoder level 2, 1-byte backward match, automatic tree;
+ *   level 4: encoder level 3, 8-byte backward match, automatic tree.
+ * The text tree's part is the same at all levels (2-byte backward match).
  */
 static __attribute__((noinline))
 long _slz_rfc1951_encode_lev1(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
 {
-	return _slz_rfc1951_encode(strm, out, in, ilen, more, 1, 0);
+	return _slz_rfc1951_encode(strm, out, in, ilen, more, 1, 1, 0);
 }
 
 static __attribute__((noinline))
 long _slz_rfc1951_encode_lev2(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
 {
-	return _slz_rfc1951_encode(strm, out, in, ilen, more, 1, 1);
+	return _slz_rfc1951_encode(strm, out, in, ilen, more, 1, 1, 1);
 }
 
 static __attribute__((noinline))
 long _slz_rfc1951_encode_lev3(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
 {
-	return _slz_rfc1951_encode(strm, out, in, ilen, more, 2, 1);
+	return _slz_rfc1951_encode(strm, out, in, ilen, more, 2, 1, 1);
 }
 
 static __attribute__((noinline))
 long _slz_rfc1951_encode_lev4(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
 {
-	return _slz_rfc1951_encode(strm, out, in, ilen, more, 3, 1);
+	return _slz_rfc1951_encode(strm, out, in, ilen, more, 3, 8, 1);
 }
 
 long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
