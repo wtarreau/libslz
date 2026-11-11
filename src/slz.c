@@ -118,9 +118,10 @@ static uint32_t text_dist_table[32768];
  * compression speed due to the savings on encoding. The only way to disable
  * this optimization is to comment out this line. It's indexed by the
  * encoder's level (see _slz_rfc1951_encode_lev1()) and only applies to the
- * fixed tree. The text tree always uses 2 bytes.
+ * fixed tree. At level 3 (compression level 4), 8 bytes save 0.03% over 2 on
+ * silesia for 0.5% of speed. The text tree always uses 2 bytes.
  */
-#define SLZ_BACKWARD_MATCH ((const int[]){ 0, 1, 1, 2 })
+#define SLZ_BACKWARD_MATCH ((const int[]){ 0, 1, 1, 8 })
 
 /* Log2 of the size of the hash table used for the references table. */
 #ifndef SLZ_HASH_BITS
@@ -2206,7 +2207,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
  *      charged per group of literals;
  *   2: same, with a probe every 64 skipped bytes;
  *   3: skip in 2048-byte steps up to 28 kB, with a probe every 64 skipped
- *      bytes, 2-byte backward match, debt charged per literal.
+ *      bytes, 8-byte backward match, debt charged per literal.
  * The compression levels are made of:
  *   level 1: encoder level 1, fixed tree only;
  *   level 2: encoder level 1, automatic tree (see SLZ_AUTO_IN);
