@@ -1216,8 +1216,17 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 			 * leave the huffman block for so few literals.
 			 */
 			if (ctype == SLZ_CT_GENERIC && level <= 2 && !(plit & 63)) {
-				long skip = rem >= skip_ratio * 64 ? skip_ratio * 64 : rem; // 0,64,192,...,8128: keeps plit aligned
-				skip_ratio = (skip_ratio * 2 + 1) & 127; // capped exponential: 0,1,3,7,... and stays at 127
+				/* The step is derived from the literals pending since
+				 * the last match: 0, 64, 192, 448, ... up to 8128, i.e.
+				 * the capped exponential ramp, which keeps <plit>
+				 * aligned on 64. Keeping it in a separate variable reset
+				 * at each match cost 2% at level 1 even on data that
+				 * never skips, through register pressure in the match
+				 * path.
+				 */
+				long skip = plit - 64 > 8128 ? 8128 : plit - 64;
+
+				skip = rem >= skip ? skip : rem;
 				/* Level 2 still looks up and indexes the last word of
 				 * each whole 64-byte chunk it skips, and stops skipping
 				 * on the first one already present within the window,
