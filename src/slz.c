@@ -255,9 +255,11 @@ union ref {
 };
 
 /* This hash provides good average results on HTML contents, and is among the
- * few which provide almost optimal results on various different pages.
+ * few which provide almost optimal results on various different pages. It
+ * returns <bits> bits, which must be a constant.
  */
-static inline uint32_t slz_hash(uint32_t a)
+static inline __attribute__((always_inline))
+uint32_t slz_hash_bits(uint32_t a, const int bits)
 {
 #if defined(__ARM_FEATURE_CRC32)
 #  if defined(__ARM_ARCH_ISA_A64)
@@ -282,7 +284,13 @@ static inline uint32_t slz_hash(uint32_t a)
 #else
 	a = ((a << 19) + (a << 6) - a);
 #endif
-	return a >> (32 - SLZ_HASH_BITS);
+	return a >> (32 - bits);
+}
+
+/* the hash of the main encoder's reference table, on SLZ_HASH_BITS bits */
+static inline uint32_t slz_hash(uint32_t a)
+{
+	return slz_hash_bits(a, SLZ_HASH_BITS);
 }
 
 /* This function compares buffers <a> and <b> and reads 32 or 64 bits at a time
