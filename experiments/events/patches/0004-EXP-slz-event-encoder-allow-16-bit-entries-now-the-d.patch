@@ -1,0 +1,74 @@
+From 1a9bd9216fa20e1bf5671c9f1fbd8230e6051b58 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sun, 15 Nov 2026 13:48:56 +0100
+Subject: [PATCH 04/11] EXP: slz: event encoder: allow 16-bit entries, now the
+ default
+
+The table's size dominates the cost on cold streams: 16-bit positions
+(the most recent one with these low bits, older ones being rejected by
+the range check or the comparison) halve it at the same number of bits.
+With 9 bits (1 kB), 508 ns per event instead of 556 with 10000 streams,
+same ratio. Indexing 1 matched position in 4 instead of 8 costs 25-35 ns
+and gains at most 0.01 pt on the SSE capture.
+---
+ src/slz.c | 9 +++++++++
+ src/slz.h | 7 ++++++-
+ 2 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/src/slz.c b/src/slz.c
+index 3eddbc0..42d0ec2 100644
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -2352,6 +2352,8 @@ static inline void ev_insert(struct slz_ev_ctx *ctx, uint32_t p, uint32_t w)
+ {
+ #if SLZ_EV_WORD
+ 	ctx->refs[ev_hash(w)] = p + ((uint64_t)w << 32);
++#elif SLZ_EV_POS16
++	ctx->refs[ev_hash(w)] = (uint16_t)p;
+ #else
+ 	ctx->refs[ev_hash(w)] = p;
+ #endif
+@@ -2453,6 +2455,13 @@ long slz_rfc1951_encode_event(struct slz_stream *__restrict strm, unsigned char
+ 		if ((uint32_t)(ent >> 32) != word)
+ 			goto send_as_lit;
+ 		last = (uint32_t)ent;
++#elif SLZ_EV_POS16
++		/* the most recent position with these 16 low bits, at most
++		 * 65536 bytes back: older entries alias to it and are
++		 * rejected by the range check or the comparison below.
++		 */
++		last = cur - (uint16_t)(cur - ctx->refs[h]);
++		ctx->refs[h] = (uint16_t)cur;
+ #else
+ 		last = ctx->refs[h];
+ 		ctx->refs[h] = cur;
+diff --git a/src/slz.h b/src/slz.h
+index afd4741..1561735 100644
+--- a/src/slz.h
++++ b/src/slz.h
+@@ -112,12 +112,15 @@ struct slz_stream {
+ /* EXP: context of slz_rfc1951_encode_event(), allocated by the caller per
+  * stream and initialized with slz_ev_init(). Its contents are private to
+  * slz.c. SLZ_EV_WORD selects the entry format: 1 = position + matched word
+- * (8 bytes), 0 = position only (4 bytes). SLZ_EV_HIST is the history kept
++ * (8 bytes), 0 = position only (4 bytes, or 2 with SLZ_EV_POS16). SLZ_EV_HIST is the history kept
+  * between calls. All three are build-time settings.
+  */
+ #ifndef SLZ_EV_WORD
+ # define SLZ_EV_WORD 0
+ #endif
++#ifndef SLZ_EV_POS16
++# define SLZ_EV_POS16 1 /* without the word: 1 = only 16 bits of position */
++#endif
+ #ifndef SLZ_EV_HASH_BITS
+ # define SLZ_EV_HASH_BITS 9
+ #endif
+@@ -128,6 +131,8 @@ struct slz_stream {
+ struct slz_ev_ctx {
+ #if SLZ_EV_WORD
+ 	uint64_t refs[1 << SLZ_EV_HASH_BITS];
++#elif SLZ_EV_POS16
++	uint16_t refs[1 << SLZ_EV_HASH_BITS];
+ #else
+ 	uint32_t refs[1 << SLZ_EV_HASH_BITS];
+ #endif

@@ -1,0 +1,164 @@
+From 179bb1981270e25e8b21968fdcae3308df4e2cc6 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sun, 15 Nov 2026 16:05:32 +0100
+Subject: [PATCH 10/11] EXP: slz: event encoder: add an in-place ring of the
+ history's size (mode 4)
+
+The history is a 64-byte aligned ring of 2 kB matched in place, the
+source of a match possibly running from the old part to the wrapped part
+then into the input, and only the input is appended on exit. Against the
+doubled buffer (mode 0): 6% slower on hot streams, 6-10% faster on SSE
+at 1000-10000 streams, -4 to +2% on cold logs, 2 kB less per stream.
+---
+ src/slz.c | 52 ++++++++++++++++++++++++++++++++++++++++++----------
+ src/slz.h |  4 +++-
+ 2 files changed, 45 insertions(+), 11 deletions(-)
+
+diff --git a/src/slz.c b/src/slz.c
+index b63ac33..23295fa 100644
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -2496,11 +2496,14 @@ void slz_ev_init(struct slz_ev_ctx *ctx)
+  * backward match recovers these bytes.
+  */
+ /* <hist> holds the <hlen> bytes of history. When <contig> is set (a
+- * constant), the input immediately follows them in memory.
++ * constant), the input immediately follows them in memory. When <ring> is
++ * set (a constant), <hist> is a ring of SLZ_EV_HIST bytes (a power of 2) in
++ * which the history starts at <hstart>.
+  */
+ static inline __attribute__((always_inline))
+ long _ev_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more,
+-                struct slz_ev_ctx *ctx, const unsigned char *hist, uint32_t hlen, int contig)
++                struct slz_ev_ctx *ctx, const unsigned char *hist, uint32_t hlen, int contig,
++                int ring, uint32_t hstart)
+ {
+ 	uint32_t base = strm->ilen;        /* absolute position of in[0] */
+ 	uint32_t hbase = base - hlen;      /* absolute position of hist[0] */
+@@ -2551,7 +2554,7 @@ long _ev_encode(struct slz_stream *__restrict strm, unsigned char *out, const un
+ 		if (hlen < (uint32_t)k || ilen < 4 - k)
+ 			continue;
+ 		for (j = 0; j < k; j++)
+-			tmp[j] = hist[hlen - k + j];
++			tmp[j] = ring ? hist[(hstart + hlen - k + j) & (SLZ_EV_HIST - 1)] : hist[hlen - k + j];
+ 		for (; j < 4; j++)
+ 			tmp[j] = in[j - k];
+ 		ev_insert(ctx, base - k, read_le32(tmp));
+@@ -2565,7 +2568,7 @@ long _ev_encode(struct slz_stream *__restrict strm, unsigned char *out, const un
+ 		uint32_t cur = base + pos;
+ 		uint32_t last, off, dist, code, d;
+ 		const unsigned char *src;
+-		long savail, mlen, max;
++		long savail, mlen, max, sback;
+ 
+ #if SLZ_EV_FMT == 8
+ 		uint64_t ent = ctx->refs[h];
+@@ -2599,16 +2602,41 @@ long _ev_encode(struct slz_stream *__restrict strm, unsigned char *out, const un
+ 			goto send_as_lit;
+ 
+ 		max = rem > 258 ? 258 : rem;
+-		if (off < hlen) {
++		sback = off;
++		if (ring && off < hlen) {
++			/* the source may run to the ring's end, then continue
++			 * at its start, then into the input.
++			 */
++			uint32_t ph = (hstart + off) & (SLZ_EV_HIST - 1);
++			long wrap = SLZ_EV_HIST - ph;
++
++			src = hist + ph;
++			savail = hlen - off;
++			if (ph < sback)
++				sback = ph;
++			if (savail > wrap) {
++				/* crosses the end of the ring */
++				long l = memmatch(in + pos, src, wrap < max ? wrap : max);
++
++				mlen = l;
++				if (l == wrap && l < max)
++					mlen += ev_match(in + pos + l, hist, savail - wrap, in, max - l);
++				goto match_done;
++			}
++		}
++		else if (off < hlen) {
+ 			src = hist + off;
+ 			savail = contig ? max : (long)(hlen - off);
+ 		} else {
+ 			src = in + (off - hlen);
+ 			savail = max;
++			if (!contig)
++				sback = off - hlen;
+ 		}
+ 
+ 		/* verifies the word too */
+ 		mlen = ev_match(in + pos, src, savail, in, max);
++	match_done:
+ 		if (mlen < 4)
+ 			goto send_as_lit;
+ 
+@@ -2628,7 +2656,6 @@ long _ev_encode(struct slz_stream *__restrict strm, unsigned char *out, const un
+ 		 */
+ 		if (SLZ_EV_BACK && plit) {
+ 			long bmax = MIN(plit, SLZ_EV_BACK);
+-			long sback = (contig || off < hlen) ? (long)off : (long)(off - hlen);
+ 			long back;
+ 
+ 			if (bmax > 258 - mlen)
+@@ -2731,7 +2758,7 @@ long _ev_encode(struct slz_stream *__restrict strm, unsigned char *out, const un
+ 	}
+ 
+  update:
+-#if SLZ_EV_MODE == 3
++#if SLZ_EV_MODE == 3 || SLZ_EV_MODE == 4
+ 	/* ring of SLZ_EV_HIST bytes (a power of 2), <hoff> being the next
+ 	 * write position; only the input is appended.
+ 	 */
+@@ -2819,7 +2846,7 @@ long slz_rfc1951_encode_event(struct slz_stream *__restrict strm, unsigned char
+ 		}
+ 		memcpy(buf + hlen, in + done, len);
+ 		done += len;
+-		o += _ev_encode(strm, o, buf + hlen, len, done < ilen ? 1 : more, ctx, buf, hlen, 1);
++		o += _ev_encode(strm, o, buf + hlen, len, done < ilen ? 1 : more, ctx, buf, hlen, 1, 0, 0);
+ 	} while (done < ilen);
+ 	return o - out;
+ #endif
+@@ -2830,10 +2857,15 @@ long slz_rfc1951_encode_event(struct slz_stream *__restrict strm, unsigned char
+ 
+ 		memcpy(buf, ctx->hist, hlen);
+ 		memcpy(buf + hlen, in, ilen);
+-		return _ev_encode(strm, out, buf + hlen, ilen, more, ctx, buf, hlen, 1);
++		return _ev_encode(strm, out, buf + hlen, ilen, more, ctx, buf, hlen, 1, 0, 0);
+ 	}
+ #endif
+-	return _ev_encode(strm, out, in, ilen, more, ctx, ctx->hist + ctx->hoff, ctx->hlen, 0);
++#if SLZ_EV_MODE == 4
++	return _ev_encode(strm, out, in, ilen, more, ctx, ctx->hist, ctx->hlen, 0,
++	                  1, (ctx->hoff - ctx->hlen) & (SLZ_EV_HIST - 1));
++#else
++	return _ev_encode(strm, out, in, ilen, more, ctx, ctx->hist + ctx->hoff, ctx->hlen, 0, 0, 0);
++#endif
+ }
+ 
+ /* Initializes stream <strm> for use with raw deflate (rfc1951). The CRC is
+diff --git a/src/slz.h b/src/slz.h
+index 9f4f65f..698e9c8 100644
+--- a/src/slz.h
++++ b/src/slz.h
+@@ -136,6 +136,8 @@ struct slz_stream {
+  *   2: matched in place as 0; buffer of the history's size as 1
+  *   3: as 1, but the buffer is a ring (only the input is appended on exit),
+  *      and larger inputs are encoded in slices of SLZ_EV_SLICE bytes
++ *   4: a ring of the history's size matched in place: old part, wrapped
++ *      part, then input; only the input is appended on exit
+  */
+ #ifndef SLZ_EV_MODE
+ # define SLZ_EV_MODE 0
+@@ -154,7 +156,7 @@ struct slz_ev_ctx {
+ #endif
+ 	uint32_t hoff;  /* start of the history in <hist> */
+ 	uint32_t hlen;  /* history length, at most SLZ_EV_HIST */
+-	unsigned char hist[(SLZ_EV_MODE == 0 ? 2 : 1) * SLZ_EV_HIST];
++	unsigned char hist[(SLZ_EV_MODE == 0 ? 2 : 1) * SLZ_EV_HIST] __attribute__((aligned(64)));
+ };
+ 
+ /* Maximum number of bytes by which the encoder's output may exceed the same

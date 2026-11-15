@@ -1,0 +1,258 @@
+From a75053beb2acd360d6920c8751c0d93609f20246 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sun, 15 Nov 2026 14:53:42 +0100
+Subject: [PATCH 06/11] EXP: slz: try 4-byte tagged entries in the main
+ encoder, add the SSE 4 kB figures
+
+SLZ_TAG_REFS=1 (off by default, the default build is unchanged) stores
+16 bits of position and a 16-bit tag of the word per entry, as the event
+encoder does. Same ratio at 13 bits, 0.3 pt better on silesia at 14 bits,
+but 9-16% slower at -1 and -4 on silesia and linux-7.0 (+14% instructions,
++16% branch misses), with the table already hot in L2 within a call.
+
+SSE with 4 kB of history in the event encoder: 4-5% smaller output, same
+cost on hot streams, 35-55% more on cold ones.
+---
+ src/slz.c | 97 +++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 94 insertions(+), 3 deletions(-)
+
+diff --git a/src/slz.c b/src/slz.c
+index 254a7f1..91286ca 100644
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -254,6 +254,25 @@ union ref {
+ 	uint64_t by64;
+ };
+ 
++/* EXP: SLZ_TAG_REFS=1 replaces the 8-byte entries of the main encoder with
++ * 4-byte ones: the 16 low bits of the position and a 16-bit tag of the word.
++ * The position is rebuilt as the most recent one with these low bits, and a
++ * candidate is verified on its bytes (the match starts at offset 0).
++ */
++#ifndef SLZ_TAG_REFS
++# define SLZ_TAG_REFS 0
++#endif
++#if SLZ_TAG_REFS
++typedef uint32_t slz_ref_t;
++#else
++typedef union ref slz_ref_t;
++#endif
++
++static inline uint32_t slz_tag(uint32_t w)
++{
++	return (uint16_t)(w ^ (w >> 16));
++}
++
+ /* This hash provides good average results on HTML contents, and is among the
+  * few which provide almost optimal results on various different pages.
+  */
+@@ -930,7 +949,7 @@ void copy_lit_huff(struct slz_stream *__restrict strm, const unsigned char *buf,
+  * realistic input length. Note that the use of memset() here is intentional
+  * as it was measured to be faster on modern libcs than an unrolled loop.
+  */
+-static void reset_refs(union ref *refs, long count)
++static void reset_refs(slz_ref_t *refs, long count)
+ {
+ 	memset(refs, 0xFE, count);
+ }
+@@ -939,7 +958,7 @@ static void reset_refs(union ref *refs, long count)
+  * Reads the 4 bytes at in[p], so the caller must guarantee that in[p + 3] is
+  * within the input buffer.
+  */
+-static inline void insert_ref(union ref *refs, const unsigned char *in, unsigned long p)
++static inline void insert_ref(slz_ref_t *refs, const unsigned char *in, unsigned long p)
+ {
+ #ifdef UNALIGNED_LE_OK
+ 	uint32_t w = *(uint32_t *)&in[p];
+@@ -949,12 +968,16 @@ static inline void insert_ref(union ref *refs, const unsigned char *in, unsigned
+ #endif
+ 	uint32_t h = slz_hash(w);
+ 
++#if SLZ_TAG_REFS
++	refs[h] = (uint16_t)p + (slz_tag(w) << 16);
++#else
+ 	if (sizeof(long) >= 8)
+ 		refs[h].by64 = ((uint64_t)p) + ((uint64_t)w << 32);
+ 	else {
+ 		refs[h].by32.pos = p;
+ 		refs[h].by32.word = w;
+ 	}
++#endif
+ }
+ 
+ /* Number of bits wasted by the 9-bit literals above which it becomes
+@@ -1227,7 +1250,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 
+ 	uint32_t plit = 0;
+ 	uint32_t dist, code;
+-	union ref refs[1 << SLZ_HASH_BITS];
++	slz_ref_t refs[1 << SLZ_HASH_BITS];
+ 
+ 	if (__builtin_expect(!strm->level, 0)) {
+ 		/* force to send as literals (eg to preserve CPU) */
+@@ -1296,6 +1319,12 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 			h = slz_hash(word);
+ 			asm volatile ("" ::); // prevent gcc from trying to be smart with the prefetch
+ 
++#if SLZ_TAG_REFS
++			ent = refs[h];
++			last = pos - (uint16_t)(pos - ent);
++			ent >>= 16;
++			refs[h] = (uint16_t)pos + (slz_tag(word) << 16);
++#else
+ 			if (sizeof(long) >= 8) {
+ 				ent = refs[h].by64;
+ 				last = (uint32_t)ent;
+@@ -1307,6 +1336,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 				refs[h].by32.pos = pos;
+ 				refs[h].by32.word = word;
+ 			}
++#endif
+ 
+ #ifdef FIND_OPTIMAL_MATCH
+ 			/* Experimental code to see what could be saved with an ideal
+@@ -1356,7 +1386,11 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 			//fprintf(stderr, "first=%d best=%d saved_total=%d\n", firstlen, bestlen, saved);
+ #endif
+ 
++#if SLZ_TAG_REFS
++			if ((uint32_t)ent != slz_tag(word)) {
++#else
+ 			if ((uint32_t)ent != word) {
++#endif
+ 			send_as_lit:
+ 				rem--;
+ 				plit++;
+@@ -1412,6 +1446,17 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 							uint32_t w = read_le32(in + pos + 60);
+ 							uint32_t hw = slz_hash(w);
+ 
++#if SLZ_TAG_REFS
++							{
++								uint32_t old = refs[hw];
++
++								if ((old >> 16) == slz_tag(w) && (uint32_t)((uint16_t)(pos + 60 - old) - 1) < 32768) {
++									skip = 0;
++									break;
++								}
++								refs[hw] = (uint16_t)(pos + 60) + (slz_tag(w) << 16);
++							}
++#else
+ 							if (sizeof(long) >= 8) {
+ 								uint64_t old = refs[hw].by64;
+ 
+@@ -1428,6 +1473,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 								refs[hw].by32.pos = pos + 60;
+ 								refs[hw].by32.word = w;
+ 							}
++#endif
+ 							pos += 64;
+ 							rem -= 64;
+ 							plit += 64;
+@@ -1473,6 +1519,17 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 							uint32_t w = read_le32(in + pos + 60);
+ 							uint32_t hw = slz_hash(w);
+ 
++#if SLZ_TAG_REFS
++							{
++								uint32_t old = refs[hw];
++
++								if ((old >> 16) == slz_tag(w) && (uint32_t)((uint16_t)(pos + 60 - old) - 1) < 32768) {
++									skip = 0;
++									break;
++								}
++								refs[hw] = (uint16_t)(pos + 60) + (slz_tag(w) << 16);
++							}
++#else
+ 							if (sizeof(long) >= 8) {
+ 								uint64_t old = refs[hw].by64;
+ 
+@@ -1489,6 +1546,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 								refs[hw].by32.pos = pos + 60;
+ 								refs[hw].by32.word = w;
+ 							}
++#endif
+ 							pos += 64;
+ 							rem -= 64;
+ 							plit += 64;
+@@ -1525,12 +1583,23 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 			/* We reject pos = last and pos > last+32768 */
+ 			if ((unsigned long)(pos - last - 1) >= 32768)
+ 				goto send_as_lit;
++#if SLZ_TAG_REFS
++			/* a rebuilt position may be before the buffer */
++			if (last >= pos)
++				goto send_as_lit;
++#endif
+ 
+ 			/* faster to keep a copy of this with gcc 13-16 */
+ 			lastp = in + last;
+ 
+ 			/* Note: cannot encode a length larger than 258 bytes */
++#if SLZ_TAG_REFS
++			mlen = memmatch(in + pos, lastp, rem > 258 ? 258 : rem);
++			if (mlen < 4)
++				goto send_as_lit;
++#else
+ 			mlen = memmatch(in + pos + 4, lastp + 4, (rem > 258 ? 258 : rem) - 4) + 4;
++#endif
+ 
+ 			/* found a matching entry */
+ 
+@@ -1840,6 +1909,12 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 			h = slz_hash(word);
+ 			asm volatile ("" ::); // prevent gcc from trying to be smart with the prefetch
+ 
++#if SLZ_TAG_REFS
++			ent = refs[h];
++			last = pos - (uint16_t)(pos - ent);
++			ent >>= 16;
++			refs[h] = (uint16_t)pos + (slz_tag(word) << 16);
++#else
+ 			if (sizeof(long) >= 8) {
+ 				ent = refs[h].by64;
+ 				last = (uint32_t)ent;
+@@ -1851,6 +1926,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 				refs[h].by32.pos = pos;
+ 				refs[h].by32.word = word;
+ 			}
++#endif
+ 
+ #ifdef FIND_OPTIMAL_MATCH
+ 			/* see the fixed tree's loop */
+@@ -1888,7 +1964,11 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 			//fprintf(stderr, "first=%d best=%d saved_total=%d\n", firstlen, bestlen, saved);
+ #endif
+ 
++#if SLZ_TAG_REFS
++			if ((uint32_t)ent != slz_tag(word)) {
++#else
+ 			if ((uint32_t)ent != word) {
++#endif
+ 			text_send_as_lit:
+ 				rem--;
+ 				plit++;
+@@ -1929,12 +2009,23 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 			/* We reject pos = last and pos > last+32768 */
+ 			if ((unsigned long)(pos - last - 1) >= 32768)
+ 				goto text_send_as_lit;
++#if SLZ_TAG_REFS
++			/* a rebuilt position may be before the buffer */
++			if (last >= pos)
++				goto text_send_as_lit;
++#endif
+ 
+ 			/* faster to keep a copy of this with gcc 13-16 */
+ 			lastp = in + last;
+ 
+ 			/* Note: cannot encode a length larger than 258 bytes */
++#if SLZ_TAG_REFS
++			mlen = memmatch(in + pos, lastp, rem > 258 ? 258 : rem);
++			if (mlen < 4)
++				goto text_send_as_lit;
++#else
+ 			mlen = memmatch(in + pos + 4, lastp + 4, (rem > 258 ? 258 : rem) - 4) + 4;
++#endif
+ 
+ 			/* found a matching entry */
+ 

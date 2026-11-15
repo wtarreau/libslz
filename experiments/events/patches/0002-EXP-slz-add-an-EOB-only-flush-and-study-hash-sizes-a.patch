@@ -1,0 +1,70 @@
+From e43404153dcad64e0bf8fcd5e50f03a3afc80f3a Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sun, 15 Nov 2026 12:37:05 +0100
+Subject: [PATCH 02/11] EXP: slz: add an EOB-only flush, and study hash sizes
+ and fixed levels on SSE
+
+slz_rfc1951_eflush() only sends EOB and the complete bytes: the EOB's 7
+bits are enough to push the last symbol out, the decoder doesn't need the
+EOB itself to deliver the data. 10 bits per event instead of 20 (partial)
+or 48 (sync): 4.14% instead of 4.57% with 512 bytes of history.
+
+With 512 bytes of history, a 9-bit hash (4 kB) is as good as 13 bits, and
+levels 2-4 started in the fixed tree give the same as level 1.
+---
+ src/slz.c | 29 +++++++++++++++++++++++++++++
+ src/slz.h |  1 +
+ 2 files changed, 30 insertions(+)
+
+diff --git a/src/slz.c b/src/slz.c
+index f375a91..30af00b 100644
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -2423,6 +2423,35 @@ int slz_rfc1951_pflush(struct slz_stream *strm, unsigned char *buf)
+ 	return strm->outbuf - buf;
+ }
+ 
++/* EXP: like slz_rfc1951_pflush() but only closes the block with EOB, without
++ * the empty fixed block: the 7 bits of EOB follow the last symbol and at most
++ * 7 bits stay queued, so the last symbol is entirely in the emitted bytes.
++ * The EOB itself may stay partly queued, the decoder doesn't need it to
++ * deliver the data. The next call starts a new block.
++ */
++int slz_rfc1951_eflush(struct slz_stream *strm, unsigned char *buf)
++{
++	strm->outbuf = buf;
++
++	if (!strm->qbits)
++		return 0;
++
++	if (strm->state == SLZ_ST_LAST || strm->state == SLZ_ST_DONE)
++		return slz_rfc1951_flush(strm, buf);
++
++	if (strm->state == SLZ_ST_FIXED) {
++		send_eob(strm, strm->cur_tree);
++		strm->state = SLZ_ST_EOB;
++	}
++
++	while (strm->qbits >= 8) {
++		*strm->outbuf++ = strm->queue;
++		strm->queue >>= 8;
++		strm->qbits -= 8;
++	}
++	return strm->outbuf - buf;
++}
++
+ /* Flushes any pending for stream <strm> into buffer <buf>, then sends BTYPE=1
+  * and BFINAL=1 if needed. The stream ends in SLZ_ST_DONE. It returns the number
+  * of bytes emitted. The trailer consists in flushing the possibly pending bits
+diff --git a/src/slz.h b/src/slz.h
+index 2b63262..66d76f1 100644
+--- a/src/slz.h
++++ b/src/slz.h
+@@ -145,6 +145,7 @@ long slz_rfc1951_encode_hist(struct slz_stream *strm, unsigned char *out, const
+ int slz_rfc1951_init(struct slz_stream *strm, int level);
+ int slz_rfc1951_flush(struct slz_stream *strm, unsigned char *buf);
+ int slz_rfc1951_pflush(struct slz_stream *strm, unsigned char *buf); /* EXP */
++int slz_rfc1951_eflush(struct slz_stream *strm, unsigned char *buf); /* EXP */
+ int slz_rfc1951_finish(struct slz_stream *strm, unsigned char *buf);
+ 
+ /* Functions specific to rfc1952 (gzip) */

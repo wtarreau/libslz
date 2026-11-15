@@ -1,0 +1,187 @@
+From 7ae5c8abeb105a4a5a62728699b330e525149acb Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sun, 15 Nov 2026 15:48:14 +0100
+Subject: [PATCH 09/11] EXP: slz: event encoder: try a stack copy, a ring and a
+ history-sized buffer
+
+SLZ_EV_MODE selects where the history lives: 0 matched in place with a
+buffer twice its size (still the default), 1 copied to the stack with the
+input behind it, 2 matched in place with a buffer of its size moved on
+exit, 3 like 1 with a ring and 2 kB slices for larger inputs (no in-place
+path at all). Same ratios. The stack copy gains 5-8% on cold log streams
+and costs 14-15% on hot SSE streams; the history-sized buffer costs 7-9%
+on SSE and saves 2 kB per stream.
+
+Also corrects the per-stream size given in the README for the defaults:
+6 kB, not 4.5 kB.
+---
+ src/slz.c | 86 +++++++++++++++++++++++++++++++++++++++++++++++++++----
+ src/slz.h | 18 +++++++++++-
+ 2 files changed, 98 insertions(+), 6 deletions(-)
+
+diff --git a/src/slz.c b/src/slz.c
+index 455d9a3..b63ac33 100644
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -2495,10 +2495,13 @@ void slz_ev_init(struct slz_ev_ctx *ctx)
+  * after the point where the data diverge is at most 8 bytes away, and the
+  * backward match recovers these bytes.
+  */
+-long slz_rfc1951_encode_event(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more, struct slz_ev_ctx *ctx)
++/* <hist> holds the <hlen> bytes of history. When <contig> is set (a
++ * constant), the input immediately follows them in memory.
++ */
++static inline __attribute__((always_inline))
++long _ev_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more,
++                struct slz_ev_ctx *ctx, const unsigned char *hist, uint32_t hlen, int contig)
+ {
+-	const unsigned char *hist = ctx->hist + ctx->hoff;
+-	uint32_t hlen = ctx->hlen;
+ 	uint32_t base = strm->ilen;        /* absolute position of in[0] */
+ 	uint32_t hbase = base - hlen;      /* absolute position of hist[0] */
+ 	long pos = 0, rem = ilen;
+@@ -2598,7 +2601,7 @@ long slz_rfc1951_encode_event(struct slz_stream *__restrict strm, unsigned char
+ 		max = rem > 258 ? 258 : rem;
+ 		if (off < hlen) {
+ 			src = hist + off;
+-			savail = hlen - off;
++			savail = contig ? max : (long)(hlen - off);
+ 		} else {
+ 			src = in + (off - hlen);
+ 			savail = max;
+@@ -2625,7 +2628,7 @@ long slz_rfc1951_encode_event(struct slz_stream *__restrict strm, unsigned char
+ 		 */
+ 		if (SLZ_EV_BACK && plit) {
+ 			long bmax = MIN(plit, SLZ_EV_BACK);
+-			long sback = off < hlen ? (long)off : (long)(off - hlen);
++			long sback = (contig || off < hlen) ? (long)off : (long)(off - hlen);
+ 			long back;
+ 
+ 			if (bmax > 258 - mlen)
+@@ -2728,6 +2731,27 @@ long slz_rfc1951_encode_event(struct slz_stream *__restrict strm, unsigned char
+ 	}
+ 
+  update:
++#if SLZ_EV_MODE == 3
++	/* ring of SLZ_EV_HIST bytes (a power of 2), <hoff> being the next
++	 * write position; only the input is appended.
++	 */
++	if (ilen >= SLZ_EV_HIST) {
++		memcpy(ctx->hist, in + ilen - SLZ_EV_HIST, SLZ_EV_HIST);
++		ctx->hoff = 0;
++		ctx->hlen = SLZ_EV_HIST;
++	}
++	else {
++		uint32_t hoff = ctx->hoff;
++		uint32_t n1 = SLZ_EV_HIST - hoff;
++
++		if (n1 > ilen)
++			n1 = ilen;
++		memcpy(ctx->hist + hoff, in, n1);
++		memcpy(ctx->hist, in + n1, ilen - n1);
++		ctx->hoff = (hoff + ilen) & (SLZ_EV_HIST - 1);
++		ctx->hlen = hlen + ilen > SLZ_EV_HIST ? SLZ_EV_HIST : hlen + ilen;
++	}
++#elif SLZ_EV_MODE == 0
+ 	/* Keep the last SLZ_EV_HIST bytes of history + input. The buffer is
+ 	 * twice as large and only slides when full, so that on average one
+ 	 * byte is copied per input byte.
+@@ -2756,10 +2780,62 @@ long slz_rfc1951_encode_event(struct slz_stream *__restrict strm, unsigned char
+ 		ctx->hoff = hoff;
+ 		ctx->hlen = hlen;
+ 	}
++#else
++	/* buffer of the history's size: move its tail, append the input */
++	if (ilen >= SLZ_EV_HIST) {
++		memcpy(ctx->hist, in + ilen - SLZ_EV_HIST, SLZ_EV_HIST);
++		ctx->hlen = SLZ_EV_HIST;
++	}
++	else {
++		uint32_t keep = hlen + ilen > SLZ_EV_HIST ? SLZ_EV_HIST - ilen : hlen;
++
++		if (keep < hlen)
++			memmove(ctx->hist, ctx->hist + hlen - keep, keep);
++		memcpy(ctx->hist + keep, in, ilen);
++		ctx->hlen = keep + ilen;
++	}
++#endif
+ 	strm->ilen += ilen;
+ 	return strm->outbuf - out;
+ }
+ 
++long slz_rfc1951_encode_event(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more, struct slz_ev_ctx *ctx)
++{
++#if SLZ_EV_MODE == 3
++	unsigned char *o = out;
++	long done = 0;
++
++	do {
++		unsigned char buf[SLZ_EV_HIST + SLZ_EV_SLICE];
++		uint32_t hlen = ctx->hlen, hoff = ctx->hoff;
++		long len = ilen - done > SLZ_EV_SLICE ? SLZ_EV_SLICE : ilen - done;
++
++		/* straighten the ring: while not full, it starts at 0 */
++		if (hlen < SLZ_EV_HIST)
++			memcpy(buf, ctx->hist, hlen);
++		else {
++			memcpy(buf, ctx->hist + hoff, SLZ_EV_HIST - hoff);
++			memcpy(buf + SLZ_EV_HIST - hoff, ctx->hist, hoff);
++		}
++		memcpy(buf + hlen, in + done, len);
++		done += len;
++		o += _ev_encode(strm, o, buf + hlen, len, done < ilen ? 1 : more, ctx, buf, hlen, 1);
++	} while (done < ilen);
++	return o - out;
++#endif
++#if SLZ_EV_MODE == 1
++	if (ilen <= SLZ_EV_SLICE) {
++		unsigned char buf[SLZ_EV_HIST + SLZ_EV_SLICE];
++		uint32_t hlen = ctx->hlen;
++
++		memcpy(buf, ctx->hist, hlen);
++		memcpy(buf + hlen, in, ilen);
++		return _ev_encode(strm, out, buf + hlen, ilen, more, ctx, buf, hlen, 1);
++	}
++#endif
++	return _ev_encode(strm, out, in, ilen, more, ctx, ctx->hist + ctx->hoff, ctx->hlen, 0);
++}
++
+ /* Initializes stream <strm> for use with raw deflate (rfc1951). The CRC is
+  * unused but set to zero. The compression level passed in <level> is set. This
+  * value will be capped between 0 (no compression) and 15 (max compression).
+diff --git a/src/slz.h b/src/slz.h
+index a9ce3bc..9f4f65f 100644
+--- a/src/slz.h
++++ b/src/slz.h
+@@ -127,6 +127,22 @@ struct slz_stream {
+ #ifndef SLZ_EV_HIST
+ # define SLZ_EV_HIST 2048
+ #endif
++/* how the history is used:
++ *   0: matched in place, old then new bytes; buffer twice as large, which
++ *      only slides when full
++ *   1: copied to the stack with the input behind it, matched as one buffer
++ *      (inputs larger than SLZ_EV_SLICE are matched in place); buffer of
++ *      the history's size, its tail moved on exit
++ *   2: matched in place as 0; buffer of the history's size as 1
++ *   3: as 1, but the buffer is a ring (only the input is appended on exit),
++ *      and larger inputs are encoded in slices of SLZ_EV_SLICE bytes
++ */
++#ifndef SLZ_EV_MODE
++# define SLZ_EV_MODE 0
++#endif
++#ifndef SLZ_EV_SLICE
++# define SLZ_EV_SLICE 2048
++#endif
+ 
+ struct slz_ev_ctx {
+ #if SLZ_EV_FMT == 8
+@@ -138,7 +154,7 @@ struct slz_ev_ctx {
+ #endif
+ 	uint32_t hoff;  /* start of the history in <hist> */
+ 	uint32_t hlen;  /* history length, at most SLZ_EV_HIST */
+-	unsigned char hist[2 * SLZ_EV_HIST];
++	unsigned char hist[(SLZ_EV_MODE == 0 ? 2 : 1) * SLZ_EV_HIST];
+ };
+ 
+ /* Maximum number of bytes by which the encoder's output may exceed the same

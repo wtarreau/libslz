@@ -1,0 +1,25 @@
+From e3ef8e63e5c354cdf294a88ec4fffe82c2322a0b Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sun, 15 Nov 2026 16:25:52 +0100
+Subject: [PATCH 11/11] EXP: slz: event encoder: default to the in-place ring
+ (mode 4)
+
+4 kB per stream instead of 6, 6-10% faster on cold SSE streams, about the
+same on cold logs, 6% slower on hot streams.
+---
+ src/slz.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/slz.h b/src/slz.h
+index 698e9c8..60d0c8c 100644
+--- a/src/slz.h
++++ b/src/slz.h
+@@ -140,7 +140,7 @@ struct slz_stream {
+  *      part, then input; only the input is appended on exit
+  */
+ #ifndef SLZ_EV_MODE
+-# define SLZ_EV_MODE 0
++# define SLZ_EV_MODE 4
+ #endif
+ #ifndef SLZ_EV_SLICE
+ # define SLZ_EV_SLICE 2048

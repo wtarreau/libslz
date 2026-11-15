@@ -1,0 +1,963 @@
+Compressing server-sent events flushed one at a time
+=====================================================
+
+2026-11-15.
+
+This study was done on top of the statistics skip and automatic tree series
+(up to "experiments: add the statistics skip and automatic tree studies").
+Its outcome, the SLZ_CT_EVENT content type, was then integrated on top of the
+same code, see section 20. The files here:
+- sse-response.txt: a real capture of an SSE response.
+- patches/: the explored code (src/ only), in order, to apply on top of the
+  commit above, i.e. on the parent of "slz: fix a mixed declaration and code
+  in the text tree's loop". They add slz_rfc1951_encode_hist(),
+  slz_rfc1951_pflush(), the SLZ_TAG_REFS option of the main encoder, and
+  slz_rfc1951_encode_event() with all its build options (SLZ_EV_FMT,
+  _HASH_BITS, _HIST, _MODE, _STEP...). The code each section measured:
+    sections 3-7     0001 encode with a history and add a partial flush
+    section 5b       0002 add an EOB-only flush
+    section 10       0003 add an event encoder
+    section 11       0004 allow 16-bit entries
+    section 12       0005 tagged 4-byte entries, amortized history
+    sections 13-15   0006 try 4-byte tagged entries in the main encoder
+    section 16       0007 prefetch the reference table at entry
+    section 17       0008 default to 2 kB of history
+    section 18       0009 try a stack copy, a ring and a history-sized buffer
+    section 19       0010-0011 in-place ring of the history's size (mode 4)
+- ssecomp.c: the study's main tool, which needs these patches.
+- evtest-study.c, evbench-study.c: the fuzzer and the concurrent-streams
+  benchmark used for the measurements below, which take the context as an
+  argument and need these patches as well.
+- evtest.c, evbench.c: the same, ported to the integrated API (SLZ_CT_EVENT
+  and the ring).
+
+The question: AI and API gateways stream their responses as server-sent
+events (SSE), each event repeating the same JSON envelope around a few bytes
+of payload, with 50-100 ms between events. haproxy then has to flush the
+compressor after each event, and slz compresses nothing that way, while the
+whole capture compresses to 3%. How much history must the encoder keep
+across calls to get most of it back (256, 512, 1 kB...)?
+
+sse-response.txt is a real capture: 942 events, one per line. Each event is
+sent as the line followed by "\n\n" (the SSE event terminator), 260568 bytes
+in all, 277 bytes per event on average.
+
+
+1. What the events contain
+--------------------------
+
+- The payload ("content" or "reasoning_content") is 4.4 bytes per event on
+  average (4092 bytes in all), 1.6% of the data.
+- Consecutive events share their first 71 bytes and their last 198 bytes on
+  average. Only "created" (17 values over the capture) and "id" (2 values)
+  change besides the payload.
+So one previous event holds nearly every match an event needs.
+
+
+2. Why slz compresses nothing today
+-----------------------------------
+
+The encoder resets its reference table at each call, so nothing can match
+across calls: each event alone has no repetitions and goes out as a stored
+block (101.7% of the input). The deflate format itself allows it: the
+decoder keeps its 32 kB window across blocks and flushes.
+
+
+3. The experiment
+-----------------
+
+- slz_rfc1951_encode_hist() (src/slz.c, EXP): like slz_rfc1951_encode(), but
+  the <hlen> bytes before the input are history already sent, which is
+  indexed into the reference table without being emitted. The encoder gets a
+  <start> argument; the production _levX() functions pass 0 and compile to
+  the same instructions (only padding moves).
+- slz_rfc1951_pflush() (src/slz.c, EXP): a partial flush, see section 5.
+- ssecomp.c: sends the events one call each, with up to N bytes of history,
+  flushing after each one, then finishes. After every flush it checks with a
+  streaming zlib inflater that everything up to the end of that event is
+  decodable from the bytes emitted so far (the event can be delivered), and
+  at the end that the whole stream decodes.
+- zlib reference: ~/repo/claude-scripts/libslz/zlib_sse.py, with a fresh
+  compressor per event primed with the last N bytes (zdict), which models a
+  history of exactly N bytes, or one continuous stream with a 2^W window.
+
+Build: gcc -O2 -Isrc experiments/events/ssecomp.c src/slz.c
+src/slz_common.c -lz; run: ssecomp sse-response.txt <level> <hint> <hist>
+[sync|partial|none] (hist -1: the whole capture in one call).
+
+
+4. History size, slz level 1
+----------------------------
+
+Flush after each event (slz_rfc1951_flush(): EOB + empty stored block),
+total output, ratio and bytes per event:
+
+  history     sync flush
+     0       265121  101.75%  281.4
+    16       264027  101.33%  280.3
+    32       237029   90.97%  251.6
+    64       211399   81.13%  224.4
+   128       188593   72.38%  200.2
+   192        92111   35.35%   97.8
+   256        34929   13.40%   37.1
+   272        19936    7.65%   21.2
+   288        13407    5.15%   14.2
+   320-448    13353    5.12%   14.2
+   512        14976    5.75%   15.9
+   1024       15077    5.79%   16.0
+   4096       14641    5.62%   15.5
+   32768      14585    5.60%   15.5
+
+  whole capture in one call:   8310  3.19%
+  32 kB history, no flush:     9420  3.62%
+
+The knee is at one event (288 bytes here, events being 277 bytes on
+average): below, the long suffix match isn't reachable. More history doesn't
+help, and 512 bytes and more even looks worse than 288-448, which isn't due
+to the history: when a flush finds the output byte-aligned (no pending
+bits), it emits nothing and the block stays open, which is free. The events
+being nearly identical, their bit cost is nearly constant, and whether a run
+of events stays aligned depends on the exact lengths of the matches. With
+384 bytes, 419 of the 942 flushes found the output aligned; with 1024, the
+encoder sometimes takes the suffix match two events back (<202,573> instead
+of <201,286>), which changes the bit lengths and breaks the alignment more
+often (317 events got 6 bytes larger, 27 got 6 bytes smaller).
+
+
+5. The flush is the main cost
+-----------------------------
+
+A sync flush costs EOB (7 bits) + empty stored block header (3) + padding
+(3.5 on average) + LEN/NLEN (32) + the next block's header (3), about 48
+bits per event, for about 10 bytes of actual content. zlib's former
+Z_PARTIAL_FLUSH does the job with EOB + an empty fixed block (10 bits),
+emitting only the complete bytes: the 10 extra bits guarantee that the
+closed block's EOB is within them, so the decoder can output everything,
+and the rest of the empty block goes out with the next event. That's 20
+bits per event with the next header. slz_rfc1951_pflush() does that (and
+nothing when the output is aligned). Every event is still verified to be
+decodable from the bytes emitted up to its flush:
+
+  history     sync flush                partial flush
+     0       265121 101.75% 281.4      265106 101.74% 281.4
+   256        34929  13.40%  37.1       31016  11.90%  32.9
+   288        13407   5.15%  14.2       11906   4.57%  12.6
+   384        13353   5.12%  14.2       11852   4.55%  12.6
+   512        14976   5.75%  15.9       11913   4.57%  12.6
+   1024       15077   5.79%  16.0       11550   4.43%  12.3
+   32768      14585   5.60%  15.5       11358   4.36%  12.1
+
+With the partial flush the alignment luck matters much less, and the curve
+is what one expects: a plateau from one event (4.57%), then a slow gain
+(4.36% with 32 kB, 0.6 byte per event).
+
+An alternative: not flushing at all, the last bits of an event leaving
+with the next one (more per-event latency, same rate and same end of
+response), the block staying open:
+
+  history     no flush                  partial flush
+   288        10285   3.95%  10.9       11906   4.57%  12.6
+   512        10082   3.87%  10.7       11913   4.57%  12.6
+   32768       9420   3.62%  10.0       11358   4.36%  12.1
+
+The partial flush costs 1.6-2 bytes per event over not flushing at all,
+the sync flush 3.3-5.5. The remaining gap to the whole capture in one call
+(3.19%) is that matches can't span calls.
+
+For comparison, zenc -1 -k 32 (32 kB calls, no history, no flush) gives
+4.44% on the file (one "\n" per event, 259626 bytes) and -k 4096 3.20%: each
+call starts without history, so the first event of each call is sent
+nearly as literals. -k 4 gives 13.52%, -k 1 42.87%.
+
+
+5b. An EOB-only flush, small hashes, and levels 2-4 in the fixed tree
+---------------------------------------------------------------------
+
+The partial flush's empty fixed block isn't needed to deliver the data: the
+7 bits of EOB follow the last symbol and at most 7 bits stay queued, so the
+last symbol is always entirely in the emitted bytes; the EOB itself may stay
+partly queued. slz_rfc1951_eflush() (EXP) only sends EOB and the complete
+bytes, the next call opening a new block: 10 bits per event with the next
+header, instead of 20 for the partial flush and 48 for the sync one. Every
+event is still verified delivered by zlib (ssecomp mode "eob"). Level 1:
+
+  history     sync      partial    eob        no flush
+   288        5.15%     4.57%      4.16%      3.95%
+   512        5.75%     4.57%      4.14%      3.87%
+   32768      5.60%     4.36%      4.00%      3.62%
+  bytes/event at 512: 15.9 / 12.6 / 11.5 / 10.7
+
+Hash size (SLZ_HASH_BITS, 8 bytes per entry), level 1, eob flush; the
+history is re-indexed at each call, every position, which is a bit more than
+a table kept between calls would hold (inside a match only its last 3
+positions are inserted):
+
+  bits  table     288      512      1024
+   13   64 kB    4.16%    4.14%    4.06%
+   12   32 kB    4.17%    4.11%    4.06%
+   11   16 kB    4.25%    4.09%    4.07%
+   10    8 kB    4.25%    4.14%    4.05%
+    9    4 kB    4.26%    4.15%    4.08%
+    8    2 kB    4.68%    4.56%    4.52%
+
+With 512 bytes of history, 9 bits (4 kB) are as good as 13. 8 bits start to
+lose matches.
+
+Levels 2-4 with every block started in the fixed tree (ssecomp env FIXED=1,
+which only sets cur_tree when a block is to be opened), eob flush:
+
+  bits  history   L1       L2       L3       L4
+   13    288     4.16%    4.17%    4.22%    4.25%
+   13    512     4.14%    4.14%    4.17%    4.14%
+   13    32768   4.00%    4.01%    4.00%    3.99%
+    9    288     4.26%    4.27%    4.29%    4.17%
+    9    512     4.15%    4.16%    4.16%    4.13%
+    9    32768   3.96%    3.97%    3.96%    3.93%
+
+The fixed tree removes the 29% problem at all levels, and the encoder never
+switched to the text tree by itself. The level differences are within
+0.1 pt: the backward extension of level 4 only shows with 288 bytes and a
+9-bit hash (4.26% -> 4.17%), where it recovers match starts lost to
+collisions.
+
+6. zlib reference
+-----------------
+
+zlib, history of exactly N bytes (fresh compressor per event with the last
+N bytes as dictionary), ratio:
+
+                  -1                  -6                  -9
+  history     sync   partial      sync   partial      sync   partial
+     0       84.14%  82.69%      83.83%  82.38%      83.83%  82.38%
+   256       13.28%  11.83%      13.20%  11.75%      13.20%  11.75%
+   288        6.02%   4.58%       6.01%   4.56%       6.01%   4.56%
+   512        5.96%   4.51%       5.94%   4.49%       5.94%   4.49%
+   1024       5.87%   4.42%       5.76%   4.32%       5.76%   4.31%
+   4096       5.67%   4.22%       5.46%   4.01%       5.43%   3.99%
+   32768      5.70%   4.26%       5.34%   3.89%       5.25%   3.80%
+  whole       2.66%               2.18%               2.04%
+
+One continuous stream with a 512-byte window gives 81-83%: zlib keeps 262
+bytes of lookahead out of its window, so only about 250 bytes can be
+referenced, less than one event (1 kB: 4.61-6.61%, 32 kB: same as dict
+32768 within 0.4 pt).
+
+- One event of history is the knee for zlib too: with 288 bytes, -1, -6
+  and -9 all give 4.56-4.58% with the partial flush, the same as slz
+  (4.57%).
+- Beyond one event, zlib -9 goes down to 3.80% with 32 kB (12.6 -> 10.5
+  bytes per event), its better matcher finding older repeated tokens; slz
+  to 4.36%.
+- In both, the sync flush costs 3-4 bytes per event more than the partial
+  one, about 1.3 points: the flush matters more than the history beyond
+  one event.
+
+
+7. Levels 2-4 and the text hint: the text tree's header at every event
+---------------------------------------------------------------------
+
+  ratio, partial flush       288 bytes    32 kB
+  level 1                      4.57%      4.36%
+  level 1 + text hint         29.01%     28.85%
+  levels 2, 3, 4 (+/- hint)   29.01%     28.85%
+  (sync flush, 32 kB: levels 2-4 28.86%)
+
+From level 2 the stream starts with the text tree, each flush closes the
+block, and each event opens a new one, paying the text tree's 78-byte
+header every time (80 bytes per event). With so few literals per event, the
+encoder never collects the evidence to go back to the fixed tree. The hint
+makes level 1 work as level 3, so it's affected too, and haproxy would set
+it for SSE since text/event-stream is a text type. Any stream flushed often
+with little data per flush is concerned, history or not.
+
+
+8. Conclusions
+--------------
+
+- A history of one event is enough to get most of the gain: about 300 bytes
+  for this capture, so 512 bytes would cover events up to about 500 bytes.
+  Beyond, slz gains 0.2 pt up to 32 kB, zlib -9 0.8 pt.
+- With one event of history and a partial flush, slz level 1 gives 4.57%
+  (12.6 bytes per event) against 101.7% today; the whole capture in one call
+  gives 3.19%. The difference is the per-event flush and block overhead.
+- The partial flush (EOB + empty fixed block, complete bytes only) saves
+  1.5-3.5 bytes per event over the sync flush, with every event decodable
+  from the bytes sent up to its flush.
+- Levels 2-4 and the text hint are 6 times worse than level 1 on such
+  streams (29%), because of the text tree's header at every event. They
+  need to stay in the fixed tree when blocks are this small.
+
+
+9. Not done yet / ideas
+-----------------------
+
+- The history has to survive between calls while the caller's buffer is
+  gone, so the stream would need its own copy of the last N bytes (e.g. 512
+  bytes per stream), re-indexed at each call (N inserts) or kept in a
+  smaller reference table.
+- Each call still resets the whole 64 kB reference table (memset), which is
+  large next to a 280-byte event: a speed question, not measured here.
+- When a flush finds the output aligned, keeping the block open is free;
+  choosing between equivalent encodings to end aligned more often (e.g.
+  splitting a match) could make more flushes free. Not tried.
+- How the text tree should behave on flush-heavy streams (section 7): the
+  fixed tree fixes it at all levels (section 5b).
+- The 64 kB reset: the entries already hold the word and the hit test
+  already checks the distance, so with positions counted from the start of
+  the stream and the distance limit set to the history size, the entries
+  from earlier calls are rejected by the existing test: no reset per call
+  and no extra read. This needs the table kept in the stream, hence small
+  (4 kB at 9 bits).
+
+
+10. A dedicated event encoder: slz_rfc1951_encode_event()
+---------------------------------------------------------
+
+The design: a separate, small encoding function for streams of small
+events (SSE, syslog), with the reference table and the history kept between
+calls in a context passed by the caller, no reset, the fixed tree only, no
+literal skip, and a backward match of 8 bytes (free in this context: here
+the target is the ratio for reasonable resources, the 64 kB reset per call
+being the cost it replaces).
+
+- struct slz_ev_ctx (slz.h, EXP): the reference table, a 512-byte history
+  and its fill length, allocated by the caller, initialized by
+  slz_ev_init(). The hash size and the history size are its own build-time
+  constants, separate from SLZ_HASH_BITS; slz.c alone knows the entry format.
+- Positions are counted from the start of the stream (strm->ilen), so the
+  entries from previous calls stay valid without any reset. A candidate must
+  fall within the history or the input before the current position, and is
+  verified by comparing the bytes themselves (the match starts at offset 0,
+  4 bytes at least), which also rejects the entries aliased by the 32-bit
+  wrapping (tested by starting the stream's position half the file below
+  2^32, evtest WRAP=1).
+- A source in the history may continue into the input: the comparison then
+  continues at in[0]. The backward match stays within the source's segment.
+  The last 3 positions of the history are indexed by the next call, once
+  their 4th byte is known.
+- Level 0 still sends stored blocks (haproxy lowers the level to 0 under
+  CPU pressure) and keeps the history up to date.
+
+Bug found on the way: a match reaching the end of the input (rem < 4) was not
+indexed at all, which slz_rfc1951_encode() also does since it doesn't care
+about the next call. Each event ends with the long match on the previous
+event's tail, so when "created" changed, the entry point in the middle of the
+tail (,"id":...) was never in the table: 6.39% instead of 4.14%. The
+experiment of section 5b re-indexed the whole history at each call, which
+hid it.
+
+What to index after a match, eob flush, ratio:
+
+  indexed positions        back 8    no back
+  all of them              4.17%     4.52%
+  1 in 4                   4.15%     4.34%
+  1 in 16                  4.16%     4.28%
+  1 in 32                  4.16%     4.29%
+  1 in 64                  4.36%     4.49%
+  first 3 (as slz.c)       5.12%     5.16%
+
+With the backward match, one matched position in 16 or 32 is as good as all
+of them. A step of 8 has a reason to work on any data: the first indexed
+position after the point where the data diverge is at most 8 bytes away, and
+the backward match recovers them. It's the default (SLZ_EV_STEP).
+
+Cost, evbench: <n> streams, each with its own slz stream, context and
+receive buffer, visited in a new random order at each round, one event each:
+the event is copied into the stream's receive buffer (as recv() would), then
+compressed and flushed. With 10000 streams the contexts total 25-46 MB, more
+than the L3 cache (11 MB), so nothing of a stream is left in the caches when
+it gets its next event. Xeon W-2145 (Skylake-X), gcc 13.3, -O2 with the JCC
+erratum options, median of 7 interleaved runs, ns per event (the ratio at
+10000 streams is higher because each stream only gets 100 events, the first
+one without history):
+
+                                          n=1     n=1000   n=10000
+  today: encode level 1 + sync flush     1014     1034     1089    101.7%
+  event, word kept, 4 kB, index all       299      469      795    4.10%
+  event, word kept, 4 kB, index 1 in 8    161      283      645    4.11%
+  event, no word, 4 kB, index 1 in 8      152      275      639    4.11%
+  event, no word, 2 kB, index 1 in 8      165        -      562    4.11%
+  event, no word, 1 kB, index 1 in 8      169        -      521    4.15%
+  event, word kept, 4 kB, first 3         161      267      594    5.12%
+  copy into the receive buffer only        15       25       54
+
+(word kept: 8-byte entries with the matched word, 9 bits; no word: 4-byte
+entries, 10, 9 or 8 bits.)
+
+- Keeping or dropping the word makes little difference at the same table
+  size: with the word, fewer candidates are compared, but the comparison is
+  needed anyway on the real matches, which read the same history lines.
+  With all positions indexed, the word is worth 2-9% (more candidates).
+- Cold streams cost 3.5 times more than hot ones, and the table's size is
+  what matters there: 4 kB -> 2 kB saves 12%, 1 kB another 7% for +0.04 pt.
+  The default is no word, 9 bits (2 kB), step 8: 2.6 kB per stream with the
+  history.
+- Against what haproxy does today, the event encoder is 2-6 times cheaper per
+  event (no 64 kB reset, no stored block) and gives 4.1% instead of 101.7%.
+
+Reliability: evtest (random chunks from 1 byte, random sync/partial/EOB/no
+flush, each flush checked as delivered by zlib, then the whole stream), on
+the capture, random data, low-entropy binary and slz's sources, levels 0-4,
+under ASan/UBSan, also across the 32-bit wrap: no failure.
+
+
+11. 16-bit entries, and indexing 1 matched position in 4
+--------------------------------------------------------
+
+Since the table's size dominates the cost on cold streams, 16-bit entries
+were tried. SLZ_EV_POS16 keeps only the 16 low bits of the position; the
+lookup takes the most recent position with these bits, at most 65536 bytes
+back (last = cur - (uint16_t)(cur - entry)). Older entries alias to it and
+are rejected by the range check or by the comparison, as with the 32-bit
+wrapping. Same matches, so the same ratios as 32-bit entries with the same
+number of bits. evtest also passes with chunks up to 140 kB (aliasing within
+a call), and across the 32-bit wrap.
+
+Ratio on the capture, eob flush, the same with 16- and 32-bit entries:
+
+  bits   step 1   step 2   step 4   step 8
+   10    4.11%    4.15%    4.14%    4.14%
+    9    4.17%    4.16%    4.15%    4.16%
+    8    4.25%    4.17%    4.14%    4.17%
+
+evbench, same conditions as section 10, ns per event:
+
+                                n=1     n=1000   n=10000
+  32-bit, 9 bits (2 kB), step 8   165      248      556
+  16-bit, 10 bits (2 kB), step 8  157      241      548
+  16-bit, 9 bits (1 kB), step 8   160      231      508
+  16-bit, 8 bits (512 B), step 8  170      232      473    (+0.04 pt)
+  16-bit, 10 bits, step 4         184      266      566
+  16-bit, 9 bits, step 4          194      261      533
+  16-bit, 8 bits, step 4          205      264      503    (+0.01 pt)
+
+- At the same table size (2 kB), 16-bit entries only gain 1.5%: it's the
+  size that matters. Halving it to 1 kB saves 7% on cold streams, 512 bytes
+  another 7% for +0.04 pt.
+- Step 4 costs 25-35 ns per event more than step 8 and gains at most 0.01
+  pt on this capture, except with 8 bits where it compensates the collisions
+  (4.14% instead of 4.17%, but still 30 ns more). On SSE, step 8 is enough;
+  step 4 might pay on less repetitive data such as syslog, not measured
+  here for lack of a sample.
+- New default: 16-bit entries, 9 bits (1 kB), step 8, 1.5 kB per stream
+  with the history.
+
+
+12. Logs: history size, step, entry format
+------------------------------------------
+
+Production log samples were used, not in the tree: haproxy logs,
+maillog, messages and netfilter logs, 100k lines each (96k for messages),
+361, 135, 104 and 224 bytes per line on average. Each line is one event
+(ssecomp LF=1), compressed with slz_rfc1951_encode_event() and the eob flush
+unless stated otherwise.
+
+Ratio against the history size, step 8, with the hash size that suits it
+(9 bits at 512, 11 at 4 kB, 13 above):
+
+  history    haproxy   maillog   messages   netfilter
+    512      50.53%    37.32%    27.85%     27.90%
+   4096      31.58%    18.38%    20.43%     17.95%
+  16384      28.03%    15.32%    17.88%     15.12%
+  32768      27.03%    14.94%    17.27%     14.53%
+  whole file, one call, slz level 1:
+             26.63%    14.23%    15.75%     13.82%
+  whole file, one call, slz level 3:
+             24.08%    13.20%    14.39%     12.83%
+
+Unlike SSE, where one event of history is enough, logs keep gaining up to
+32 kB: from 512 bytes to 4 kB the output is divided by 1.4 to 2, and with
+32 kB it's within 0.4-1.5 pt of the whole file compressed in one call.
+
+The full grid (history 512 to 32768, 9 to 13 bits, steps 1, 4, 8) shows:
+- The hash must grow with the history: about 1 entry per 2-4 bytes of
+  history. With too small a table, step 8 is better than step 1 (fewer
+  collisions), e.g. haproxy at 32 kB with 9 bits: 33.14% at step 8, 35.11%
+  at step 1.
+- With a suitable table, the step changes at most 0.3 pt: step 4 is the
+  best for haproxy (31.42% at 4 kB/11 bits against 31.58% at step 8), step 1
+  for messages and netfilter (20.13% and 17.71% against 20.43% and 17.95%),
+  all equal for maillog. Step 4 is thus a reasonable compromise, but not a
+  large gain.
+
+Backward match, 4 kB and 16 kB, step 8: without it, the output grows by
+0.9 pt / 0.4 pt (haproxy), 0.6 / 0.2 (maillog), 0.4 / 0.15 (messages),
+0.4 / 0.14 (netfilter).
+
+Flushes, 4 kB / 11 bits, ratio with eob, partial, sync, no flush:
+
+  haproxy     31.58%   31.88%   32.73%   31.27%
+  maillog     18.38%   19.21%   21.50%   17.58%
+  messages    20.43%   21.49%   24.18%   19.38%
+  netfilter   17.95%   18.44%   19.83%   17.47%
+
+zlib with one stream and a flush per line (zlib_sse.py LF=1), window 4 kB /
+32 kB, partial flush:
+
+               -1                -6                -9
+  haproxy    31.93% 26.76%    26.70% 22.37%    26.59% 21.90%
+  maillog    20.36% 15.95%    16.86% 13.19%    16.69% 12.84%
+  messages   22.13% 18.36%    19.29% 15.80%    19.16% 15.45%
+  netfilter  20.60% 15.40%    15.94% 12.54%    15.60% 11.84%
+
+With the same history, the event encoder is better than zlib -1 flushed per
+line on all four but haproxy at 32 kB (27.03% vs 26.76%), thanks to the
+cheaper flush and the backward match; zlib -6 stays 2-5 pt below.
+
+Entry formats (SLZ_EV_FMT): 8 = 32-bit position + word, 4 = 16-bit position
++ 16-bit tag of the word (new), 2 = 16-bit position. Same ratios (the
+candidates they reject would fail the comparison anyway). evbench LF=1, ns
+per event:
+
+                     hot (1 stream)             cold (1000 streams)
+  history          8       4       2           8       4       2
+  haproxy  512   1177    1252    2255        1513    1535    2483
+          4096    846     891    1262        2587    1950    1986
+         16384    881     889    1079        3875    3610    3521
+         32768    834     842     983        3851    3608    3804
+  maillog  512    392     409     547         628     602     707
+          4096    255     266     279         901     746     655
+         16384    217     225     226        1070    1006     939
+         32768    213     221     227        1071     995     968
+
+(the 1000-stream column used 64 kB receive buffers per stream, the others
+in this section are sized to the longest event; the SSE figures below are
+all with the latter.)
+
+- On literal-heavy data (haproxy logs at 512 bytes: 50%), 2-byte entries
+  are twice as slow: every lookup finds an in-range candidate that the
+  comparison has to reject. The word or the tag avoids most of them.
+- On cold streams, the table size matters again, and the 4-byte tag format
+  is never far from the best one. It's the default now.
+- Cold streams with 16-32 kB of history cost 3.6 µs per haproxy log line,
+  1 µs per mail log line: the history's lines are cold too.
+
+SSE, 512 bytes, same evbench, 1 and 10000 streams: previous version (single
+512-byte history, 2-byte entries) 160 / 480 ns, now with 2-byte entries
+160 / 509, 4-byte tags 174 / 587, 8-byte entries 163 / 653.
+
+The history used to be shifted by memmove() at each call, which costs up to
+250 ns per event at 32 kB (maillog: 313 ns per event at 16 kB, 558 at 32
+kB). It's now in a buffer twice as large which only slides when full, so
+that one byte is copied per input byte on average. This costs 6% on cold
+SSE streams at 512 bytes (480 -> 509 ns), where the memmove was cheap.
+
+So the right settings differ: SSE wants a small table and 512 bytes of
+history, logs want 4-32 kB and a table that grows with it. Since the
+context's size follows from them, the history size and the hash size would
+better be chosen per stream at run time (the history size is already a
+variable in the loop, the hash size would be a variable shift).
+
+
+13. SSE with 4 kB of history
+----------------------------
+
+4 kB is considered the maximum history for the event encoder (memory per
+stream). On the SSE capture, eob flush, ratio (2- and 4-byte entries give
+the same):
+
+  history   bits   ratio
+    512       9    4.16%
+   4096       9    4.00%
+   4096      10    3.99%
+   4096      11    3.97%
+
+evbench (in this run 4.11% at 512 and 3.90-3.93% at 4 kB, the events being
+taken in a different order), median of 5, ns per event:
+
+                              n=1    n=1000   n=10000
+  2-byte, 512 B, 9 bits       165      234      511
+  2-byte, 4 kB, 9 bits        167      311      689
+  2-byte, 4 kB, 11 bits       151      374      784
+  4-byte, 512 B, 9 bits       174      258      590
+  4-byte, 4 kB, 9 bits        165      317      708
+  4-byte, 4 kB, 11 bits       168      488      915
+
+4 kB saves 4-5% of the output on SSE (0.2 pt), the same cost on hot streams,
+and 35-55% more on cold ones, mostly from the larger table: with the table
+kept at 9 bits, the larger history alone costs 35% (511 -> 689 ns) for most
+of the gain (4.00% against 3.97%).
+
+
+14. The tag in the main encoder (SLZ_TAG_REFS)
+----------------------------------------------
+
+Same 4-byte format as the event encoder's default, applied to
+_slz_rfc1951_encode() under SLZ_TAG_REFS=1 (off by default, the default
+build's _lev1-4 are unchanged, checked with fncmp): 16 low bits of the
+position + 16-bit tag (w ^ w >> 16), the position rebuilt as the most recent
+one with these bits, rejected if before the buffer, and verified by starting
+memmatch at offset 0 (at least 4 bytes). The probes of levels 3-4 compare the
+tag. Round trips at levels 1-4 on silesia and linux-7.0 and streamtest pass.
+
+Ratio: with 13 bits (32 kB table instead of 64), identical to today. With 14
+bits (64 kB, as today), silesia 46.28 / 43.73 / 40.52 / 40.12% at -1..-4
+instead of 46.61 / 43.98 / 40.84 / 40.47%, linux 23.27 / 20.76 / 20.58 /
+20.58% instead of 23.36 / 20.80 / 20.63 / 20.63%.
+
+Speed, zenc -p -t -v, Xeon W-2145, gcc 13.3 -O3 -march=native -mno-avx512f
+with the JCC erratum options, 4 .text paddings x best of 3, mean (min-max)
+over paddings (zsweep.sh in claude-scripts):
+
+                    today            tag 13 bits        tag 14 bits
+  silesia -1   589.3 (589-590)   522.0 (521-524)    506.7 (506-507)
+  silesia -4   459.7 (458-460)   418.7 (417-420)    403.3 (402-405)
+  linux -1     687.2 (687-688)   594.9 (594-595)    576.6 (575-578)
+  linux -4     642.5 (640-644)   570.9 (570-572)    556.0 (555-557)
+
+The tag costs 9-13% at 13 bits and 12-16% at 14 bits, with no overlap
+between the paddings. perf stat, silesia -1, padding 0: +14% instructions,
++11% cycles, +16% branch misses. Every position pays the tag computation
+and the position rebuild, and the hit path gets two more tests (rebuilt
+position before the buffer, fewer than 4 matching bytes). The smaller table
+doesn't pay for it: today's 64 kB table is already hot in L2 within a call.
+The event encoder is different: its table is cold at each call on busy
+proxies, and it already compared the bytes from offset 0.
+
+This confirms an earlier negative result on the main encoder.
+
+
+15. 1 kB of history, steps 1 to 8, 9 bits
+-----------------------------------------
+
+It was suspected that 1 kB (about 3 SSE events, so more chances of a long
+match) with one matched position in 2 indexed and 9 bits could be a good
+point. Note that the step only concerns the positions inside a match:
+every literal position is still looked up and indexed.
+
+Ratio, eob flush, step 1 / 2 / 4 / 8:
+
+  9 bits
+  history  SSE                        haproxy                    maillog
+    512    4.17 4.16 4.15 4.16        49.83 49.40 49.68 50.53    36.71 36.84 37.21 37.32
+   1024    4.03 4.07 4.08 4.05        41.45 40.73 40.89 41.59    30.88 31.08 31.46 31.41
+   2048    4.01 4.05 4.04 4.05        37.32 36.38 36.31 36.71    23.42 23.43 23.58 23.49
+   4096    4.00 3.99 4.01 4.00        35.60 34.43 34.10 34.20    20.03 19.81 19.72 19.52
+  history  messages                   netfilter
+    512    26.84 27.15 27.47 27.85    26.73 26.74 27.09 27.90
+   1024    23.75 23.98 24.24 24.57    23.81 23.64 23.80 24.23
+   2048    21.59 21.71 21.88 22.16    21.71 21.40 21.34 21.47
+   4096    20.25 20.27 20.40 20.57    19.70 19.28 19.11 19.05
+
+  10 bits
+  history  SSE                        haproxy                    maillog
+    512    4.11 4.15 4.14 4.14        48.68 48.51 48.77 49.44    36.52 36.53 36.70 36.70
+   1024    4.01 4.06 4.08 4.09        39.95 39.64 39.79 40.30    30.57 30.66 30.90 30.75
+   2048    4.02 4.02 4.03 4.04        35.29 34.87 34.90 35.22    22.81 22.78 22.85 22.72
+   4096    3.97 3.97 3.99 3.99        32.70 32.22 32.14 32.28    19.00 18.93 18.86 18.66
+  history  messages                   netfilter
+    512    26.88 27.19 27.49 27.69    26.21 26.44 26.79 27.45
+   1024    23.76 23.99 24.22 24.38    22.99 23.08 23.33 23.71
+   2048    21.56 21.71 21.86 22.03    20.58 20.55 20.68 20.86
+   4096    20.17 20.21 20.34 20.46    18.26 18.16 18.25 18.33
+
+- 1 kB instead of 512 bytes: SSE 4.16 -> 4.05% (step 8), logs 12-18%
+  smaller. 4 kB remains much better on logs (maillog 31.4 -> 19.5%).
+- At 1 kB / 9 bits, step 2 is better than step 8 by 0.3-0.9 pt on the logs
+  (haproxy 40.73 against 41.59%, messages 23.98 against 24.57%), equal on SSE.
+  At 4 kB / 9 bits it's no longer better on haproxy, maillog and netfilter:
+  the table is too small for that many entries.
+
+Cost, evbench, 9 bits, ns per event (SSE median of 5, logs median of 3):
+
+                        SSE                  haproxy          maillog
+  fmt hist  step   n=1  n=1000 n=10000    n=1   n=1000    n=1   n=1000
+   2   512    8    161    233    508     2252    2480     538     696
+   2  1024    2    233    309    616     1941    2167     521     703
+   2  1024    8    163    246    562     1868    2115     494     683
+   2  4096    2    230    360    723     1583    1974     363     626
+   2  4096    8    164    312    693     1401    1818     331     608
+   4   512    8    174    258    587     1251    1514     416     597
+   4  1024    2    261    348    694     1104    1368     390     571
+   4  1024    8    171    266    637     1050    1320     371     585
+   4  4096    2    248    383    772      977    1353     307     563
+   4  4096    8    165    317    714      869    1279     269     546
+
+(ratios in this SSE run: 4.11% at 512, 3.98-4.00% at 1 kB, 3.91-3.93% at
+4 kB.)
+
+- On logs, a longer history is cheaper as well as smaller, there are
+  fewer literals to look up: 4 kB / step 8 / 4-byte tags costs 869 ns per
+  haproxy line against 1251 at 512 bytes, and 15-36% less cold.
+- Step 2 costs 40-90 ns per event hot (SSE +70, haproxy +55-110), less cold,
+  for 0.3-0.9 pt on logs at 1 kB and nothing on SSE.
+- The 4-byte tags win on logs (30-45% cheaper on haproxy), the 2-byte
+  entries on SSE (8-13% cheaper): literal-heavy data needs the filter.
+
+
+16. 2 kB of history, and prefetching the context at entry
+---------------------------------------------------------
+
+2 kB, 9 bits (the 4-byte table is 2 kB too), evbench, ns per event,
+median of 5 (SSE) or 3 (logs), the same run for each column:
+
+                           SSE                  haproxy          maillog
+  fmt hist  step    n=1  n=1000 n=10000     n=1   n=1000     n=1   n=1000
+   4  1024    8     172    269    638      1050    1323      370    572
+   4  2048    4     200    308    700       959    1279      317    544
+   4  2048    8     169    286    685       928    1260      304    536
+   4  4096    8     168    320    717       865    1287      270    545
+   2  1024    8     162    247    561      1872    2115      498    683
+   2  2048    4     197    299    653      1614    1876      404    627
+   2  2048    8     166    273    632      1565    1843      394    623
+   2  4096    8     166    318    693      1395    1845      331    603
+
+ratio (n=1)        SSE      haproxy   maillog
+  1024 / step 8   3.98%     41.59%    31.41%
+  2048 / step 4   3.97%     36.31%    23.58%
+  2048 / step 8   3.98%     36.71%    23.49%
+  4096 / step 8   3.93%     34.20%    19.52%
+
+2 kB costs 7% more than 1 kB on cold SSE streams for the same ratio there,
+and is 10-25% smaller and 2-18% cheaper on logs. Step 4 isn't worth it.
+
+Prefetch at entry (SLZ_EV_PREFETCH): 1 = every line of the
+table, 2 = the table and the history. 9 bits, step 8:
+
+  SSE              n=1          n=1000          n=10000
+  fmt hist      0   1   2     0   1   2       0   1   2
+   2  1024    162 159 166   246 240 251     562 494 465
+   2  2048    164 163 171   270 257 301     633 561 561
+   4  1024    171 172 174   265 272 288     634 567 532
+   4  2048    167 168 172   282 285 334     682 614 624
+
+  haproxy          n=1             n=1000             n=10000
+   2  1024   1872 1870 1893   2122 2064 2077   2580 2374 2276
+   2  2048   1564 1571 1591   1862 1802 1797   2523 2309 2077
+   4  1024   1048 1065 1061   1328 1278 1260   1903 1579 1513
+   4  2048    924  926  941   1246 1192 1175   1903 1592 1483
+
+  maillog          n=1             n=1000             n=10000
+   2  1024    500  495  502    685  647  634   1083  912  819
+   2  2048    393  393  401    621  579  572   1058  876  777
+   4  1024    370  373  377    574  530  512   1028  793  725
+   4  2048    303  304  314    534  496  491   1015  785  730
+
+(at n=10000 each log stream only gets 20 lines, hence the higher ratios.)
+
+- Prefetching the table saves 10-12% on cold SSE streams, 8-23% on cold log
+  streams, 3-8% at 1000 streams on logs, and is neutral on hot streams.
+- Prefetching the history as well saves another 5-11% on cold logs and on
+  SSE at 1 kB, but costs 5-18% on SSE at 1000 streams (contexts in L3) and
+  nothing at 2 kB cold: SSE only references the last one or two events, so
+  most of a 2 kB history is prefetched for nothing. Prefetching only the
+  tail of the history is left to try.
+- Default now SLZ_EV_PREFETCH=1.
+
+
+17. Default settings
+--------------------
+
+The choice: 2 kB of history with the 4-byte tagged entries on 9 bits
+(2 kB table), step 8, backward match 8, table prefetched at entry. It excels
+nowhere but is bad nowhere either: SSE 4.05%, haproxy 36.71%, maillog
+23.49%, messages 22.16%, netfilter 21.47% (eob flush), 6 kB per stream
+(2 kB table + 4 kB history buffer).
+
+On the history prefetch: a reference is only read after the
+table has eliminated most candidates, and the CPU starts fetching it a few
+instructions after loading the entry anyway. The measured 5-11% on cold
+log streams likely comes from issuing all the history's lines at once
+instead of one dependent miss after the other (hash -> entry -> history),
+which only pays when many of them get used, as on logs.
+
+(Correction: section 17 first said 4.5 kB per stream; 2 kB of table + a
+4 kB history buffer is 6 kB, and so was the commit message of patch 0008,
+"event encoder: default to 2 kB of history".)
+
+
+18. Where the history lives (SLZ_EV_MODE)
+-----------------------------------------
+
+The history buffer twice the history's size was questioned, with the
+suggestion of copying the history to the stack with the input behind it (contiguous, and
+hot), or else a buffer of the history's size whose tail is moved on exit.
+Four modes, same matches (same ratios), all fuzzed:
+
+  0: matched in place, history then input; buffer twice as large, sliding
+     when full (until now)
+  1: history copied to the stack with the input behind it, one contiguous
+     buffer; buffer of the history's size, tail moved on exit; inputs above
+     2 kB matched in place as 0
+  2: matched in place as 0; buffer of the history's size, tail moved on exit
+  3: as 1, but the buffer is a ring: straightened by two memcpy() when
+     copied to the stack, only the input appended on exit; larger inputs
+     are encoded in 2 kB slices, so there is no in-place path at all
+
+2 kB of history, 4-byte tags, 9 bits, step 8, table prefetch, ns per event
+(SSE median of 5, logs median of 3):
+
+             SSE                     haproxy                  maillog
+  mode   n=1  n=1000 n=10000    n=1  n=1000 n=10000     n=1  n=1000 n=10000
+   0     168    285    617      927   1194   1589       307    496    784
+   1     192    335    642      915   1137   1470       323    488    744
+   2     181    309    668      944   1185   1583       321    500    788
+   3     194    323    651      921   1123   1475       318    472    749
+
+  per stream: mode 0 6 kB, modes 1-3 4 kB.
+
+- Mode 2 (history-sized buffer, tail moved on exit) costs 7-9% on SSE,
+  nothing on logs, and saves 2 kB per stream.
+- Copying the history to the stack (1, 3) gains 5-8% on cold log streams
+  and 6% at 1000 streams for haproxy and maillog with the ring (the copy
+  acts as the history prefetch of section 16), but costs 14-15% on hot SSE
+  streams and 4-6% on cold ones: 2 kB copied for a 280-byte event, of which
+  SSE only uses the last one or two events.
+- The ring (3) saves the tail move of 1 and gives the simplest encoder (no
+  in-place matching, no special case at the history's end), for the same
+  cost as 1.
+No mode wins everywhere: 0 for SSE, 3 for logs. 2 trades 7-9% on SSE for 2
+kB per stream. The default stays 0 for now.
+
+
+19. A ring matched in place (mode 4)
+------------------------------------
+
+The next suggestion: a ring of the history's size, 64-byte aligned, used in
+the split mode and only appended to on exit. Extra slack only helps the
+"slide when full" scheme, and only when it is at least as large as the
+events (with S bytes of slack, HIST/S bytes are moved per input byte), so
+the ring has none: nothing is overwritten during the compression anyway.
+When it wraps, the history is in two parts, so a match's source may run
+from the old part to the wrapped part, then into the input; only such
+matches pay for the third segment. The backward match stays within the
+source's physical segment. 4 kB per stream (2 kB table + 2 kB ring). Same
+ratios (3.97 instead of 3.98% on SSE in evbench, the backward match being
+limited differently), fuzzed.
+
+Same conditions as section 18, all four rebuilt with the 64-byte aligned
+context, ns per event:
+
+             SSE                     haproxy                  maillog
+  mode   n=1  n=1000 n=10000    n=1  n=1000 n=10000     n=1  n=1000 n=10000
+   0     168    291    612      914   1183   1589       303    499    810
+   2     179    310    671      919   1166   1581       313    495    810
+   3     198    327    652      919   1133   1479       319    480    762
+   4     177    272    551      971   1204   1564       321    493    780
+
+- Against mode 0, the in-place ring is 6% slower on hot streams (single
+  build each, so possibly partly layout), but 6% faster on SSE at 1000
+  streams and 10% faster at 10000, and within -4% to +2% on cold logs.
+- It's the fastest of all modes on cold SSE streams, and saves 2 kB per
+  stream over mode 0.
+- On cold logs, the stack copy (3) remains the fastest (-5 to -7%).
+
+Default now SLZ_EV_MODE=4: 2 kB ring matched in place, 2 kB table
+of 4-byte tagged entries on 9 bits, step 8, backward match 8, table
+prefetched at entry, 4 kB per stream.
+
+
+20. Integration
+---------------
+
+A first integration was mistakenly based on an older code base, without the
+automatic tree; the final one is on top of the automatic tree, where
+send_eob() and the copy_lit helpers take the tree, and the open block's tree is <cur_tree>: the flush closes the block
+with send_eob(strm, strm->cur_tree), and the event encoder first closes a
+block opened with the text tree and resets <cur_tree> to the fixed one.
+<content_type> grows to 2 bits, which fit in the padding before <debt>
+(struct slz_stream: 56 bytes with the ring pointer, 48 before).
+
+The integration was meant to be minimal: a cheaper flush, the event encoder
+selected by a new SLZ_CT_EVENT content type, an exported size for the
+caller to allocate the ring, and a check that the ring is set. The encoder
+is the default above, alone, with its settings hardcoded: mode 4, 4-byte
+tagged entries, 9 bits, 2 kB, step 8, backward match 8, table prefetch.
+
+- The ring is private to slz.c (struct slz_ring: table, history, write
+  offset, length, end position), slz_ring_size gives its size (4108
+  bytes). The caller allocates it zeroed and sets it in the stream's new <ring> field, which
+  the init functions reset. 64-byte alignment is preferred, not required:
+  the table comes first, so the history is aligned when the ring is.
+- slz_rfc1951_encode() uses the event encoder when the content type is
+  SLZ_CT_EVENT, the ring is set and the level is not 0. Otherwise the
+  stream works as with SLZ_CT_GENERIC (every tree selection in slz.c tests
+  for SLZ_CT_TEXT, so 2 gets the fixed tree). The gzip and zlib encoders
+  call it.
+- New: the ring records the stream position where its history ends, and
+  the history is dropped when it differs from strm->ilen, i.e. when data
+  were passed without the ring (unset for a while, level 0, another
+  content type). Without it, the distances would point to the wrong bytes.
+- The flush: haproxy only needs every byte of data on the wire after a
+  flush (http-no-delay, CouchDB's heartbeats), and slz_rfc1951_flush()
+  already left the block open when entered with an empty queue. Its empty
+  stored block only served to align the output, and dates back to when the
+  EOB state implied an empty queue, as after a stored block. So instead of
+  a separate EOB-only flush, slz_rfc1951_flush() itself now guarantees
+  that all the bits pending at the call are emitted, adding only what is
+  needed to cross the byte boundary (no symbol unless needed), from
+  the state alone: nothing if aligned, the EOB inside a block (7 bits
+  fixed, 11 text, checked at build time), EOB + padding in the last block,
+  padding after it, an empty fixed block (10 bits) between blocks. Then
+  only complete bytes are emitted, so up to 7 of the added bits may stay
+  queued. A first version relied on the queue being empty between blocks
+  except after a flush, which was rejected as depending on relations
+  between states that nobody can check by reading the function. It
+  applies to all content types: 0 or 10 bits (EOB + next header) instead
+  of about 48 for a flush inside a block, 10 bits for a flush following
+  another one with unaligned bits left. Sending a second
+  EOB (empty fixed block, zlib's Z_PARTIAL_FLUSH) to get the first one out
+  as well isn't needed by zlib, and Go's flate (read from its source, not
+  run) only hands data to the reader when its window fills or at the end
+  of the final block, so a block boundary doesn't help it either.
+  Measured on SSE at level 1 with 512 B of history (section 5b): 15.9
+  bytes per event with the old flush, 12.6 with Z_PARTIAL_FLUSH's, 11.5
+  with this one, 10.7 without flushing. The plain level 1 path barely
+  changes on SSE (265100 bytes instead of 265119 in evbench "today"):
+  without history each event leaves as a stored block, already aligned.
+- The backward match reads 8 bytes at once when UNALIGNED_LE_OK and 8 bytes
+  are available before both sides, otherwise compares byte by byte.
+- SLZ_DIRECT_ENQUEUE56 was first left out of the event encoder without
+  being measured, which was noticed during the review. It is now supported like in the main
+  encoder. Same output; evbench, 7 interleaved runs pinned on one core,
+  median ns per event (min-max), Xeon W-2145, gcc 13.3 -O3:
+
+                        without              with              delta
+    SSE      n=1     182.8 (179.7-260.4)  179.6 (179.3-185.0)   -1.8%
+    SSE      n=10000 596.4 (589.5-643.1)  591.0 (589.7-603.8)   -0.9%
+    haproxy  n=1     981.7 (979.7-1169.8) 982.8 (978.8-997.2)   +0.1%
+    haproxy  n=10000 1542.2 (1539.8-1560.1) 1546.4 (1545.0-1550.6) +0.3%
+
+  Within the noise on SSE (the ranges overlap), +0.3% on the haproxy log
+  at n=10000 (no overlap but tiny). Kept for consistency with the main
+  encoder, since the option then means the same thing everywhere.
+
+Checks:
+- zenc's output is identical to the base's on silesia at levels 0-4,
+  with and without -T.
+- evtest (ASan/UBSan, alignment excepted): sse-response.txt, the first
+  400 kB of silesia and the last 300 kB of the haproxy log, random levels,
+  formats and content types (event, generic, text), one or two flushes in
+  a row or none, delivery checked with zlib after each flush, 60 runs
+  each, plus WRAP=1 (20 runs, chunks up to 140 kB) and DETACH=1 (ring
+  removed for 1 chunk in 16): 0 failures.
+- tests/sequence: 300000 sequences, 0 mismatches, 0 bound violations with
+  the new flush bounds (6/8/16 bytes for deflate/zlib/gzip). Its total
+  budget for a stream didn't count SLZ_MAX_DEBT_BYTES, which the text tree
+  uses from level 2 since the automatic tree (81 streams over by up to 13
+  bytes on the base, 88 with the new flush and its smaller budget,
+  77 with the old budget). This is fixed by "tests/sequence: check each
+  call against SLZ_MAX_OVERHEAD and allow the debt", which also checks each encode() call against SLZ_MAX_OVERHEAD().
+- evbench outputs exactly the same number of bytes as the study's encoder
+  (patch 0011, mode 4) with its EOB-only flush on SSE and logs.
+
+evbench, study (patch 0011, mode 4) vs the integrated encoder (with the EOB-only
+flush, before it was merged into slz_rfc1951_flush(), same output), 7
+interleaved runs, median ns per event, Xeon W-2145, gcc 13.3:
+
+                       n=1     n=1000   n=10000   ratio
+  SSE         study   185.3    282.8     557.3    3.97%
+              int     179.6    275.7     546.4
+  haproxy     study  1107.3   1337.6    1699.7   36.71%
+              int     989.0   1215.3    1556.4
+  maillog     study   348.5      -       833.1   23.49%
+              int     323.3      -       795.5
+
+These figures are from the first integration (on the older code base). The
+final one runs at the same speed (5 interleaved runs: SSE
+183.1/551.8 ns at n=1/10000 vs 183.5/553.4, haproxy log 1034.9/1606.1 vs
+1049.8/1627.4), so the 2-3% gained on SSE and 5-11% on logs over the study's
+encoder don't come from the helpers, but from the encoder itself (the
+study's version carries all the modes and options). Not investigated further. Same ratios. At n=1, SSE gives 3.97%
+instead of ssecomp's 4.05% because these runs go through the capture about
+1000 times; one pass (942 rounds) gives 4.05% with both.

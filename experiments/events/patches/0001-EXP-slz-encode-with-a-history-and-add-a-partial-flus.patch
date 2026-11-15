@@ -1,0 +1,221 @@
+From 48a576423701cdc0a0fbb3a267b8ba987bec297a Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sun, 15 Nov 2026 11:29:49 +0100
+Subject: [PATCH 01/11] EXP: slz: encode with a history and add a partial flush
+
+slz_rfc1951_encode_hist() indexes the <hlen> bytes preceding the input
+as history already sent, so that references may point into it across
+calls. The encoder gets a <start> argument for this; the production
+_levX() functions pass 0 and only padding moves.
+
+slz_rfc1951_pflush() is a partial flush in the spirit of zlib's
+Z_PARTIAL_FLUSH: EOB plus an empty fixed block, emitting only the
+complete bytes, which is enough for the decoder to deliver everything
+before the flush, for about 20 bits instead of 48 for the sync flush.
+
+Both are experimental, used by experiments/chunks.
+---
+ src/slz.c | 116 +++++++++++++++++++++++++++++++++++++++++++++++++-----
+ src/slz.h |   2 +
+ 2 files changed, 109 insertions(+), 9 deletions(-)
+
+diff --git a/src/slz.c b/src/slz.c
+index e8f244a..f375a91 100644
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -1214,10 +1214,10 @@ long backward_match(const unsigned char *in, unsigned long pos, const unsigned c
+  * All three must be constants. Each tree has its own part below.
+  */
+ static inline __attribute__((always_inline))
+-long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more, int level, int bmatch, int auto_tree)
++long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more, int level, int bmatch, int auto_tree, long start)
+ {
+ 	long rem = ilen;
+-	unsigned long pos = 0;
++	unsigned long pos = start;
+ 	unsigned long last;
+ 	const unsigned char *lastp;
+ 	uint32_t word = 0;
+@@ -1232,14 +1232,25 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 	if (__builtin_expect(!strm->level, 0)) {
+ 		/* force to send as literals (eg to preserve CPU) */
+ 		strm->outbuf = out;
+-		if (ilen)
+-			copy_lit(strm, in, ilen, more, SLZ_CT_GENERIC, auto_tree);
++		if (ilen - start)
++			copy_lit(strm, in + start, ilen - start, more, SLZ_CT_GENERIC, auto_tree);
+ 		goto leave;
+ 	}
+ 
+ 	reset_refs(refs, sizeof(refs));
+ 	strm->outbuf = out;
+ 
++	if (start) {
++		/* EXP (history): the <start> first bytes are history, already
++		 * sent by previous calls: only index them so that the data
++		 * after them may reference them.
++		 */
++		unsigned long p = start > 32768 ? start - 32768 : 0;
++
++		for (; p < (unsigned long)start && p + 3 < (unsigned long)ilen; p++)
++			insert_ref(refs, in, p);
++	}
++
+ 	if (auto_tree) {
+ 		/* only the savings of this call may pay for its text blocks,
+ 		 * see SLZ_TEXT_CREDIT.
+@@ -2179,7 +2190,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 		goto fixed_start;
+ 	}
+  leave:
+-	strm->ilen += ilen;
++	strm->ilen += ilen - start;
+ 	return strm->outbuf - out;
+ }
+ 
+@@ -2210,25 +2221,25 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ static __attribute__((noinline))
+ long _slz_rfc1951_encode_lev1(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
+ {
+-	return _slz_rfc1951_encode(strm, out, in, ilen, more, 1, 1, 0);
++	return _slz_rfc1951_encode(strm, out, in, ilen, more, 1, 1, 0, 0);
+ }
+ 
+ static __attribute__((noinline))
+ long _slz_rfc1951_encode_lev2(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
+ {
+-	return _slz_rfc1951_encode(strm, out, in, ilen, more, 1, 1, 1);
++	return _slz_rfc1951_encode(strm, out, in, ilen, more, 1, 1, 1, 0);
+ }
+ 
+ static __attribute__((noinline))
+ long _slz_rfc1951_encode_lev3(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
+ {
+-	return _slz_rfc1951_encode(strm, out, in, ilen, more, 2, 1, 1);
++	return _slz_rfc1951_encode(strm, out, in, ilen, more, 2, 1, 1, 0);
+ }
+ 
+ static __attribute__((noinline))
+ long _slz_rfc1951_encode_lev4(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
+ {
+-	return _slz_rfc1951_encode(strm, out, in, ilen, more, 3, 8, 1);
++	return _slz_rfc1951_encode(strm, out, in, ilen, more, 3, 8, 1, 0);
+ }
+ 
+ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
+@@ -2251,6 +2262,57 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
+ 		return _slz_rfc1951_encode_lev4(strm, out, in, ilen, more);
+ }
+ 
++/* EXP (history): same as the _levX() functions, the first <start> bytes of
++ * <in> being history (see slz_rfc1951_encode_hist()).
++ */
++static __attribute__((noinline))
++long _slz_rfc1951_encode_hlev1(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more, long start)
++{
++	return _slz_rfc1951_encode(strm, out, in, ilen, more, 1, 1, 0, start);
++}
++
++static __attribute__((noinline))
++long _slz_rfc1951_encode_hlev2(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more, long start)
++{
++	return _slz_rfc1951_encode(strm, out, in, ilen, more, 1, 1, 1, start);
++}
++
++static __attribute__((noinline))
++long _slz_rfc1951_encode_hlev3(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more, long start)
++{
++	return _slz_rfc1951_encode(strm, out, in, ilen, more, 2, 1, 1, start);
++}
++
++static __attribute__((noinline))
++long _slz_rfc1951_encode_hlev4(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more, long start)
++{
++	return _slz_rfc1951_encode(strm, out, in, ilen, more, 3, 8, 1, start);
++}
++
++/* EXP (history): same as slz_rfc1951_encode(), except that the <hlen> bytes
++ * before <in> are the end of the data already passed to previous calls on the
++ * same stream (at most 32768), which the data at <in> may reference. The
++ * output only covers the <ilen> bytes at <in>.
++ */
++long slz_rfc1951_encode_hist(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more, long hlen)
++{
++	int level = strm->level;
++
++	if (hlen > 32768)
++		hlen = 32768;
++	if (strm->content_type == SLZ_CT_TEXT && level && level < 3)
++		level = 3;
++
++	if (level <= 1)
++		return _slz_rfc1951_encode_hlev1(strm, out, in - hlen, ilen + hlen, more, hlen);
++	else if (level <= 2)
++		return _slz_rfc1951_encode_hlev2(strm, out, in - hlen, ilen + hlen, more, hlen);
++	else if (level <= 3)
++		return _slz_rfc1951_encode_hlev3(strm, out, in - hlen, ilen + hlen, more, hlen);
++	else
++		return _slz_rfc1951_encode_hlev4(strm, out, in - hlen, ilen + hlen, more, hlen);
++}
++
+ /* Initializes stream <strm> for use with raw deflate (rfc1951). The CRC is
+  * unused but set to zero. The compression level passed in <level> is set. This
+  * value will be capped between 0 (no compression) and 15 (max compression).
+@@ -2325,6 +2387,42 @@ int slz_rfc1951_flush(struct slz_stream *strm, unsigned char *buf)
+ 	return strm->outbuf - buf;
+ }
+ 
++/* EXP (partial flush): makes everything passed so far decodable from the
++ * bytes emitted, at a lower cost than slz_rfc1951_flush() when bits are
++ * pending: the current block is closed and followed by an empty fixed block
++ * (10 bits), which guarantees that the closed block's EOB lies within the
++ * complete bytes emitted, and only complete bytes are emitted, the remaining
++ * bits of the empty block staying in the queue for the next call (this is
++ * zlib's Z_PARTIAL_FLUSH). If no bits are pending, the decoder already has
++ * everything and nothing is done, the block remaining open. The last block
++ * is handled by slz_rfc1951_flush().
++ */
++int slz_rfc1951_pflush(struct slz_stream *strm, unsigned char *buf)
++{
++	strm->outbuf = buf;
++
++	if (!strm->qbits)
++		return 0;
++
++	if (strm->state == SLZ_ST_LAST || strm->state == SLZ_ST_DONE)
++		return slz_rfc1951_flush(strm, buf);
++
++	if (strm->state == SLZ_ST_FIXED) {
++		send_eob(strm, strm->cur_tree);
++		enqueue8(strm, 2, 3); // BFINAL = 0 ; BTYPE = 01
++		enqueue8(strm, 0, 7); // EOB
++		strm->state = SLZ_ST_EOB;
++	}
++
++	/* emit the complete bytes only */
++	while (strm->qbits >= 8) {
++		*strm->outbuf++ = strm->queue;
++		strm->queue >>= 8;
++		strm->qbits -= 8;
++	}
++	return strm->outbuf - buf;
++}
++
+ /* Flushes any pending for stream <strm> into buffer <buf>, then sends BTYPE=1
+  * and BFINAL=1 if needed. The stream ends in SLZ_ST_DONE. It returns the number
+  * of bytes emitted. The trailer consists in flushing the possibly pending bits
+diff --git a/src/slz.h b/src/slz.h
+index 9e77a7f..2b63262 100644
+--- a/src/slz.h
++++ b/src/slz.h
+@@ -141,8 +141,10 @@ struct slz_stream {
+ /* Functions specific to rfc1951 (deflate) */
+ void slz_prepare_dist_table(); /* obsolete, not needed anymore */
+ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsigned char *in, long ilen, int more);
++long slz_rfc1951_encode_hist(struct slz_stream *strm, unsigned char *out, const unsigned char *in, long ilen, int more, long hlen); /* EXP */
+ int slz_rfc1951_init(struct slz_stream *strm, int level);
+ int slz_rfc1951_flush(struct slz_stream *strm, unsigned char *buf);
++int slz_rfc1951_pflush(struct slz_stream *strm, unsigned char *buf); /* EXP */
+ int slz_rfc1951_finish(struct slz_stream *strm, unsigned char *buf);
+ 
+ /* Functions specific to rfc1952 (gzip) */

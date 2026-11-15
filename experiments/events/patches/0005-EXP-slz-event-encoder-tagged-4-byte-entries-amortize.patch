@@ -1,0 +1,184 @@
+From 35ec1bbcf32731ed0c696323603dfb53687435e6 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sun, 15 Nov 2026 14:20:03 +0100
+Subject: [PATCH 05/11] EXP: slz: event encoder: tagged 4-byte entries,
+ amortized history, log study
+
+On Willy's production log samples (haproxy, maillog, messages, netfilter),
+the history matters much more than on SSE: from 512 bytes to 4 kB the
+output is divided by 1.4 to 2, and with 32 kB it's within 0.4-1.5 pt of
+the whole file in one call, better than zlib -1 flushed per line on 3
+of 4. The step changes at most 0.3 pt with a suitable hash size.
+
+Literal-heavy logs make 2-byte entries twice as slow (every candidate
+needs the comparison), hence a 4-byte format with a 16-bit position and
+a 16-bit tag of the word, now the default. The history is kept in a
+buffer twice as large that only slides when full, instead of a memmove
+of the whole history at each call (250 ns per event at 32 kB).
+---
+ src/slz.c | 57 ++++++++++++++++++++++++++++++++++++++++---------------
+ src/slz.h | 29 ++++++++++++++--------------
+ 2 files changed, 57 insertions(+), 29 deletions(-)
+
+diff --git a/src/slz.c b/src/slz.c
+index 42d0ec2..254a7f1 100644
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -2348,14 +2348,20 @@ static inline uint32_t ev_hash(uint32_t a)
+ #endif
+ 
+ /* inserts absolute position <p> whose 4 first bytes are <w> */
++/* 16-bit tag of word <w> for SLZ_EV_FMT 4, from bits the hash mostly ignores */
++static inline uint32_t ev_tag(uint32_t w)
++{
++	return (uint16_t)(w ^ (w >> 16));
++}
++
+ static inline void ev_insert(struct slz_ev_ctx *ctx, uint32_t p, uint32_t w)
+ {
+-#if SLZ_EV_WORD
++#if SLZ_EV_FMT == 8
+ 	ctx->refs[ev_hash(w)] = p + ((uint64_t)w << 32);
+-#elif SLZ_EV_POS16
+-	ctx->refs[ev_hash(w)] = (uint16_t)p;
++#elif SLZ_EV_FMT == 4
++	ctx->refs[ev_hash(w)] = (uint16_t)p + (ev_tag(w) << 16);
+ #else
+-	ctx->refs[ev_hash(w)] = p;
++	ctx->refs[ev_hash(w)] = (uint16_t)p;
+ #endif
+ }
+ 
+@@ -2395,7 +2401,7 @@ void slz_ev_init(struct slz_ev_ctx *ctx)
+  */
+ long slz_rfc1951_encode_event(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more, struct slz_ev_ctx *ctx)
+ {
+-	const unsigned char *hist = ctx->hist;
++	const unsigned char *hist = ctx->hist + ctx->hoff;
+ 	uint32_t hlen = ctx->hlen;
+ 	uint32_t base = strm->ilen;        /* absolute position of in[0] */
+ 	uint32_t hbase = base - hlen;      /* absolute position of hist[0] */
+@@ -2448,23 +2454,28 @@ long slz_rfc1951_encode_event(struct slz_stream *__restrict strm, unsigned char
+ 		const unsigned char *src;
+ 		long savail, mlen, max;
+ 
+-#if SLZ_EV_WORD
++#if SLZ_EV_FMT == 8
+ 		uint64_t ent = ctx->refs[h];
+ 
+ 		ctx->refs[h] = cur + ((uint64_t)word << 32);
+ 		if ((uint32_t)(ent >> 32) != word)
+ 			goto send_as_lit;
+ 		last = (uint32_t)ent;
+-#elif SLZ_EV_POS16
++#elif SLZ_EV_FMT == 4
++		uint32_t ent = ctx->refs[h];
++
++		ctx->refs[h] = (uint16_t)cur + (ev_tag(word) << 16);
++		if ((ent >> 16) != ev_tag(word))
++			goto send_as_lit;
+ 		/* the most recent position with these 16 low bits, at most
+ 		 * 65536 bytes back: older entries alias to it and are
+ 		 * rejected by the range check or the comparison below.
+ 		 */
++		last = cur - (uint16_t)(cur - ent);
++#else
++		/* same as above */
+ 		last = cur - (uint16_t)(cur - ctx->refs[h]);
+ 		ctx->refs[h] = (uint16_t)cur;
+-#else
+-		last = ctx->refs[h];
+-		ctx->refs[h] = cur;
+ #endif
+ 		/* must be within the history or the input before <pos> */
+ 		off = last - hbase;
+@@ -2607,17 +2618,33 @@ long slz_rfc1951_encode_event(struct slz_stream *__restrict strm, unsigned char
+ 	}
+ 
+  update:
+-	/* keep the last SLZ_EV_HIST bytes of history + input */
++	/* Keep the last SLZ_EV_HIST bytes of history + input. The buffer is
++	 * twice as large and only slides when full, so that on average one
++	 * byte is copied per input byte.
++	 */
+ 	if (ilen >= SLZ_EV_HIST) {
+ 		memcpy(ctx->hist, in + ilen - SLZ_EV_HIST, SLZ_EV_HIST);
++		ctx->hoff = 0;
+ 		ctx->hlen = SLZ_EV_HIST;
+ 	}
+ 	else {
+-		uint32_t keep = hlen + ilen > SLZ_EV_HIST ? SLZ_EV_HIST - ilen : hlen;
++		uint32_t hoff = ctx->hoff;
+ 
+-		memmove(ctx->hist, ctx->hist + hlen - keep, keep);
+-		memcpy(ctx->hist + keep, in, ilen);
+-		ctx->hlen = keep + ilen;
++		if (hoff + hlen + ilen > 2 * SLZ_EV_HIST) {
++			uint32_t keep = hlen + ilen > SLZ_EV_HIST ? SLZ_EV_HIST - ilen : hlen;
++
++			memmove(ctx->hist, ctx->hist + hoff + hlen - keep, keep);
++			hoff = 0;
++			hlen = keep;
++		}
++		memcpy(ctx->hist + hoff + hlen, in, ilen);
++		hlen += ilen;
++		if (hlen > SLZ_EV_HIST) {
++			hoff += hlen - SLZ_EV_HIST;
++			hlen = SLZ_EV_HIST;
++		}
++		ctx->hoff = hoff;
++		ctx->hlen = hlen;
+ 	}
+ 	strm->ilen += ilen;
+ 	return strm->outbuf - out;
+diff --git a/src/slz.h b/src/slz.h
+index 1561735..f965c73 100644
+--- a/src/slz.h
++++ b/src/slz.h
+@@ -111,15 +111,15 @@ struct slz_stream {
+ 
+ /* EXP: context of slz_rfc1951_encode_event(), allocated by the caller per
+  * stream and initialized with slz_ev_init(). Its contents are private to
+- * slz.c. SLZ_EV_WORD selects the entry format: 1 = position + matched word
+- * (8 bytes), 0 = position only (4 bytes, or 2 with SLZ_EV_POS16). SLZ_EV_HIST is the history kept
+- * between calls. All three are build-time settings.
++ * slz.c. SLZ_EV_FMT selects the entry format, by its size in bytes:
++ *   8: 32-bit position + matched word
++ *   4: 16-bit position + 16-bit tag derived from the word
++ *   2: 16-bit position only
++ * SLZ_EV_HIST is the history kept between calls, stored in a buffer twice as
++ * large which only slides when full. All are build-time settings.
+  */
+-#ifndef SLZ_EV_WORD
+-# define SLZ_EV_WORD 0
+-#endif
+-#ifndef SLZ_EV_POS16
+-# define SLZ_EV_POS16 1 /* without the word: 1 = only 16 bits of position */
++#ifndef SLZ_EV_FMT
++# define SLZ_EV_FMT 4
+ #endif
+ #ifndef SLZ_EV_HASH_BITS
+ # define SLZ_EV_HASH_BITS 9
+@@ -129,15 +129,16 @@ struct slz_stream {
+ #endif
+ 
+ struct slz_ev_ctx {
+-#if SLZ_EV_WORD
++#if SLZ_EV_FMT == 8
+ 	uint64_t refs[1 << SLZ_EV_HASH_BITS];
+-#elif SLZ_EV_POS16
+-	uint16_t refs[1 << SLZ_EV_HASH_BITS];
+-#else
++#elif SLZ_EV_FMT == 4
+ 	uint32_t refs[1 << SLZ_EV_HASH_BITS];
++#else
++	uint16_t refs[1 << SLZ_EV_HASH_BITS];
+ #endif
+-	uint32_t hlen;
+-	unsigned char hist[SLZ_EV_HIST];
++	uint32_t hoff;  /* start of the history in <hist> */
++	uint32_t hlen;  /* history length, at most SLZ_EV_HIST */
++	unsigned char hist[2 * SLZ_EV_HIST];
+ };
+ 
+ /* Maximum number of bytes by which the encoder's output may exceed the same

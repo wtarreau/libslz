@@ -1,0 +1,380 @@
+From 5d29888c2b37a416fe575eae83aa424bd70b0c37 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sun, 15 Nov 2026 13:32:06 +0100
+Subject: [PATCH 03/11] EXP: slz: add an event encoder keeping its history and
+ refs between calls
+
+slz_rfc1951_encode_event() compresses streams of small events (SSE,
+syslog) with a context passed by the caller: a reference table and the
+last 512 bytes, kept between calls. Positions are counted from the start
+of the stream so that nothing is reset, and every candidate is verified
+on the bytes themselves, which also covers the 32-bit wrapping. Fixed
+tree only, no literal skip, 8-byte backward match, and one matched
+position in 8 indexed, the backward match recovering the others.
+
+On Willy's SSE capture with the EOB-only flush: 4.16% instead of 101.7%
+today, for 165 ns per event instead of 1014 on hot streams, 562 instead
+of 1089 with 10000 streams visited at random. See experiments/chunks.
+---
+ src/slz.c | 301 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/slz.h |  28 +++++
+ 2 files changed, 329 insertions(+)
+
+diff --git a/src/slz.c b/src/slz.c
+index 30af00b..3eddbc0 100644
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -2313,6 +2313,307 @@ long slz_rfc1951_encode_hist(struct slz_stream *__restrict strm, unsigned char *
+ 		return _slz_rfc1951_encode_hlev4(strm, out, in - hlen, ilen + hlen, more, hlen);
+ }
+ 
++/* EXP (event encoder): same hash as slz_hash() on SLZ_EV_HASH_BITS bits */
++static inline uint32_t ev_hash(uint32_t a)
++{
++#if defined(__ARM_FEATURE_CRC32)
++#  if defined(__ARM_ARCH_ISA_A64)
++	__asm__ volatile("crc32w %w0,%w0,%w1" : "+r"(a) : "r"(0));
++#  else
++	__asm__ volatile("crc32w %0,%0,%1" : "+r"(a) : "r"(0));
++#  endif
++#elif defined(__SSE4_2__) && defined(USE_CRC32C_HASH)
++	__asm__ volatile("crc32l %1,%0" : "+r"(a) : "r"(0));
++#elif defined(HAVE_FAST_MULT)
++	a = (a * 0x1af42f);
++#else
++	a = ((a << 19) + (a << 6) - a);
++#endif
++	return a >> (32 - SLZ_EV_HASH_BITS);
++}
++
++/* number of matched positions indexed after a match, 0 = all of them */
++#ifndef SLZ_EV_INSERT
++# define SLZ_EV_INSERT 0
++#endif
++
++/* backward match length, at most 8 */
++#ifndef SLZ_EV_BACK
++# define SLZ_EV_BACK 8
++#endif
++
++/* step between the matched positions indexed */
++#ifndef SLZ_EV_STEP
++# define SLZ_EV_STEP 8
++#endif
++
++/* inserts absolute position <p> whose 4 first bytes are <w> */
++static inline void ev_insert(struct slz_ev_ctx *ctx, uint32_t p, uint32_t w)
++{
++#if SLZ_EV_WORD
++	ctx->refs[ev_hash(w)] = p + ((uint64_t)w << 32);
++#else
++	ctx->refs[ev_hash(w)] = p;
++#endif
++}
++
++/* compares up to <max> bytes at <a> with the source at <b>, of which only
++ * <bavail> are contiguous, the source then continuing at <in> (the history
++ * being followed by the input).
++ */
++static inline long ev_match(const unsigned char *a, const unsigned char *b, long bavail, const unsigned char *in, long max)
++{
++	long l;
++
++	if (max <= bavail)
++		return memmatch(a, b, max);
++	l = memmatch(a, b, bavail);
++	if (l < bavail)
++		return l;
++	return l + memmatch(a + l, in, max - l);
++}
++
++void slz_ev_init(struct slz_ev_ctx *ctx)
++{
++	memset(ctx, 0, sizeof(*ctx));
++}
++
++/* EXP: encoder for streams made of small events flushed one at a time (SSE,
++ * syslog...). Unlike slz_rfc1951_encode(), the references may point into the
++ * last SLZ_EV_HIST bytes passed in previous calls, which <ctx> keeps along
++ * with its own reference table, so nothing is reset at each call. Positions
++ * are counted from the start of the stream (strm->ilen), so that entries from
++ * previous calls are still valid, and every hit is verified by reading the
++ * source bytes, which also rejects entries aliased by the 32-bit wrapping. The
++ * level is ignored except for 0, it always uses the fixed tree, never skips
++ * literals, and grows matches up to 8 bytes backwards. One matched position
++ * in SLZ_EV_STEP is indexed: with a step of 8, the first indexed position
++ * after the point where the data diverge is at most 8 bytes away, and the
++ * backward match recovers these bytes.
++ */
++long slz_rfc1951_encode_event(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more, struct slz_ev_ctx *ctx)
++{
++	const unsigned char *hist = ctx->hist;
++	uint32_t hlen = ctx->hlen;
++	uint32_t base = strm->ilen;        /* absolute position of in[0] */
++	uint32_t hbase = base - hlen;      /* absolute position of hist[0] */
++	long pos = 0, rem = ilen;
++	uint32_t plit = 0;
++	uint32_t bal;
++	int k;
++
++	strm->outbuf = out;
++
++	/* only the fixed tree here */
++	if (strm->cur_tree != SLZ_CT_GENERIC) {
++		if (strm->state == SLZ_ST_FIXED) {
++			send_eob(strm, strm->cur_tree);
++			strm->state = SLZ_ST_EOB;
++		}
++		strm->cur_tree = SLZ_CT_GENERIC;
++	}
++	strm->tree_switch = 0;
++
++	if (__builtin_expect(!strm->level, 0)) {
++		if (ilen)
++			copy_lit(strm, in, ilen, more, SLZ_CT_GENERIC, 0);
++		goto update;
++	}
++
++	/* the last 3 positions of the history could not be indexed before
++	 * their 4th byte was known.
++	 */
++	for (k = 3; k >= 1; k--) {
++		unsigned char tmp[4];
++		int j;
++
++		if (hlen < (uint32_t)k || ilen < 4 - k)
++			continue;
++		for (j = 0; j < k; j++)
++			tmp[j] = hist[hlen - k + j];
++		for (; j < 4; j++)
++			tmp[j] = in[j - k];
++		ev_insert(ctx, base - k, read_le32(tmp));
++	}
++
++	bal = strm->debt;
++
++	while (rem >= 4) {
++		uint32_t word = read_le32(in + pos);
++		uint32_t h = ev_hash(word);
++		uint32_t cur = base + pos;
++		uint32_t last, off, dist, code, d;
++		const unsigned char *src;
++		long savail, mlen, max;
++
++#if SLZ_EV_WORD
++		uint64_t ent = ctx->refs[h];
++
++		ctx->refs[h] = cur + ((uint64_t)word << 32);
++		if ((uint32_t)(ent >> 32) != word)
++			goto send_as_lit;
++		last = (uint32_t)ent;
++#else
++		last = ctx->refs[h];
++		ctx->refs[h] = cur;
++#endif
++		/* must be within the history or the input before <pos> */
++		off = last - hbase;
++		if (off >= hlen + (uint32_t)pos)
++			goto send_as_lit;
++		dist = hlen + pos - off;
++		if (dist > 32768)
++			goto send_as_lit;
++
++		max = rem > 258 ? 258 : rem;
++		if (off < hlen) {
++			src = hist + off;
++			savail = hlen - off;
++		} else {
++			src = in + (off - hlen);
++			savail = max;
++		}
++
++		/* verifies the word too */
++		mlen = ev_match(in + pos, src, savail, in, max);
++		if (mlen < 4)
++			goto send_as_lit;
++
++		if (bal >= SLZ_SWITCH_COST + SLZ_CREDIT && mlen < 6)
++			goto send_as_lit;
++
++		code = len_code(mlen, SLZ_CT_GENERIC);
++		d = fh_dist_table[dist - 1];
++
++		/* see _slz_rfc1951_encode() */
++		if (bal >= SLZ_MAX_DEBT + SLZ_CREDIT &&
++		    (d & 0x1f) + (code >> 16) + SLZ_SWITCH_COST > 8 * mlen)
++			goto send_as_lit;
++
++		/* grow the match backwards over up to 8 pending literals,
++		 * within the source's segment.
++		 */
++		if (SLZ_EV_BACK && plit) {
++			long bmax = MIN(plit, SLZ_EV_BACK);
++			long sback = off < hlen ? (long)off : (long)(off - hlen);
++			long back;
++
++			if (bmax > 258 - mlen)
++				bmax = 258 - mlen;
++			if (bmax > sback)
++				bmax = sback;
++			if (SLZ_EV_BACK == 8 && pos >= 8 && sback >= 8)
++				back = backward_match(in, pos, src, bmax, 8);
++			else {
++				back = 0;
++				while (back < bmax && in[pos - back - 1] == src[-back - 1])
++					back++;
++			}
++			if (back) {
++				pos  -= back;
++				plit -= back;
++				rem  += back;
++				mlen += back;
++				code = len_code(mlen, SLZ_CT_GENERIC);
++			}
++		}
++
++		if (plit) {
++			if (bal >= SLZ_SWITCH_COST + SLZ_CREDIT) {
++				copy_lit(strm, in + pos - plit, plit, 1, SLZ_CT_GENERIC, 0);
++				bal = strm->debt;
++			}
++			else
++				copy_lit_huff(strm, in + pos - plit, plit, 1, SLZ_CT_GENERIC, 0);
++			plit = 0;
++		}
++
++		if (strm->state == SLZ_ST_EOB) {
++			strm->state = SLZ_ST_FIXED;
++			open_huff_block(strm, 0, SLZ_CT_GENERIC);
++			bal = strm->debt + SLZ_SWITCH_COST;
++		}
++
++		enqueue24(strm, code & 0xFFFF, code >> 16);
++		enqueue24(strm, d >> 5, d & 0x1f);
++
++		code = bal + (code >> 16) + (d & 0x1f);
++		bal = (code > 8 * (uint32_t)mlen) ? code - 8 * (uint32_t)mlen : 0;
++		strm->debt = bal;
++
++		rem -= mlen;
++		pos += mlen;
++
++		/* Index the matched positions, also when the match reaches the
++		 * end of the input: the next calls need them. Those whose 4
++		 * bytes are not all there yet are indexed by the next call.
++		 * SLZ_EV_INSERT=0 indexes all of them, otherwise the first N.
++		 */
++		{
++			long p = pos - mlen + 1;
++			long e = pos;
++
++			if (SLZ_EV_INSERT && e > p + SLZ_EV_INSERT)
++				e = p + SLZ_EV_INSERT;
++			if (e > ilen - 3)
++				e = ilen - 3;
++			for (; p < e; p += SLZ_EV_STEP)
++				ev_insert(ctx, base + p, read_le32(in + p));
++		}
++		continue;
++
++	send_as_lit:
++		bal += ((unsigned char)word >= 144);
++		plit++;
++		pos++;
++		rem--;
++		if (__builtin_expect(plit == 0xffc0, 0)) {
++			copy_lit_small(strm, in + pos - plit, plit, 1, SLZ_CT_GENERIC, 0);
++			plit = 0;
++			bal = strm->debt + SLZ_MAX_DEBT + SLZ_CREDIT;
++		}
++	}
++
++	if (rem) {
++		plit += rem;
++		do {
++			bal += (in[pos++] >= 144);
++		} while (--rem);
++	}
++
++	if (plit) {
++		uint32_t cost;
++
++		if (more)
++			cost = SLZ_SWITCH_COST;
++		else
++			cost = (strm->state == SLZ_ST_EOB) ? SLZ_LAST_COST_EOB : SLZ_LAST_COST;
++
++		if (bal >= cost + SLZ_CREDIT)
++			copy_lit(strm, in + pos - plit, plit, more, SLZ_CT_GENERIC, 0);
++		else {
++			copy_lit_huff(strm, in + pos - plit, plit, more, SLZ_CT_GENERIC, 0);
++			strm->debt = bal;
++		}
++	}
++
++ update:
++	/* keep the last SLZ_EV_HIST bytes of history + input */
++	if (ilen >= SLZ_EV_HIST) {
++		memcpy(ctx->hist, in + ilen - SLZ_EV_HIST, SLZ_EV_HIST);
++		ctx->hlen = SLZ_EV_HIST;
++	}
++	else {
++		uint32_t keep = hlen + ilen > SLZ_EV_HIST ? SLZ_EV_HIST - ilen : hlen;
++
++		memmove(ctx->hist, ctx->hist + hlen - keep, keep);
++		memcpy(ctx->hist + keep, in, ilen);
++		ctx->hlen = keep + ilen;
++	}
++	strm->ilen += ilen;
++	return strm->outbuf - out;
++}
++
+ /* Initializes stream <strm> for use with raw deflate (rfc1951). The CRC is
+  * unused but set to zero. The compression level passed in <level> is set. This
+  * value will be capped between 0 (no compression) and 15 (max compression).
+diff --git a/src/slz.h b/src/slz.h
+index 66d76f1..afd4741 100644
+--- a/src/slz.h
++++ b/src/slz.h
+@@ -109,6 +109,32 @@ struct slz_stream {
+ 	uint32_t tree_switch; /* switch to the other tree after the next match */
+ };
+ 
++/* EXP: context of slz_rfc1951_encode_event(), allocated by the caller per
++ * stream and initialized with slz_ev_init(). Its contents are private to
++ * slz.c. SLZ_EV_WORD selects the entry format: 1 = position + matched word
++ * (8 bytes), 0 = position only (4 bytes). SLZ_EV_HIST is the history kept
++ * between calls. All three are build-time settings.
++ */
++#ifndef SLZ_EV_WORD
++# define SLZ_EV_WORD 0
++#endif
++#ifndef SLZ_EV_HASH_BITS
++# define SLZ_EV_HASH_BITS 9
++#endif
++#ifndef SLZ_EV_HIST
++# define SLZ_EV_HIST 512
++#endif
++
++struct slz_ev_ctx {
++#if SLZ_EV_WORD
++	uint64_t refs[1 << SLZ_EV_HASH_BITS];
++#else
++	uint32_t refs[1 << SLZ_EV_HASH_BITS];
++#endif
++	uint32_t hlen;
++	unsigned char hist[SLZ_EV_HIST];
++};
++
+ /* Maximum number of bytes by which the encoder's output may exceed the same
+  * data sent as stored blocks, which is the input plus 5 bytes per 65535. It
+  * comes from the 9-bit literals of the fixed huffman encoding, or from the
+@@ -146,6 +172,8 @@ int slz_rfc1951_init(struct slz_stream *strm, int level);
+ int slz_rfc1951_flush(struct slz_stream *strm, unsigned char *buf);
+ int slz_rfc1951_pflush(struct slz_stream *strm, unsigned char *buf); /* EXP */
+ int slz_rfc1951_eflush(struct slz_stream *strm, unsigned char *buf); /* EXP */
++void slz_ev_init(struct slz_ev_ctx *ctx); /* EXP */
++long slz_rfc1951_encode_event(struct slz_stream *strm, unsigned char *out, const unsigned char *in, long ilen, int more, struct slz_ev_ctx *ctx); /* EXP */
+ int slz_rfc1951_finish(struct slz_stream *strm, unsigned char *buf);
+ 
+ /* Functions specific to rfc1952 (gzip) */

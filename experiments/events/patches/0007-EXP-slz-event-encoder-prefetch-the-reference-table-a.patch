@@ -1,0 +1,54 @@
+From cb2c25df8e5d627de3c5a4106e4a583d84690177 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Sun, 15 Nov 2026 15:20:57 +0100
+Subject: [PATCH 07/11] EXP: slz: event encoder: prefetch the reference table
+ at entry, 2 kB study
+
+Prefetching every line of the table at entry (Willy's idea) saves 10-12%
+on cold SSE streams and 8-23% on cold log streams, neutral on hot ones;
+now the default. Prefetching the history too saves 5-11% more on logs
+but costs up to 18% on SSE when the contexts are in L3.
+
+2 kB of history at 9 bits: on SSE, same ratio as 1 kB for 7% more on
+cold streams; on logs, 10-25% smaller and 2-18% cheaper than 1 kB.
+---
+ src/slz.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/src/slz.c b/src/slz.c
+index 91286ca..455d9a3 100644
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -2433,6 +2433,11 @@ static inline uint32_t ev_hash(uint32_t a)
+ # define SLZ_EV_BACK 8
+ #endif
+ 
++/* prefetch at entry: 0 = none, 1 = refs, 2 = refs + history */
++#ifndef SLZ_EV_PREFETCH
++# define SLZ_EV_PREFETCH 1
++#endif
++
+ /* step between the matched positions indexed */
+ #ifndef SLZ_EV_STEP
+ # define SLZ_EV_STEP 8
+@@ -2503,6 +2508,20 @@ long slz_rfc1951_encode_event(struct slz_stream *__restrict strm, unsigned char
+ 
+ 	strm->outbuf = out;
+ 
++	/* EXP: SLZ_EV_PREFETCH=1 prefetches the whole reference table at
++	 * entry, 2 also the history: on busy proxies, nothing of the context
++	 * is left in the caches since the previous event.
++	 */
++	if (SLZ_EV_PREFETCH) {
++		const char *p;
++
++		for (p = (const char *)ctx->refs; p < (const char *)ctx->refs + sizeof(ctx->refs); p += 64)
++			__builtin_prefetch(p, 1);
++		if (SLZ_EV_PREFETCH >= 2)
++			for (p = (const char *)hist; p < (const char *)hist + hlen; p += 64)
++				__builtin_prefetch(p, 0);
++	}
++
+ 	/* only the fixed tree here */
+ 	if (strm->cur_tree != SLZ_CT_GENERIC) {
+ 		if (strm->state == SLZ_ST_FIXED) {
