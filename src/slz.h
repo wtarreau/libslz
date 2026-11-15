@@ -112,7 +112,23 @@ struct slz_stream {
 	uint32_t ilen;
 	int32_t tree_save;    /* bits the other tree would have saved, see SLZ_AUTO_IN */
 	uint32_t tree_switch; /* switch to the other tree after the next match */
+	void *ring;      /* SLZ_CT_EVENT only: history kept between calls, see
+	                  * slz_ring_size. Reset by the init functions.
+	                  */
 };
+
+/* Size in bytes of the ring that the SLZ_CT_EVENT content type needs per
+ * stream (about 4 kB). The caller allocates it, zeroes it, and sets it in the
+ * stream's <ring> field after the init function and before the first encode
+ * call; the stream doesn't free it. 64-byte alignment is preferred but not
+ * required. The same ring may be reused by another stream after being zeroed
+ * again. If data are passed to the stream while the ring is not set (or with
+ * another content type), the history it holds is dropped at the next call.
+ */
+extern const int slz_ring_size;
+
+/* lets applications detect the event content type with #ifdef slz_ring_size */
+#define slz_ring_size slz_ring_size
 
 /* Maximum number of bytes by which the encoder's output may exceed the same
  * data sent as stored blocks, which is the input plus 5 bytes per 65535. It

@@ -2241,6 +2241,32 @@ long _slz_rfc1951_encode_lev4(struct slz_stream *__restrict strm, unsigned char 
 	return _slz_rfc1951_encode(strm, out, in, ilen, more, 3, 8, 1);
 }
 
+/* Event encoder, used with SLZ_CT_EVENT: streams made of small events flushed
+ * one at a time (SSE, syslog...), where slz_rfc1951_encode() cannot find much
+ * since it forgets everything at each call. The ring, allocated by the caller
+ * (slz_ring_size bytes, zeroed) and referenced by strm->ring, keeps the last
+ * SLZ_EV_HIST bytes passed to the stream and a reference table between calls.
+ * 2 kB of history and a 9-bit table of 4-byte entries were found to be a good
+ * trade-off between SSE and logs, and between ratio and cost with many
+ * concurrent streams whose ring is out of the caches at each call, see
+ * experiments/events.
+ */
+#define SLZ_EV_HIST      2048 /* history size, a power of 2 */
+#define SLZ_EV_HASH_BITS 9    /* size of the reference table */
+#define SLZ_EV_STEP      8    /* step between the matched positions indexed */
+
+struct slz_ring {
+	/* entries: 16 low bits of the position, and a 16-bit tag of the word */
+	uint32_t refs[1 << SLZ_EV_HASH_BITS];
+	unsigned char hist[SLZ_EV_HIST]; /* ring of the last bytes */
+	uint32_t hoff;   /* next write position in <hist> */
+	uint32_t hlen;   /* bytes of history in <hist>, at most SLZ_EV_HIST */
+	uint32_t hend;   /* stream position (strm->ilen) at the history's end */
+};
+
+/* size of the ring to allocate per stream for SLZ_CT_EVENT */
+const int slz_ring_size = sizeof(struct slz_ring);
+
 long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
 {
 	int level = strm->level;
@@ -2271,6 +2297,7 @@ int slz_rfc1951_init(struct slz_stream *strm, int level)
 	strm->state = SLZ_ST_EOB; // no header
 	strm->level = MIN(MAX(level, 0), 15);
 	strm->format = SLZ_FMT_DEFLATE;
+	strm->ring = NULL;
 	strm->crc32 = 0;
 	strm->ilen  = 0;
 	strm->qbits = 0;
@@ -2538,6 +2565,7 @@ int slz_rfc1952_init(struct slz_stream *strm, int level)
 	strm->state  = SLZ_ST_INIT;
 	strm->level  = MIN(MAX(level, 0), 15);
 	strm->format = SLZ_FMT_GZIP;
+	strm->ring = NULL;
 	strm->crc32  = 0;
 	strm->ilen   = 0;
 	strm->qbits  = 0;
@@ -2751,6 +2779,7 @@ int slz_rfc1950_init(struct slz_stream *strm, int level)
 	strm->state  = SLZ_ST_INIT;
 	strm->level  = MIN(MAX(level, 0), 15);
 	strm->format = SLZ_FMT_ZLIB;
+	strm->ring = NULL;
 	strm->crc32  = 1; // rfc1950/zlib starts with initial crc=1
 	strm->ilen   = 0;
 	strm->qbits  = 0;
