@@ -1112,6 +1112,8 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 		word = ((uint32_t)(unsigned char)in[pos] << 8) + ((uint32_t)(unsigned char)in[pos + 1] << 16) + ((uint32_t)(unsigned char)in[pos + 2] << 24);
 #endif
 	while (rem >= 4) {
+		int32_t cost;
+
 #ifndef UNALIGNED_FASTER
 		word = ((uint32_t)(unsigned char)in[pos + 3] << 24) + (word >> 8);
 #else
@@ -1443,7 +1445,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 			 * SLZ_TEXT_MAX_DEBT), or if it doesn't open a block and
 			 * saves bits together with the literals.
 			 */
-			int32_t cost = (int32_t)((dist & 0x1f) + (code >> 16) + lit_excess) - 8 * (int32_t)mlen;
+			cost = (int32_t)((dist & 0x1f) + (code >> 16) + lit_excess) - 8 * (int32_t)mlen;
 
 			/* <lit_excess> is null when there are no literals */
 			lit_stored = text_lit_stored(strm, lit_excess);
