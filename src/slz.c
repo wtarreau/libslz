@@ -2267,9 +2267,317 @@ struct slz_ring {
 /* size of the ring to allocate per stream for SLZ_CT_EVENT */
 const int slz_ring_size = sizeof(struct slz_ring);
 
+/* the hash of the event encoder's reference table, on SLZ_EV_HASH_BITS bits */
+static inline uint32_t slz_ev_hash(uint32_t a)
+{
+	return slz_hash_bits(a, SLZ_EV_HASH_BITS);
+}
+
+/* 16-bit tag of word <w>, from bits the hash mostly ignores */
+static inline uint32_t slz_ev_tag(uint32_t w)
+{
+	return (uint16_t)(w ^ (w >> 16));
+}
+
+/* inserts absolute position <p> whose 4 first bytes are <w> */
+static inline void slz_ev_insert(struct slz_ring *ring, uint32_t p, uint32_t w)
+{
+	ring->refs[slz_ev_hash(w)] = (uint16_t)p + (slz_ev_tag(w) << 16);
+}
+
+/* compares up to <max> bytes at <a> with the source at <b>, of which only
+ * <bavail> are contiguous, the source then continuing at <in>.
+ */
+static inline long slz_ev_match(const unsigned char *a, const unsigned char *b, long bavail, const unsigned char *in, long max)
+{
+	long l;
+
+	if (max <= bavail)
+		return memmatch(a, b, max);
+	l = memmatch(a, b, bavail);
+	if (l < bavail)
+		return l;
+	return l + memmatch(a + l, in, max - l);
+}
+
+/* Encodes <ilen> bytes from <in> into <out> for stream <strm> using the ring
+ * at strm->ring, see above. It is a copy of the fixed tree's part of
+ * _slz_rfc1951_encode(), whose comments apply here, adapted to the ring and
+ * simplified. The references may point into the history kept
+ * in the ring, which is matched in place: from the oldest byte to the ring's
+ * end, then from the ring's start, then into the input. Positions are counted
+ * from the start of the stream (strm->ilen), so that the entries from the
+ * previous calls remain valid, and every hit is verified by reading the
+ * source bytes, which also rejects the entries aliased by the 16-bit
+ * positions or by the 32-bit wrapping. The level is ignored (except 0, which
+ * never comes here), it always uses the fixed tree, never skips literals, and
+ * grows matches up to 8 bytes backwards. One matched position in SLZ_EV_STEP
+ * is indexed: with a step of 8, the first indexed position after the point
+ * where the data diverge is at most 8 bytes away, and the backward match
+ * recovers these bytes. The input is appended to the ring on exit.
+ */
+static __attribute__((noinline))
+long _slz_rfc1951_ev_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
+{
+	struct slz_ring *ring = strm->ring;
+	const unsigned char *hist = ring->hist;
+	/* the history is lost if some data were passed without the ring */
+	uint32_t hlen = (ring->hend == strm->ilen) ? ring->hlen : 0;
+	uint32_t hstart = (ring->hoff - hlen) & (SLZ_EV_HIST - 1); /* oldest byte */
+	uint32_t base = strm->ilen;        /* absolute position of in[0] */
+	uint32_t hbase = base - hlen;      /* absolute position of the oldest byte */
+	long pos = 0, rem = ilen;
+	uint32_t plit = 0;
+	uint32_t bal;
+	const char *p;
+	int k;
+
+	strm->outbuf = out;
+
+	/* on busy proxies, nothing of the ring is left in the caches since
+	 * the previous event, and the table is accessed randomly.
+	 */
+	for (p = (const char *)ring->refs; p < (const char *)ring->refs + sizeof(ring->refs); p += 64)
+		__builtin_prefetch(p, 1);
+
+	/* only the fixed tree here, see SLZ_AUTO_IN */
+	if (strm->cur_tree != SLZ_CT_GENERIC) {
+		if (strm->state == SLZ_ST_FIXED) {
+			send_eob(strm, strm->cur_tree);
+			strm->state = SLZ_ST_EOB;
+		}
+		strm->cur_tree = SLZ_CT_GENERIC;
+	}
+	strm->tree_switch = 0;
+
+	/* the last 3 positions of the history could not be indexed before
+	 * their 4th byte was known.
+	 */
+	for (k = 3; k >= 1; k--) {
+		unsigned char tmp[4];
+		int j;
+
+		if (hlen < (uint32_t)k || ilen < 4 - k)
+			continue;
+		for (j = 0; j < k; j++)
+			tmp[j] = hist[(hstart + hlen - k + j) & (SLZ_EV_HIST - 1)];
+		for (; j < 4; j++)
+			tmp[j] = in[j - k];
+		slz_ev_insert(ring, base - k, read_le32(tmp));
+	}
+
+	bal = strm->debt;
+
+	while (rem >= 4) {
+		uint32_t word = read_le32(in + pos);
+		uint32_t h = slz_ev_hash(word);
+		uint32_t cur = base + pos;
+		uint32_t ent = ring->refs[h];
+		uint32_t last, off, dist, code, d;
+		const unsigned char *src;
+		long savail, mlen, max, sback;
+
+		ring->refs[h] = (uint16_t)cur + (slz_ev_tag(word) << 16);
+		if ((ent >> 16) != slz_ev_tag(word))
+			goto send_as_lit;
+
+		/* the most recent position with these 16 low bits, at most
+		 * 65536 bytes back: older entries alias to it and are rejected
+		 * by the range check or the comparison below.
+		 */
+		last = cur - (uint16_t)(cur - ent);
+
+		/* must be within the history or the input before <pos> */
+		off = last - hbase;
+		if (off >= hlen + (uint32_t)pos)
+			goto send_as_lit;
+		dist = hlen + pos - off;
+		if (dist > 32768)
+			goto send_as_lit;
+
+		max = rem > 258 ? 258 : rem;
+		if (off < hlen) {
+			/* in the history: the source may run to the ring's
+			 * end, then continue at its start, then into the
+			 * input. <sback> is what can be read before it in
+			 * the same segment.
+			 */
+			uint32_t ph = (hstart + off) & (SLZ_EV_HIST - 1);
+			long wrap = SLZ_EV_HIST - ph;
+
+			src = hist + ph;
+			savail = hlen - off;
+			sback = off < ph ? off : ph;
+			if (savail > wrap) {
+				long l = memmatch(in + pos, src, wrap < max ? wrap : max);
+
+				mlen = l;
+				if (l == wrap && l < max)
+					mlen += slz_ev_match(in + pos + l, hist, savail - wrap, in, max - l);
+			}
+			else
+				mlen = slz_ev_match(in + pos, src, savail, in, max);
+		}
+		else {
+			src = in + (off - hlen);
+			sback = off - hlen;
+			mlen = memmatch(in + pos, src, max);
+		}
+
+		/* this also verifies the word */
+		if (mlen < 4)
+			goto send_as_lit;
+
+		if (bal >= SLZ_SWITCH_COST + SLZ_CREDIT && mlen < 6)
+			goto send_as_lit;
+
+		code = len_code(mlen, SLZ_CT_GENERIC);
+		d = fh_dist_table[dist - 1];
+
+		/* see _slz_rfc1951_encode() */
+		if (bal >= SLZ_MAX_DEBT + SLZ_CREDIT &&
+		    (d & 0x1f) + (code >> 16) + SLZ_SWITCH_COST > 8 * mlen)
+			goto send_as_lit;
+
+		/* grow the match backwards over up to 8 pending literals,
+		 * within the source's segment, see the backward match in
+		 * _slz_rfc1951_encode(). 8 bytes are compared at once when
+		 * available before both sides, otherwise one at a time.
+		 */
+		if (plit) {
+			long bmax = MIN(plit, 8);
+			long back;
+
+			if (bmax > 258 - mlen)
+				bmax = 258 - mlen;
+			if (bmax > sback)
+				bmax = sback;
+			if (MIN((long)pos, sback) >= 8)
+				back = backward_match(in, pos, src, bmax, 8);
+			else
+				back = backward_match(in, pos, src, bmax, 0);
+			if (back) {
+				pos  -= back;
+				plit -= back;
+				rem  += back;
+				mlen += back;
+				code = len_code(mlen, SLZ_CT_GENERIC);
+			}
+		}
+
+		if (plit) {
+			if (bal >= SLZ_SWITCH_COST + SLZ_CREDIT) {
+				copy_lit(strm, in + pos - plit, plit, 1, SLZ_CT_GENERIC, 0);
+				bal = strm->debt;
+			}
+			else
+				copy_lit_huff(strm, in + pos - plit, plit, 1, SLZ_CT_GENERIC, 0);
+			plit = 0;
+		}
+
+		if (strm->state == SLZ_ST_EOB) {
+			strm->state = SLZ_ST_FIXED;
+			open_huff_block(strm, 0, SLZ_CT_GENERIC);
+			bal = strm->debt + SLZ_SWITCH_COST;
+		}
+
+#if SLZ_DIRECT_ENQUEUE56
+		/* see _slz_rfc1951_encode() */
+		enqueue56(strm, (uint64_t)(code & 0xFFFF) |
+		                ((uint64_t)(d >> 5) << (code >> 16)),
+		          (code >> 16) + (d & 0x1f));
+#else
+		enqueue24(strm, code & 0xFFFF, code >> 16);
+		enqueue24(strm, d >> 5, d & 0x1f);
+#endif
+
+		code = bal + (code >> 16) + (d & 0x1f);
+		bal = (code > 8 * (uint32_t)mlen) ? code - 8 * (uint32_t)mlen : 0;
+		strm->debt = bal;
+
+		rem -= mlen;
+		pos += mlen;
+
+		/* Index the matched positions, also when the match reaches the
+		 * end of the input since the next calls need them. Those whose
+		 * 4 bytes are not all there yet are indexed by the next call.
+		 */
+		{
+			long i = pos - mlen + 1;
+			long e = pos;
+
+			if (e > ilen - 3)
+				e = ilen - 3;
+			for (; i < e; i += SLZ_EV_STEP)
+				slz_ev_insert(ring, base + i, read_le32(in + i));
+		}
+		continue;
+
+	send_as_lit:
+		bal += ((unsigned char)word >= 144);
+		plit++;
+		pos++;
+		rem--;
+		if (__builtin_expect(plit == 0xffc0, 0)) {
+			copy_lit_small(strm, in + pos - plit, plit, 1, SLZ_CT_GENERIC, 0);
+			plit = 0;
+			bal = strm->debt + SLZ_MAX_DEBT + SLZ_CREDIT;
+		}
+	}
+
+	if (rem) {
+		plit += rem;
+		do {
+			bal += (in[pos++] >= 144);
+		} while (--rem);
+	}
+
+	if (plit) {
+		uint32_t cost;
+
+		if (more)
+			cost = SLZ_SWITCH_COST;
+		else
+			cost = (strm->state == SLZ_ST_EOB) ? SLZ_LAST_COST_EOB : SLZ_LAST_COST;
+
+		if (bal >= cost + SLZ_CREDIT)
+			copy_lit(strm, in + pos - plit, plit, more, SLZ_CT_GENERIC, 0);
+		else {
+			copy_lit_huff(strm, in + pos - plit, plit, more, SLZ_CT_GENERIC, 0);
+			strm->debt = bal;
+		}
+	}
+
+	/* append the input to the ring */
+	if (ilen >= SLZ_EV_HIST) {
+		memcpy(ring->hist, in + ilen - SLZ_EV_HIST, SLZ_EV_HIST);
+		ring->hoff = 0;
+		ring->hlen = SLZ_EV_HIST;
+	}
+	else {
+		uint32_t hoff = ring->hoff;
+		uint32_t n1 = SLZ_EV_HIST - hoff;
+
+		if (n1 > ilen)
+			n1 = ilen;
+		memcpy(ring->hist + hoff, in, n1);
+		memcpy(ring->hist, in + n1, ilen - n1);
+		ring->hoff = (hoff + ilen) & (SLZ_EV_HIST - 1);
+		ring->hlen = hlen + ilen > SLZ_EV_HIST ? SLZ_EV_HIST : hlen + ilen;
+	}
+	ring->hend = base + ilen;
+
+	strm->ilen += ilen;
+	return strm->outbuf - out;
+}
+
 long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
 {
 	int level = strm->level;
+
+	/* events: needs a ring, otherwise the same as no hint */
+	if (__builtin_expect(strm->content_type == SLZ_CT_EVENT, 0) && strm->ring && level)
+		return _slz_rfc1951_ev_encode(strm, out, in, ilen, more);
 
 	/* mostly text: levels 1 and 2 work as level 3, see
 	 * slz_set_content_type().
