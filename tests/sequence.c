@@ -4,10 +4,13 @@
  *
  *   - the whole output decodes back to the concatenation of the inputs;
  *   - flush() and finish() never emit more than what they document;
- *   - the total output never exceeds the documented maximum for the stream.
- *     Note that a single encode() call may exceed its own share by a few
- *     bytes, since up to 31 bits are retained in the queue from one call to
- *     the next; only the sum over the stream is bounded.
+ *   - each encode() call never emits more than <len> + SLZ_MAX_OVERHEAD(len)
+ *     plus the format's header on the first call, which is what callers
+ *     size their output buffer with;
+ *   - the total output never exceeds the same data sent as stored blocks by
+ *     more than SLZ_MAX_DEBT_BYTES, plus what the flushes and finish() may
+ *     add. Summing the per-call bound would allow SLZ_MAX_OVERHEAD on every
+ *     call, too loose to catch an error in the encoder's debt accounting.
  *
  * It notably covers the sequences that are easy to get wrong: a flush before
  * any data has been sent, several flushes in a row, empty encode() calls, and
@@ -43,13 +46,14 @@ static unsigned int rnd(void)
 /* documented worst cases, header included */
 static const int max_flush[3]  = { 20, 12, 10 };  /* gzip, zlib, deflate */
 static const int max_finish[3] = { 24, 12,  6 };  /* incl. 10/2/0 of header */
+static const int hdr_len[3]    = { 10,  2,  0 };  /* sent by the first call */
 
 int main(void)
 {
 	static const int fmts[3] = { SLZ_FMT_GZIP, SLZ_FMT_ZLIB, SLZ_FMT_DEFLATE };
 	long iter, i;
 	int errors = 0, over = 0;
-	long worst_flush = 0, worst_finish = 0, worst_total = 0;
+	long worst_flush = 0, worst_finish = 0, worst_total = 0, worst_call = 0;
 
 	for (i = 0; i < (long)sizeof(src); i++) {
 		int t = (i / 1000) % 4;
@@ -93,7 +97,19 @@ int main(void)
 			if (ilen + l > (long)sizeof(in))
 				break;
 			memcpy(in + ilen, src + ofs, l);
-			olen += slz_encode(&strm, out + olen, in + ilen, l, more);
+			{
+				long hdr = (strm.state == SLZ_ST_INIT) ? hdr_len[f] : 0;
+				long n = slz_encode(&strm, out + olen, in + ilen, l, more);
+
+				if (n > l + SLZ_MAX_OVERHEAD(l) + hdr) {
+					printf("ENCODE TOO LARGE: fmt=%d lvl=%d len=%ld out=%ld > %ld\n",
+					       f, lvl, l, n, l + SLZ_MAX_OVERHEAD(l) + hdr);
+					over++;
+				}
+				if (n - l - hdr > worst_call)
+					worst_call = n - l - hdr;
+				olen += n;
+			}
 			omax += l + 5 * ((l + 65534) / 65535) + (more ? 0 : 2);
 			ilen += l;
 
@@ -126,8 +142,10 @@ int main(void)
 
 		/* the flushes and the envelope are budgeted separately: each
 		 * flush may add its documented maximum, and so may finish().
+		 * The encoder may exceed stored blocks by SLZ_MAX_DEBT_BYTES
+		 * over the whole stream (e.g. the text tree's header).
 		 */
-		omax += nflush * max_flush[f] + max_finish[f];
+		omax += nflush * max_flush[f] + max_finish[f] + SLZ_MAX_DEBT_BYTES;
 		if (olen - omax > worst_total)
 			worst_total = olen - omax;
 		if (olen > omax) {
@@ -152,7 +170,7 @@ int main(void)
 		inflateEnd(&z);
 	}
 	printf("300000 sequences: %d mismatches, %d bound violations "
-	       "(worst flush=%ld finish=%ld, worst total %+ld over the promise)\n",
-	       errors, over, worst_flush, worst_finish, worst_total);
+	       "(worst flush=%ld finish=%ld encode=len%+ld, worst total %+ld over the promise)\n",
+	       errors, over, worst_flush, worst_finish, worst_call, worst_total);
 	return errors || over;
 }
