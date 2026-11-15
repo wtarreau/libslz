@@ -71,11 +71,16 @@ enum {
  * them: the fixed tree from RFC1951, and a tree trained on web contents
  * (html, css, js, json, svg...), which saves about 15% of the huffman-coded
  * bits on such contents and still works on any text, at the expense of a
- * header of about 80 bytes each time a block is opened.
+ * header of about 80 bytes each time a block is opened. The event one is for
+ * streams made of small events flushed one at a time (SSE, logs...): it uses
+ * the fixed tree, and references up to the last 2 kB passed to the stream,
+ * which requires a ring allocated by the caller, see slz_ring_size. Without a
+ * ring, it is the same as no hint.
  */
 enum {
 	SLZ_CT_GENERIC = 0, /* default: no hint; also the fixed huffman tree */
 	SLZ_CT_TEXT,        /* mostly text contents; also the text tree */
+	SLZ_CT_EVENT,       /* small events flushed one at a time, see slz_ring_size */
 };
 
 struct slz_stream {
@@ -93,7 +98,7 @@ struct slz_stream {
 	uint32_t qbits; /* number of bits in queue, < 8 on 32-bit, < 32 on 64-bit */
 	uint32_t state;   /* one of slz_state */
 	uint8_t cur_tree:1; /* SLZ_CT_*: tree of the current block, see SLZ_AUTO_IN in slz.c */
-	uint8_t content_type:1; /* SLZ_CT_*, see slz_set_content_type() */
+	uint8_t content_type:2; /* SLZ_CT_*, see slz_set_content_type() */
 	uint8_t format:2; /* SLZ_FMT_* */
 	uint8_t level:4;  /* 0 = no compression, 1..15 = compression */
 	uint16_t debt;   /* number of bits by which the output is above the
@@ -255,14 +260,16 @@ static inline int slz_flush(struct slz_stream *strm, void *buf)
  * default). From level 2 on, the encoder chooses the huffman tree on the fly
  * anyway, and starts with the text one. With the hint, levels 1 and 2 work
  * as level 3, whose accounting of the references finds text with few
- * literals, and level 1 starts with the text tree as well. It is meant to be
- * called right after one of the init functions, which reset it to
- * SLZ_CT_GENERIC. It returns 0 on success, or -1 if a block was already
- * opened or the type is unknown, in which case nothing is changed.
+ * literals, and level 1 starts with the text tree as well. SLZ_CT_EVENT
+ * hints that the stream is made of small events flushed one at a time, and
+ * switches to the event encoder once a ring is set, see slz_ring_size. It
+ * is meant to be called right after one of the init functions, which reset
+ * it to SLZ_CT_GENERIC. It returns 0 on success, or -1 if a block was
+ * already opened or the type is unknown, in which case nothing is changed.
  */
 static inline int slz_set_content_type(struct slz_stream *strm, int type)
 {
-	if ((unsigned int)type > SLZ_CT_TEXT ||
+	if ((unsigned int)type > SLZ_CT_EVENT ||
 	    strm->state == SLZ_ST_FIXED || strm->state == SLZ_ST_LAST)
 		return -1;
 	strm->content_type = type;
