@@ -44,7 +44,7 @@ static unsigned int rnd(void)
 }
 
 /* documented worst cases, header included */
-static const int max_flush[3]  = { 20, 12, 10 };  /* gzip, zlib, deflate */
+static const int max_flush[3]  = { 16,  8,  6 };  /* gzip, zlib, deflate */
 static const int max_finish[3] = { 24, 12,  6 };  /* incl. 10/2/0 of header */
 static const int hdr_len[3]    = { 10,  2,  0 };  /* sent by the first call */
 

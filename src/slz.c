@@ -2276,56 +2276,64 @@ int slz_rfc1951_init(struct slz_stream *strm, int level)
 	return 0;
 }
 
-/* Flushes any pending data for stream <strm> into buffer <buf>, then emits an
- * empty literal block to byte-align the output, allowing to completely flush
- * the queue. This requires that the output buffer still has the size of the
- * queue (up to 31 bits when using the 64-bit queue), plus a possible EOB (7
- * bits), plus (BFINAL,BTYPE) (3 bits), which once rounded up to the next byte
- * make 6 bytes, plus 4 bytes for LEN+NLEN, or a total of 10 bytes in the worst
- * case. If the stream was already completed by a previous call to encode()
- * with <more> cleared, the last block is simply terminated and the output
- * aligned, since nothing may be appended to a finished stream. The number of
- * bytes emitted is returned. It is guaranteed that the queue is empty on
- * return. This may cause some overhead by adding needless 5-byte blocks if
- * called to often.
+/* Emits into buffer <buf> all the bits pending in stream <strm> at the time of
+ * the call, so that everything passed so far is decodable from the emitted
+ * bytes, and returns their number. Pending bits ending on a byte boundary are
+ * simply emitted. Otherwise, the least is added to cross the boundary,
+ * depending on the state:
+ *   - inside a block: its EOB, which is at least 7 bits long. The next encode
+ *     call opens a new block.
+ *   - inside the last block: its EOB, then padding to the next byte since
+ *     nothing may follow it. The stream is then complete.
+ *   - after the last block: padding, for the same reason.
+ *   - between blocks: an empty fixed block (10 bits).
+ * Only the complete bytes are emitted, so that the bits added beyond the
+ * boundary may stay queued, the next call emitting them. The output is then
+ * not aligned on return. It costs 7 bits plus the next block's 3 header bits
+ * where older versions emitted an empty stored block to byte-align the
+ * output, or about 48 bits. This requires that the output buffer still has
+ * the size of the queue (up to 31 bits when using the 64-bit queue) plus up
+ * to 11 bits, rounded up to the next byte, or 6 bytes in the worst case.
  */
 int slz_rfc1951_flush(struct slz_stream *strm, unsigned char *buf)
 {
 	strm->outbuf = buf;
 
-	/* The queue is always empty on INIT, DONE, and END */
-	if (!strm->qbits)
-		return 0;
-
-	/* we may need to terminate a huffman output. Lit is always in EOB state */
-	if (strm->state != SLZ_ST_EOB) {
-		strm->state = (strm->state == SLZ_ST_LAST) ? SLZ_ST_DONE : SLZ_ST_EOB;
-		send_eob(strm, strm->cur_tree);
+	if (strm->qbits & 7) {
+		switch (strm->state) {
+		case SLZ_ST_FIXED:
+			send_eob(strm, strm->cur_tree);
+			strm->state = SLZ_ST_EOB;
+			break;
+		case SLZ_ST_LAST:
+			send_eob(strm, strm->cur_tree);
+			strm->state = SLZ_ST_DONE;
+			/* fall through */
+		case SLZ_ST_DONE:
+		case SLZ_ST_END:
+			flush_bits(strm);
+			return strm->outbuf - buf;
+		default:
+			/* an empty fixed block, whatever the tree
+			 * since it's the cheapest one, as in finish().
+			 */
+			enqueue8(strm, 2, 3); // BFINAL = 0 ; BTYPE = 01
+			send_eob(strm, SLZ_CT_GENERIC);
+			break;
+		}
 	}
 
-	if (strm->state == SLZ_ST_DONE) {
-		/* The block we've just terminated was already marked final, so
-		 * the deflate stream is complete and nothing may be appended to
-		 * it: an extra block here would be located past the end of the
-		 * stream and would shift the gzip or zlib trailer that the
-		 * caller is about to emit. Aligning the output is all we have
-		 * to do, and it's all that's left to do for finish() as well.
-		 */
-		flush_bits(strm);
-		return strm->outbuf - buf;
+	/* emit the complete bytes only */
+	while (strm->qbits >= 8) {
+		*strm->outbuf++ = strm->queue;
+		strm->queue >>= 8;
+		strm->qbits -= 8;
 	}
-
-	/* send BFINAL=0 and BTYPE=00 (lit) */
-	enqueue8(strm, 0, 3);
-	flush_bits(strm);             // emit pending bits
-	copy_32b(strm, 0xFFFF0000U);  // len=0, nlen=~0
-
-	/* Now the queue is empty, EOB was sent, and a zero-byte block was sent
-	 * to byte-align the output. The last state reflects all this. Let's
-	 * just return the number of bytes added to the output buffer.
-	 */
 	return strm->outbuf - buf;
 }
+
+/* the EOB must cross the byte boundary in slz_rfc1951_flush() */
+typedef char slz_text_eob_bits_check[(TEXT_EOB_BITS >= 7) ? 1 : -1];
 
 /* Flushes any pending for stream <strm> into buffer <buf>, then sends BTYPE=1
  * and BFINAL=1 if needed. The stream ends in SLZ_ST_DONE. It returns the number
@@ -2535,15 +2543,12 @@ int slz_rfc1952_init(struct slz_stream *strm, int level)
 	return 0;
 }
 
-/* Flushes any pending data for stream <strm> into buffer <buf>, then emits an
- * empty literal block to byte-align the output, allowing to completely flush
- * the queue. Note that if the initial header was never sent, it will be sent
- * first as well (10 extra bytes). This requires that the output buffer still
- * has this plus the 6 bytes needed to flush the queue, the possible EOB and
- * the (BFINAL,BTYPE) bits, plus 4 bytes for LEN+NLEN, or a total of 20 bytes
- * in the worst case. The number of bytes emitted is returned. It is guaranteed
- * that the queue is empty on return. This may cause some overhead by adding
- * needless 5-byte blocks if called to often.
+/* Makes everything passed to stream <strm> so far decodable from the bytes
+ * emitted into buffer <buf>, see slz_rfc1951_flush(). Note that if the initial
+ * header was never sent, it will be sent first as well (10 extra bytes). This
+ * requires that the output buffer still has this plus the 6 bytes needed to
+ * emit the queue and a possible EOB, or a total of 16 bytes in the worst case.
+ * The number of bytes emitted is returned.
  */
 int slz_rfc1952_flush(struct slz_stream *strm, unsigned char *buf)
 {
@@ -2751,15 +2756,12 @@ int slz_rfc1950_init(struct slz_stream *strm, int level)
 	return 0;
 }
 
-/* Flushes any pending data for stream <strm> into buffer <buf>, then emits an
- * empty literal block to byte-align the output, allowing to completely flush
- * the queue. Note that if the initial header was never sent, it will be sent
- * first as well (2 extra bytes). This requires that the output buffer still
- * has this plus the 6 bytes needed to flush the queue, the possible EOB and
- * the (BFINAL,BTYPE) bits, plus 4 bytes for LEN+NLEN, or a total of 12 bytes
- * in the worst case. The number of bytes emitted is returned. It is guaranteed
- * that the queue is empty on return. This may cause some overhead by adding
- * needless 5-byte blocks if called to often.
+/* Makes everything passed to stream <strm> so far decodable from the bytes
+ * emitted into buffer <buf>, see slz_rfc1951_flush(). Note that if the initial
+ * header was never sent, it will be sent first as well (2 extra bytes). This
+ * requires that the output buffer still has this plus the 6 bytes needed to
+ * emit the queue and a possible EOB, or a total of 8 bytes in the worst case.
+ * The number of bytes emitted is returned.
  */
 int slz_rfc1950_flush(struct slz_stream *strm, unsigned char *buf)
 {

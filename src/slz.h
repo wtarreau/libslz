@@ -225,15 +225,16 @@ static inline int slz_finish(struct slz_stream *strm, void *buf)
 	return ret;
 }
 
-/* Flushes any pending data for stream <strm> into buffer <buf>, then emits an
- * empty literal block to byte-align the output, allowing to completely flush
- * the queue. Note that if the initial header was never sent, it will be sent
- * first as well (0, 2 or 10 extra bytes). This requires that the output buffer
- * still has this plus the 6 bytes needed to flush the queue, the possible EOB
- * and the (BFINAL,BTYPE) bits, plus 4 bytes for LEN+NLEN, or a total of 20
- * bytes in the worst case. The number of bytes emitted is returned. It is
- * guaranteed that the queue is empty on return. This may cause some overhead
- * by adding needless 5-byte blocks if called to often.
+/* Emits into buffer <buf> all the bits pending in stream <strm> at the time of
+ * the call, so that everything passed so far is decodable from the emitted
+ * bytes. If they don't end on a byte boundary, the least is added to cross
+ * it (usually the current block's EOB, 7 bits with the fixed tree, see
+ * slz_rfc1951_flush()), and up to 7 of the bits added may stay queued. The
+ * output is thus not necessarily aligned on return. Note that if the initial
+ * header was never sent, it will be sent first as well (0, 2 or 10 extra
+ * bytes). This requires that the output buffer still has this plus the 6
+ * bytes needed to emit the queue and a possible EOB, or a total of 16 bytes
+ * in the worst case. The number of bytes emitted is returned.
  */
 static inline int slz_flush(struct slz_stream *strm, void *buf)
 {
