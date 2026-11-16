@@ -656,22 +656,6 @@ static inline void send_eob(struct slz_stream *__restrict strm, int ctype)
 		enqueue8(strm, 0, 7); // direct encoding of 256 = EOB (cf RFC1951)
 }
 
-/* Makes the fixed tree the current one for the encoders that only know it,
- * closing a block opened with the text tree. <cur_tree> may be the text tree
- * when they are entered: the init functions start with it from level 2, and
- * the level may be changed between calls (e.g. lowered under load).
- */
-static inline void leave_text_tree(struct slz_stream *__restrict strm)
-{
-	if (strm->cur_tree != SLZ_CT_GENERIC) {
-		if (strm->state == SLZ_ST_FIXED) {
-			send_eob(strm, strm->cur_tree);
-			strm->state = SLZ_ST_EOB;
-		}
-		strm->cur_tree = SLZ_CT_GENERIC;
-	}
-}
-
 /* Opens a dynamic block (BTYPE=10) with BFINAL set to <bfinal>, and sends the
  * definition of the text tree. The whole round trip is charged to the debt
  * (SLZ_TEXT_SWITCH_COST, see SLZ_TEXT_MAX_DEBT): the block type and the
@@ -1092,6 +1076,40 @@ typedef char slz_max_debt_bytes_check[(SLZ_MAX_DEBT_BYTES * 8 >= SLZ_MAX_DEBT + 
 #define SLZ_TEXT_CREDIT     4096
 #define SLZ_TEXT_MAX_DEBT   (SLZ_MAX_DEBT + SLZ_TEXT_CREDIT)
 
+/* Each tree's part only maintains its own counter, <debt> or <text_debt>, so
+ * the excess must be carried from one to the other when the tree changes, or
+ * a call or a stream alternating between them could reach the sum of their
+ * bounds. Both counters remain within the larger bound, since none of the
+ * parts adds to its counter past its own threshold. Only the fixed tree takes
+ * the savings, as the text tree may only use those of the current call.
+ */
+static inline void debt_to_text(struct slz_stream *__restrict strm)
+{
+	strm->text_debt = SLZ_TEXT_CREDIT + (strm->debt > SLZ_CREDIT ? strm->debt - SLZ_CREDIT : 0);
+}
+
+static inline void debt_to_fixed(struct slz_stream *__restrict strm)
+{
+	strm->debt = (strm->text_debt > SLZ_TEXT_CREDIT - SLZ_CREDIT) ? strm->text_debt - (SLZ_TEXT_CREDIT - SLZ_CREDIT) : 0;
+}
+
+/* Makes the fixed tree the current one for the encoders that only know it,
+ * closing a block opened with the text tree. <cur_tree> may be the text tree
+ * when they are entered: the init functions start with it from level 2, and
+ * the level may be changed between calls (e.g. lowered under load).
+ */
+static inline void leave_text_tree(struct slz_stream *__restrict strm)
+{
+	if (strm->cur_tree != SLZ_CT_GENERIC) {
+		if (strm->state == SLZ_ST_FIXED) {
+			send_eob(strm, strm->cur_tree);
+			strm->state = SLZ_ST_EOB;
+		}
+		strm->cur_tree = SLZ_CT_GENERIC;
+		debt_to_fixed(strm);
+	}
+}
+
 /* fails to build if send_text_hdr() doesn't charge SLZ_TEXT_SWITCH_COST */
 typedef char slz_text_switch_cost_check[(SLZ_TEXT_SWITCH_COST == TEXT_EOB_BITS + 42 + 3 + TEXT_HDR_BITS) ? 1 : -1];
 
@@ -1277,8 +1295,13 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 				send_eob(strm, strm->cur_tree);
 				strm->state = SLZ_ST_EOB;
 			}
-			if (strm->state == SLZ_ST_EOB)
+			if (strm->state == SLZ_ST_EOB) {
 				strm->cur_tree = !strm->cur_tree;
+				if (strm->cur_tree == SLZ_CT_TEXT)
+					debt_to_text(strm);
+				else
+					debt_to_fixed(strm);
+			}
 			strm->tree_switch = 0;
 			strm->tree_save = 0;
 		}
@@ -2192,6 +2215,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 		strm->tree_switch = 0;
 		strm->tree_save = 0;
 		strm->cur_tree = SLZ_CT_TEXT;
+		debt_to_text(strm);
 		goto text_start;
 
  switch_to_fixed:
@@ -2202,6 +2226,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 		strm->tree_switch = 0;
 		strm->tree_save = 0;
 		strm->cur_tree = SLZ_CT_GENERIC;
+		debt_to_fixed(strm);
 		goto fixed_start;
 	}
  leave:
