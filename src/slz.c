@@ -779,21 +779,23 @@ void copy_lit_small(struct slz_stream *__restrict strm, const void *buf, uint32_
 }
 
 /* copies <len> litterals from <buf>. <more> indicates that there are data past
- * buf + <len>. <len> must not be null. Use copy_lit() instead.
+ * buf + <len>. <len> must not be null. Use copy_lit() instead. It's only used
+ * with the fixed tree, the text tree's literals leave through copy_lit_small()
+ * since they never accumulate past 0xffc0 bytes.
  */
 static inline __attribute__((always_inline))
-void _copy_lit(struct slz_stream *__restrict strm, const void *buf, uint32_t len, int more, int ctype, int track_save)
+void _copy_lit(struct slz_stream *__restrict strm, const void *buf, uint32_t len, int more, int track_save)
 {
 	uint32_t len2;
 
 	if (len <= 65535)
-		return copy_lit_small(strm, buf, len, more, ctype, track_save);
+		return copy_lit_small(strm, buf, len, more, SLZ_CT_GENERIC, track_save);
 
-	if (track_save && ctype == SLZ_CT_GENERIC)
+	if (track_save)
 		strm->tree_save = 0;
 
 	if (strm->state != SLZ_ST_EOB)
-		send_eob(strm, ctype);
+		send_eob(strm, SLZ_CT_GENERIC);
 
 	len2 = 65535;
 	len -= len2;
@@ -818,32 +820,24 @@ void _copy_lit(struct slz_stream *__restrict strm, const void *buf, uint32_t len
 	strm->state = more ? SLZ_ST_EOB : SLZ_ST_DONE;
 }
 
-/* out-of-line versions of _copy_lit() for each tree */
+/* out-of-line versions of _copy_lit() with and without <track_save> */
 static __attribute__((noinline,unused))
 void copy_lit_generic(struct slz_stream *__restrict strm, const void *buf, uint32_t len, int more)
 {
-	_copy_lit(strm, buf, len, more, SLZ_CT_GENERIC, 0);
+	_copy_lit(strm, buf, len, more, 0);
 }
 
 static __attribute__((noinline))
 void copy_lit_generic_auto(struct slz_stream *__restrict strm, const void *buf, uint32_t len, int more)
 {
-	_copy_lit(strm, buf, len, more, SLZ_CT_GENERIC, 1);
+	_copy_lit(strm, buf, len, more, 1);
 }
 
-static __attribute__((noinline,unused))
-void copy_lit_text(struct slz_stream *__restrict strm, const void *buf, uint32_t len, int more)
-{
-	_copy_lit(strm, buf, len, more, SLZ_CT_TEXT, 0);
-}
-
-/* calls the version of _copy_lit() for <ctype> */
+/* calls the version of _copy_lit() for <track_save> */
 static inline __attribute__((always_inline))
-void copy_lit(struct slz_stream *__restrict strm, const void *buf, uint32_t len, int more, int ctype, int track_save)
+void copy_lit(struct slz_stream *__restrict strm, const void *buf, uint32_t len, int more, int track_save)
 {
-	if (ctype == SLZ_CT_TEXT)
-		copy_lit_text(strm, buf, len, more);
-	else if (track_save)
+	if (track_save)
 		copy_lit_generic_auto(strm, buf, len, more);
 	else
 		copy_lit_generic(strm, buf, len, more);
@@ -1279,7 +1273,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 		/* force to send as literals (eg to preserve CPU) */
 		strm->outbuf = out;
 		if (ilen)
-			copy_lit(strm, in, ilen, more, SLZ_CT_GENERIC, auto_tree);
+			copy_lit(strm, in, ilen, more, auto_tree);
 		goto leave;
 	}
 
@@ -1665,7 +1659,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 				 * stored block do not cost anything extra.
 				 */
 				if (bal >= SLZ_SWITCH_COST + SLZ_CREDIT) {
-					copy_lit(strm, in + pos - plit, plit, 1, SLZ_CT_GENERIC, auto_tree);
+					copy_lit(strm, in + pos - plit, plit, 1, auto_tree);
 					bal = strm->debt;
 				}
 				else {
@@ -1789,7 +1783,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 				cost = (strm->state == SLZ_ST_EOB) ? SLZ_LAST_COST_EOB : SLZ_LAST_COST;
 
 			if (bal >= cost + SLZ_CREDIT)
-				copy_lit(strm, in + pos - plit, plit, more, SLZ_CT_GENERIC, auto_tree);
+				copy_lit(strm, in + pos - plit, plit, more, auto_tree);
 			else {
 				copy_lit_huff(strm, in + pos - plit, plit, more, SLZ_CT_GENERIC, auto_tree);
 				strm->debt = bal;
@@ -2422,7 +2416,7 @@ long _slz_rfc1951_ev_encode(struct slz_stream *__restrict strm, unsigned char *o
 
 		if (plit) {
 			if (bal >= SLZ_SWITCH_COST + SLZ_CREDIT) {
-				copy_lit(strm, in + pos - plit, plit, 1, SLZ_CT_GENERIC, 0);
+				copy_lit(strm, in + pos - plit, plit, 1, 0);
 				bal = strm->debt;
 			}
 			else
@@ -2496,7 +2490,7 @@ long _slz_rfc1951_ev_encode(struct slz_stream *__restrict strm, unsigned char *o
 			cost = (strm->state == SLZ_ST_EOB) ? SLZ_LAST_COST_EOB : SLZ_LAST_COST;
 
 		if (bal >= cost + SLZ_CREDIT)
-			copy_lit(strm, in + pos - plit, plit, more, SLZ_CT_GENERIC, 0);
+			copy_lit(strm, in + pos - plit, plit, more, 0);
 		else {
 			copy_lit_huff(strm, in + pos - plit, plit, more, SLZ_CT_GENERIC, 0);
 			strm->debt = bal;
