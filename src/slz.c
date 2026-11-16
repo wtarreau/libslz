@@ -1348,54 +1348,6 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 				refs[h].by32.word = word;
 			}
 
-#ifdef FIND_OPTIMAL_MATCH
-			/* Experimental code to see what could be saved with an ideal
-			 * longest match lookup algorithm. This one is very slow but
-			 * scans the whole window. In short, here are the savings :
-			 *   file        orig     fast(ratio)  optimal(ratio)
-			 *  README       5185    3419 (65.9%)    3165 (61.0%)  -7.5%
-			 *  index.html  76799   35662 (46.4%)   29875 (38.9%) -16.3%
-			 *  rfc1952.c   29383   13442 (45.7%)   11793 (40.1%) -12.3%
-			 *
-			 * Thus the savings to expect for large files is at best 16%.
-			 *
-			 * A non-colliding hash gives 33025 instead of 35662 (-7.4%),
-			 * and keeping the last two entries gives 31724 (-11.0%).
-			 */
-			unsigned long scan;
-			int saved = 0;
-			int bestpos = 0;
-			int bestlen = 0;
-			int firstlen = 0;
-			int max_lookup = 2; // 0 = no limit
-
-			for (scan = pos - 1; scan < pos && (unsigned long)(pos - scan - 1) < 32768; scan--) {
-				int len;
-
-				if (*(uint32_t *)(in + scan) != word)
-					continue;
-
-				len = memmatch(in + pos, in + scan, rem);
-				if (!bestlen)
-					firstlen = len;
-
-				if (len > bestlen) {
-					bestlen = len;
-					bestpos = scan;
-				}
-				if (!--max_lookup)
-					break;
-			}
-			if (bestlen) {
-				//printf("pos=%d last=%d bestpos=%d word=%08x ent=%08x len=%d\n",
-				//       (int)pos, (int)last, (int)bestpos, (int)word, (int)ent, bestlen);
-				last = bestpos;
-				ent  = word;
-				saved += bestlen - firstlen;
-			}
-			//fprintf(stderr, "first=%d best=%d saved_total=%d\n", firstlen, bestlen, saved);
-#endif
-
 			if ((uint32_t)ent != word) {
 			send_as_lit:
 				rem--;
@@ -1893,42 +1845,6 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 				refs[h].by32.pos = pos;
 				refs[h].by32.word = word;
 			}
-
-#ifdef FIND_OPTIMAL_MATCH
-			/* see the fixed tree's loop */
-			unsigned long scan;
-			int saved = 0;
-			int bestpos = 0;
-			int bestlen = 0;
-			int firstlen = 0;
-			int max_lookup = 2; // 0 = no limit
-
-			for (scan = pos - 1; scan < pos && (unsigned long)(pos - scan - 1) < 32768; scan--) {
-				int len;
-
-				if (*(uint32_t *)(in + scan) != word)
-					continue;
-
-				len = memmatch(in + pos, in + scan, rem);
-				if (!bestlen)
-					firstlen = len;
-
-				if (len > bestlen) {
-					bestlen = len;
-					bestpos = scan;
-				}
-				if (!--max_lookup)
-					break;
-			}
-			if (bestlen) {
-				//printf("pos=%d last=%d bestpos=%d word=%08x ent=%08x len=%d\n",
-				//       (int)pos, (int)last, (int)bestpos, (int)word, (int)ent, bestlen);
-				last = bestpos;
-				ent  = word;
-				saved += bestlen - firstlen;
-			}
-			//fprintf(stderr, "first=%d best=%d saved_total=%d\n", firstlen, bestlen, saved);
-#endif
 
 			if ((uint32_t)ent != word) {
 			text_send_as_lit:
