@@ -1032,16 +1032,20 @@ static inline void insert_ref(union ref *refs, const unsigned char *in, unsigned
  * it saves by itself, and the switch to fixed huffman is charged when it is
  * performed by that reference, but not when the first literals perform it.
  *
- * At levels 1 and 2, literals are not counted one at a time, which costs too much in
- * the main loop. Instead, a group of literals sent in fixed huffman mode before
- * a reference is charged one bit per byte as if all of them took 9 bits, once
- * the decision to send it in fixed huffman mode is taken. The balance is thus
- * still an upper bound of the excess, and the group itself, whose decision did
- * not include it, is shorter than 64 bytes there (longer ones are skipped and
- * leave as a stored block), so it adds less than 64 bits to the bound, which
- * is thus 315 bits, published in bytes as SLZ_MAX_DEBT_BYTES in slz.h. On real
- * data, the reference that follows almost always saves more than the charge,
- * so this rarely changes a decision.
+ * At encoder levels 1 and 2 (compression levels 1 to 3, see the <level>
+ * argument of _slz_rfc1951_encode()), literals are not counted one at a time,
+ * which costs too much in the main loop. Instead, a group of literals sent in
+ * fixed huffman mode before a reference is charged one bit per byte as if all
+ * of them took 9 bits, once the decision to send it in fixed huffman mode is
+ * taken. The balance is thus still an upper bound of the excess, and the group
+ * itself, whose decision did not include it, is shorter than 64 bytes there
+ * (longer ones are skipped and leave as a stored block), so it adds less than
+ * 64 bits to the bound, which is thus 315 bits, published in bytes as
+ * SLZ_MAX_DEBT_BYTES in slz.h. On real data, the reference that follows almost
+ * always saves more than the charge, so this rarely changes a decision. This
+ * relies on the literal skip: without it (SLZ_LITERAL_SKIP=0), a group may be
+ * up to 65472 bytes long and would add as many bits to the bound, so all
+ * levels count literals one at a time then.
  */
 #define SLZ_MAX_DEBT        200
 #define SLZ_CREDIT           64
@@ -1396,7 +1400,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 			send_as_lit:
 				rem--;
 				plit++;
-				if (level >= 3) // levels 1-2 charge whole groups, see SLZ_MAX_DEBT
+				if (level >= 3 || !SLZ_LITERAL_SKIP) // see SLZ_MAX_DEBT
 					bal += ((unsigned char)word >= 144);
 				pos++;
 
@@ -1713,7 +1717,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 					bal = strm->debt;
 				}
 				else {
-					if (level <= 2)
+					if (level <= 2 && SLZ_LITERAL_SKIP)
 						bal += plit; // worst case: all of them take 9 bits
 					copy_lit_huff(strm, in + pos - plit, plit, 1, SLZ_CT_GENERIC, auto_tree);
 				}
@@ -2238,7 +2242,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
  * the fixed tree's literal skip and debt accounting (see SLZ_MAX_DEBT and the
  * literal skip in _slz_rfc1951_encode()):
  *   1: blind skip ramp from 64 to 8128 bytes, debt charged per group of
- *      literals;
+ *      literals (per literal without SLZ_LITERAL_SKIP);
  *   2: same, with a probe every 64 skipped bytes;
  *   3: skip in 2048-byte steps up to 28 kB, with a probe every 64 skipped
  *      bytes, debt charged per literal.
