@@ -656,6 +656,22 @@ static inline void send_eob(struct slz_stream *__restrict strm, int ctype)
 		enqueue8(strm, 0, 7); // direct encoding of 256 = EOB (cf RFC1951)
 }
 
+/* Makes the fixed tree the current one for the encoders that only know it,
+ * closing a block opened with the text tree. <cur_tree> may be the text tree
+ * when they are entered: the init functions start with it from level 2, and
+ * the level may be changed between calls (e.g. lowered under load).
+ */
+static inline void leave_text_tree(struct slz_stream *__restrict strm)
+{
+	if (strm->cur_tree != SLZ_CT_GENERIC) {
+		if (strm->state == SLZ_ST_FIXED) {
+			send_eob(strm, strm->cur_tree);
+			strm->state = SLZ_ST_EOB;
+		}
+		strm->cur_tree = SLZ_CT_GENERIC;
+	}
+}
+
 /* Opens a dynamic block (BTYPE=10) with BFINAL set to <bfinal>, and sends the
  * definition of the text tree. The whole round trip is charged to the debt
  * (SLZ_TEXT_SWITCH_COST, see SLZ_TEXT_MAX_DEBT): the block type and the
@@ -2341,13 +2357,7 @@ long _slz_rfc1951_ev_encode(struct slz_stream *__restrict strm, unsigned char *o
 		__builtin_prefetch(p, 1);
 
 	/* only the fixed tree here, see SLZ_AUTO_IN */
-	if (strm->cur_tree != SLZ_CT_GENERIC) {
-		if (strm->state == SLZ_ST_FIXED) {
-			send_eob(strm, strm->cur_tree);
-			strm->state = SLZ_ST_EOB;
-		}
-		strm->cur_tree = SLZ_CT_GENERIC;
-	}
+	leave_text_tree(strm);
 	strm->tree_switch = 0;
 
 	/* the last 3 positions of the history could not be indexed before
@@ -2585,8 +2595,18 @@ long slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, 
 	if (strm->content_type == SLZ_CT_TEXT && level && level < 3)
 		level = 3;
 
-	if (level <= 1)
+	if (level <= 1) {
+		/* level 1 (and 0) only use the fixed tree */
+		if (__builtin_expect(strm->cur_tree != SLZ_CT_GENERIC, 0)) {
+			long n;
+
+			strm->outbuf = out;
+			leave_text_tree(strm);
+			n = strm->outbuf - out;
+			return n + _slz_rfc1951_encode_lev1(strm, out + n, in, ilen, more);
+		}
 		return _slz_rfc1951_encode_lev1(strm, out, in, ilen, more);
+	}
 	else if (level <= 2)
 		return _slz_rfc1951_encode_lev2(strm, out, in, ilen, more);
 	else if (level <= 3)
