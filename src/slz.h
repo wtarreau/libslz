@@ -228,7 +228,7 @@ static inline long slz_encode(struct slz_stream *strm, void *out,
  * possibly pending bits from the queue, the possible EOB and the final empty
  * block, rounding to the next byte, then 4 bytes for the CRC when doing
  * zlib/gzip, then another 4 bytes for the input length for gzip. That may
- * amount to 6+4+4 = 14 bytes, that the caller must ensure are available before
+ * amount to 7+4+4 = 15 bytes, that the caller must ensure are available before
  * calling the function. Note that if the initial header was never sent, it
  * will be sent first as well (up to 10 extra bytes).
  */

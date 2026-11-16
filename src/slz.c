@@ -2730,10 +2730,11 @@ typedef char slz_text_eob_bits_check[(TEXT_EOB_BITS >= 7) ? 1 : -1];
 /* Flushes any pending for stream <strm> into buffer <buf>, then sends BTYPE=1
  * and BFINAL=1 if needed. The stream ends in SLZ_ST_DONE. It returns the number
  * of bytes emitted. The trailer consists in flushing the possibly pending bits
- * from the queue (up to 31 bits when using the 64-bit queue), then possibly
- * EOB (7 bits), then 3 bits, EOB, a rounding to the next byte, which amounts
- * to a total of 6 bytes max, that the caller must ensure are available before
- * calling the function.
+ * from the queue (up to 31 bits when the queue is not stored after each
+ * enqueue, see SLZ_DIRECT_ENQUEUE24), then possibly the EOB (7 bits with the
+ * fixed tree, 11 with the text one), then 3 bits, EOB, a rounding to the next
+ * byte, which amounts to a total of 7 bytes max, that the caller must ensure
+ * are available before calling the function.
  */
 int slz_rfc1951_finish(struct slz_stream *strm, unsigned char *buf)
 {
@@ -2959,7 +2960,7 @@ int slz_rfc1952_flush(struct slz_stream *strm, unsigned char *buf)
  * returns the number of bytes emitted. The trailer consists in flushing the
  * possibly pending bits from the queue, the possible EOB and the final empty
  * block, rounding to the next byte, then 4 bytes for the CRC and another 4
- * bytes for the input length. That may amount to 6+4+4 = 14 bytes, that the
+ * bytes for the input length. That may amount to 7+4+4 = 15 bytes, that the
  * caller must ensure are available before calling the function. Note that if
  * the initial header was never sent, it will be sent first as well (10 extra
  * bytes).
@@ -3168,14 +3169,14 @@ int slz_rfc1950_flush(struct slz_stream *strm, unsigned char *buf)
 	return sent;
 }
 
-/* Flushes pending bits and sends the gzip trailer for stream <strm> into
+/* Flushes pending bits and sends the zlib trailer for stream <strm> into
  * buffer <buf>. When it's done, the stream state is updated to SLZ_ST_END. It
  * returns the number of bytes emitted. The trailer consists in flushing the
  * possibly pending bits from the queue, the possible EOB and the final empty
- * block, rounding to the next byte, then 4 bytes for the CRC. That may amount
- * to 6+4 = 10 bytes, that the caller must ensure are available before calling
- * the function. Note that if the initial header was never sent, it will be
- * sent first as well (2 extra bytes).
+ * block, rounding to the next byte, then 4 bytes for the Adler-32. That may
+ * amount to 7+4 = 11 bytes, that the caller must ensure are available before
+ * calling the function. Note that if the initial header was never sent, it
+ * will be sent first as well (2 extra bytes).
  */
 int slz_rfc1950_finish(struct slz_stream *strm, unsigned char *buf)
 {
