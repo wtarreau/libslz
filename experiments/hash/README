@@ -1,0 +1,235 @@
+Hash function of the reference table
+====================================
+
+2026-11-21, on top of the event encoder series. Figures are from the Xeon
+W-2145 (Skylake) unless stated otherwise; speeds that decided anything come
+from the Arrow Lake (Ultra 7 265K). Nothing here changes the code: the
+multiply by 0x1af42f in slz_hash_bits() stays.
+
+The question: can a hash of 3 to 5 simple operations (shifts, adds, xors) get
+close to the multiply's ratio while costing less, possibly by favouring the
+bits of the input words that vary the most in text? And which factor works
+best if level 4 moves to a 14- or 15-bit table?
+
+
+1. Tools
+--------
+
+  hashlog.patch  makes slz.c write every hashed word to $SLZ_HLOG (records of
+                 3 uint32: word, offset in the input, kind 0 = main loop
+                 lookup, 1 = insert_ref(), 2 = skip probe). Build zenc with it
+                 and run "SLZ_HLOG=log zenc -<level> -t silesia.tar". zenc maps
+                 the whole input, offsets are relative to the first word.
+  bitent.c       per-bit entropy of all the 4-byte words of a file
+  logent.c       same, on a log
+  hsim.c         screens hash forms by simulating the table on files
+  hsim2.c        same, replaying a log: a lookup "hits" when its bucket holds
+                 the same word within 32768 bytes, then every record updates
+                 the bucket. Only every <stride>th chunk of 1M records is
+                 replayed. One candidate takes 0.2-0.3 s on the -4 log.
+  hashcmp.sh     builds zenc with slz_hash_bits() replaced by an expression
+                 and prints real output sizes per level and file
+  imullat.c      imul latency and throughput for several constants
+
+The hit count measures matches found, which tracks the ratio but is not the
+ratio (match lengths are not counted), so every finalist was checked with
+real compression.
+
+
+2. Which words are hashed, and which bits vary
+----------------------------------------------
+
+With the literal skip, silesia.tar (211.9 MB) hashes 89.0M words at -1 (44%
+lookups, 56% inserts) and 113.5M at -4 (50.5% lookups, 49.4% inserts, 0.1%
+probes).
+
+Entropy of each bit of a byte, all positions of the file (every byte
+position of the word shows the same pattern):
+
+    bit           7     6     5     4     3     2     1     0
+    silesia     0.50  0.97  0.92  0.93  0.93  0.96  0.93  0.95
+    linux       0.02  0.97  0.93  0.91  0.94  0.97  0.94  0.98
+    html        0.00  0.91  0.33  0.89  0.96  1.00  0.96  0.99
+
+In text, bit 7 is dead and bit 5 (case) is weak in HTML: bits 0-4 and 6 of
+each byte carry the information, about 24 useful bits out of 32. On the words
+that slz really hashes on silesia, bit 7 still varies (0.46-0.63) because
+the binary files are partly compressible, bit 5 is at 0.84-0.94, the others
+at 0.92-1.00.
+
+How the current factor feeds the 13 bits kept (product bits 19-31, cK is the
+carry into product bit K, factor bits 0 1 2 3 5 10 12 13 14 15 17 19 20):
+
+    r0  = w19 + w18 + w17 + w16 + w14 + w9 + w7 + w6 + w5 + w4 + w2 + w0 + c19
+    r1  = w20 + w19 + w18 + w17 + w15 + w10 + w8 + w7 + w6 + w5 + w3 + w1 + w0 + c20
+    r2  = w21 + w20 + w19 + w18 + w16 + w11 + w9 + w8 + w7 + w6 + w4 + w2 + w1 + c21
+    r3  = w22 + w21 + w20 + w19 + w17 + w12 + w10 + w9 + w8 + w7 + w5 + w3 + w2 + c22
+    r4  = w23 + w22 + w21 + w20 + w18 + w13 + w11 + w10 + w9 + w8 + w6 + w4 + w3 + c23
+    r5  = w24 + w23 + w22 + w21 + w19 + w14 + w12 + w11 + w10 + w9 + w7 + w5 + w4 + c24
+    r6  = w25 + w24 + w23 + w22 + w20 + w15 + w13 + w12 + w11 + w10 + w8 + w6 + w5 + c25
+    r7  = w26 + w25 + w24 + w23 + w21 + w16 + w14 + w13 + w12 + w11 + w9 + w7 + w6 + c26
+    r8  = w27 + w26 + w25 + w24 + w22 + w17 + w15 + w14 + w13 + w12 + w10 + w8 + w7 + c27
+    r9  = w28 + w27 + w26 + w25 + w23 + w18 + w16 + w15 + w14 + w13 + w11 + w9 + w8 + c28
+    r10 = w29 + w28 + w27 + w26 + w24 + w19 + w17 + w16 + w15 + w14 + w12 + w10 + w9 + c29
+    r11 = w30 + w29 + w28 + w27 + w25 + w20 + w18 + w17 + w16 + w15 + w13 + w11 + w10 + c30
+    r12 = w31 + w30 + w29 + w28 + w26 + w21 + w19 + w18 + w17 + w16 + w14 + w12 + w11 + c31
+
+
+3. Cheap forms: screen
+----------------------
+
+Every form with two shifts and two operations (+, -, ^), 17022 candidates,
+replayed on the -4 log (stride 4), in three families:
+
+  - sparse multiplies, top bits: ((a<<p) o (a<<q) o a) >> (32-bits), the
+    family of the former shift hash (a<<19)+(a<<6)-a;
+  - right folds, low bits: (a o (a>>p) o (a>>q)) & mask;
+  - mixed: ((a o (a>>p)) o (a<<q)) >> (32-bits).
+
+Hits relative to the multiply by 0x1af42f:
+
+    bits  multiply        (a<<19)+(a<<6)-a   best 2-shift form
+     13   4.74M           -4.79%             -1.35%  (a<<20)-(a<<11)+a
+     14   5.20M (+9.8%)   -4.59%             -1.11%  ((a^(a>>19))+(a>>7)) & mask
+     15   5.49M (+5.6%)   -3.73%             -0.90%  (a<<19)-(a<<10)-a
+
+The mixed family is far behind (-15% at best). A near-ideal mixer,
+((a ^ (a>>15)) * 0x9E3779B1) >> (32-bits), is at -0.70% at 13 bits: a
+uniform hash is better on random input, while slz feeds it words with a lot
+of structure. The multiply ranks first at all three sizes. From 13 to 14
+bits the hits grow by 9.8%, from 14 to 15 by 5.6% only.
+
+
+4. Cheap forms: real sizes, and what x86 compilers make of them
+---------------------------------------------------------------
+
+13 bits, output size relative to the multiply (+ = larger), levels 1/2/3/4.
+"web" is index.html, daniels.html and haproxy's configuration.txt (1.9 MB).
+
+    hash                      silesia                  linux                    web
+    (a<<19)+(a<<6)-a          +0.49 +0.49 +0.57 +0.43  +0.08 +0.06 +0.05 +0.05  +0.17 +0.08 +0.08 +0.08
+    f1a: (a-(a>>20)-(a>>9))&m +0.28 +0.27 +0.21 +0.13  +0.05 +0.06 +0.05 +0.05  +0.05 +0.02 +0.02 +0.02
+    (a<<20)-(a<<11)+a         +0.31 +0.30 +0.13 +0.12  +0.08 +0.07 +0.06 +0.06  +0.12 +0.08 +0.08 +0.08
+    (a<<19)+(a<<12)+a         +0.50 +0.51 +0.19 +0.16  +0.07 +0.08 +0.05 +0.05  +0.07 +0.01 +0.01 +0.01
+
+silesia with the multiply: 98783584 / 93211617 / 86565096 / 85777881 bytes.
+
+On x86-64, gcc and clang compile any sum of left shifts of the word into one
+multiply: (a<<19)+(a<<6)-a is "imul $0x8003f" + "shr", (a<<20)+(a<<11)+a is
+"imul $0x100801". The left-shift forms are thus only other factors there. A
+right-shift fold cannot become a multiply (x86 has no shift-and-add, lea only
+scales by 2, 4 or 8):
+
+    form                           gcc -O3 instructions          critical path
+    (a - (a>>20) - (a>>9)) & mask  8: 3 mov 2 shr add sub and    shr add sub and
+    same with +                    7: 2 mov 2 shr 2 add and      shr add add and
+    ((a<<20) + (a<<11) + a) >> 19  2: imul $0x100801, shr        imul (3) shr
+    same, shifts forced by asm     7: 2 mov 2 shl 2 add shr      shl add add shr
+
+The subtractions do not force a sequence: gcc reassociates a - x - y into
+a - (x + y), and only needs one extra mov because sub writes into the
+register holding a. All forms take about 4 cycles; the difference is 2
+instructions against 7-8 in a loop that is sensitive to decode bandwidth and
+registers. On ARM, "sub w0, w0, w1, lsr #20" folds the shift into the
+operation, so f1a is 3 instructions there; this was not measured.
+
+Arrow Lake, zenc -D -t -v -p -l 4 on silesia.tar (4 passes), size and speed:
+
+    ratio, MB/s     level 1        level 2        level 3        level 4
+    a * 0x1af42f    46.61% 931.3   43.98% 902.7   40.84% 791.8   40.47% 753.6
+    a * 0x8003f     46.84% 932.7   44.19% 906.5   41.07% 795.0   40.65% 756.4
+    a * 0x100801    46.74% 924.0   44.10% 896.6   40.93% 787.1   40.52% 747.2
+    f1a             46.74% 901.6   44.10% 875.7   40.93% 768.5   40.52% 726.5
+
+f1a costs 2.9-3.6% against the multiply. 0x8003f and 0x100801 are encoded in
+6 bytes each at the same address, so their comparison has no layout effect,
+yet 0x100801 is 0.9-1.2% slower while compressing 0.09-0.14 point better.
+
+
+5. The multiply's cost does not depend on the factor
+----------------------------------------------------
+
+imullat.c measures a dependent chain and 4 independent chains of
+"imul $C, r32, r32" with 0x8003f, 0x100801, 0x1af42f, 0x7fffffff and 3: all
+give 2.48 / 0.83 reference cycles per imul on the Skylake (3 / 1 core cycles
+at turbo), and the same values for all constants on the Arrow Lake. Large
+factors were slower on cores with early-terminating multipliers (ARM7/ARM9,
+Cortex-M3, some old PowerPC and SPARC), not on current x86. On ARM64 a factor
+above 16 significant bits takes movz+movk to load, normally hoisted out of
+the loop at the cost of a register.
+
+The 0x100801 slowdown comes from what the hash makes the encoder do
+(Skylake, silesia, zenc -p, pinned, two runs each, both runs agreeing):
+
+                              0x8003f     0x100801    delta
+    -1 hashed positions       88.41M      88.95M      +0.61%
+    -1 instructions           3.351G      3.374G      +0.67%
+    -1 branch misses          20.3M       20.6M       +1.5%
+    -1 L1d misses             61.8M       63.3M       +2.4%
+    -1 cycles                 1.795G      1.805G      +0.6%
+    -4 hashed positions       113.04M     113.66M     +0.55%
+    -4 instructions           4.941G      4.949G      +0.17%
+    -4 L1d misses             81.2M       84.9M       +4.6%
+    -4 cycles                 2.341G      2.358G      +0.7%
+
+The new factor finds a few more short matches in the binary parts of
+silesia. Each match resets the literal skip ramp, so more positions are
+hashed and looked up, each one a table access in a more scattered pattern
+and another chance to mispredict the bucket test. The output barely changes
+because these matches are short ones in nearly incompressible data. So the
+speed of a hash in slz depends on what it finds, not on what it costs, and a
+better hash may be slower by turning skipping off on binary data. This is
+also why 0x1af42f, which compresses best, sits between the two others in
+speed.
+
+
+6. Factors built from the varying bits
+--------------------------------------
+
+Each set bit s of the factor adds the word shifted left by s, so input bit i
+reaches the kept bits through factor bits near (32-bits)-i to 31-i, plus the
+carries. Factors were built with one term per input byte so that the bytes'
+significant bits interleave in the kept bits instead of piling up:
+c = (m0<<s0) + (m1<<s1) + (m2<<s2) + 1, byte 3 entering through the +1,
+s0 in 12-25, s1 in 4-17, s2 in 0-10, each m being 1 or 3 (one bit or two
+adjacent ones): 11094 factors, replayed on the -4 log (stride 8).
+
+  - 13 bits: 0x1af42f ranks first; the best built ones are 0x80631 (-0.10%
+    hits) and 0xc6031 (-0.12%).
+  - 14 bits: 0x1af42f ranks 34th; the best is 0x44041 = 2^18 + 2^14 + 2^6 + 1
+    (+0.25% hits), then 0x303c01 (+0.23%) and 0x60441 (+0.17%).
+
+Real sizes against 0x1af42f at the same table size (+ = larger, levels
+1/2/3/4):
+
+    bits factor     silesia                      linux                        web
+    13   0x80631    +0.141 +0.147 +0.046 +0.022  +0.020 +0.018 +0.021 +0.021  -0.102 -0.066 -0.066 -0.066
+    13   0xc6031    -0.062 -0.055 +0.033 -0.003  +0.027 +0.054 +0.027 +0.028  -0.014 +0.033 +0.033 +0.033
+    13   0x1802c1   +0.215 +0.225 +0.065 -0.002  +0.024 +0.039 +0.020 +0.019  +0.144 +0.122 +0.122 +0.122
+    14   0x44041    -0.112 -0.117 +0.036 -0.065  +0.025 +0.025 +0.021 +0.021  -0.077 -0.068 -0.068 -0.068
+    14   0x303c01   +0.050 +0.062 +0.012 -0.083  -0.005 -0.021 -0.013 -0.013  -0.086 -0.076 -0.076 -0.076
+    14   0x60441    -0.095 -0.097 +0.029 -0.034  +0.019 +0.028 +0.019 +0.019  +0.036 +0.030 +0.030 +0.030
+
+silesia with 0x1af42f at 14 bits: 98094957 / 92681439 / 85895133 / 85072999
+bytes, i.e. -0.82% at -4 against 13 bits.
+
+At 13 bits nothing beats 0x1af42f clearly. At 14 bits, 0x303c01 is smaller
+on all three corpora at -4, but by under 0.1%, and measured on the Arrow
+Lake all of these gain very little.
+
+
+7. Conclusions
+--------------
+
+  - The multiply by 0x1af42f stays. It is close to optimal from 12 to 14
+    bits, as found when it was chosen (48k factors tested), and none of the
+    cheap forms nor the factors built here does better in a way that matters.
+  - On x86 the shift hashes are multiplies; the only cheaper non-multiply
+    forms are right folds, which cost 7-8 instructions and are slower.
+  - imul does not cost more with a larger factor on current x86.
+  - To compare hashes, look at the encoder's behaviour (hashed positions,
+    branch and L1d misses), not at the hash's instruction cost: a hash that
+    finds more short matches in binary data reduces the literal skip.
+  - A 14-bit table at level 4 can keep 0x1af42f. Its size has to reach the
+    inlined encoder body as a compile-time constant argument, never a
+    runtime one, or it pins a register in the hot loop.

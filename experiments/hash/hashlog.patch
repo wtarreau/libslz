@@ -1,0 +1,78 @@
+--- a/src/slz.c
++++ b/src/slz.c
+@@ -293,6 +293,30 @@
+ 	return slz_hash_bits(a, SLZ_HASH_BITS);
+ }
+ 
++/* hash log for experiments/hash, see the README there */
++#include <stdio.h>
++#include <stdlib.h>
++static FILE *slz_hlog;
++static const unsigned char *slz_hbase;
++/* logs <a> read at <p>, of kind <t> (0 lookup, 1 insert, 2 probe) */
++static inline uint32_t slz_hash_log(uint32_t a, const unsigned char *p, int t)
++{
++	static int done;
++	uint32_t r[3];
++
++	if (!done) {
++		const char *n = getenv("SLZ_HLOG");
++
++		done = 1;
++		slz_hlog = n ? fopen(n, "w") : NULL;
++		slz_hbase = p; /* zenc maps the whole input, offsets are relative to it */
++	}
++	if (slz_hlog) {
++		r[0] = a; r[1] = (uint32_t)(p - slz_hbase); r[2] = t;
++		fwrite(r, sizeof(r), 1, slz_hlog);
++	}
++	return slz_hash(a);
++}
+ /* This function compares buffers <a> and <b> and reads 32 or 64 bits at a time
+  * during the approach. It makes us of unaligned little endian memory accesses
+  * on capable architectures. <max> is the maximum number of bytes that can be
+@@ -949,7 +973,7 @@
+ 	uint32_t w = ((uint32_t)in[p]) | ((uint32_t)in[p + 1] << 8) |
+ 	             ((uint32_t)in[p + 2] << 16) | ((uint32_t)in[p + 3] << 24);
+ #endif
+-	uint32_t h = slz_hash(w);
++	uint32_t h = slz_hash_log(w, in + p, 1);
+ 
+ 	if (sizeof(long) >= 8)
+ 		refs[h].by64 = ((uint64_t)p) + ((uint64_t)w << 32);
+@@ -1327,7 +1351,7 @@
+ #else
+ 			word = *(uint32_t *)&in[pos];
+ #endif
+-			h = slz_hash(word);
++			h = slz_hash_log(word, in + pos, 0);
+ 			asm volatile ("" ::); // prevent gcc from trying to be smart with the prefetch
+ 
+ 			if (sizeof(long) >= 8) {
+@@ -1444,7 +1468,7 @@
+ 						skip &= 63;
+ 						do {
+ 							uint32_t w = read_le32(in + pos + 60);
+-							uint32_t hw = slz_hash(w);
++							uint32_t hw = slz_hash_log(w, in + pos + 60, 2);
+ 
+ 							if (sizeof(long) >= 8) {
+ 								uint64_t old = refs[hw].by64;
+@@ -1505,7 +1529,7 @@
+ 						skip &= 63;
+ 						do {
+ 							uint32_t w = read_le32(in + pos + 60);
+-							uint32_t hw = slz_hash(w);
++							uint32_t hw = slz_hash_log(w, in + pos + 60, 2);
+ 
+ 							if (sizeof(long) >= 8) {
+ 								uint64_t old = refs[hw].by64;
+@@ -1873,7 +1897,7 @@
+ #else
+ 			word = *(uint32_t *)&in[pos];
+ #endif
+-			h = slz_hash(word);
++			h = slz_hash_log(word, in + pos, 0);
+ 			asm volatile ("" ::); // prevent gcc from trying to be smart with the prefetch
+ 
+ 			if (sizeof(long) >= 8) {
