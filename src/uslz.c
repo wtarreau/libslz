@@ -866,13 +866,6 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 	}  /* if (state->block_type == 0) */
 
 	if (state->block_type == 2) {  /* Dynamic tables. */
-		/* codelen_order: Order of code lengths in the block header for the
-		 * code length alphabet.
-		 */
-		static const unsigned char codelen_order[19] = {
-			16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
-		};
-
 		/* Retrieve the three code counts from the block header. */
 		state->state = USLZ_ST_LITERAL_COUNT;
 
