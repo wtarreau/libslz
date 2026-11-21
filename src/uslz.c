@@ -209,12 +209,20 @@ static int gen_huffman_table(unsigned int symbols,
 	return 1;
 }
 
+/* Fast table entry for codes too long for the table or unused codes: a zero
+ * length, so that the readers fall back to the tree walk, and symbol 511, above
+ * all literals, so that the literal loop of dynamic blocks leaves on its
+ * literal test alone.
+ */
+#define USLZ_FAST_LONG (511U << 7)
+
 /*
  * gen_fast_table: fill the direct lookup <table> of <tbits> bits from the code
  * lengths in <lengths>, for an alphabet of <symbols> symbols. Entries have the
  * same layout as fixed_huff_dec_table[]: the symbol in the upper bits and the
- * code length in the low 4 bits. Codes longer than <tbits> are left at zero
- * and are decoded by walking the tree built by gen_huffman_table() instead.
+ * code length in the low 4 bits. Codes longer than <tbits> are left at
+ * USLZ_FAST_LONG and are decoded by walking the tree built by
+ * gen_huffman_table() instead.
  *
  * Each code is replicated over every combination of the bits above it, so
  * that a lookup performed with fewer than <tbits> bits still finds it,
@@ -232,7 +240,9 @@ static void gen_fast_table(unsigned int symbols, const unsigned char *lengths,
 	unsigned short count[16];
 	unsigned int i, len, code;
 
-	memset(table, 0, (1U << tbits) * sizeof(*table));
+	/* entries left unassigned carry USLZ_FAST_LONG */
+	for (i = 0; i < (1U << tbits); i++)
+		table[i] = USLZ_FAST_LONG;
 	memset(count, 0, sizeof(count));
 
 	for (i = 0; i < symbols; i++)
@@ -552,6 +562,53 @@ static inline int gethuff_fast(const unsigned char **in_ptr, const unsigned char
 				goto have_symbol;                              \
 			}                                                      \
 			*out++ = state->symbol;                                \
+		}                                                              \
+	} while (0)
+
+/* Number of literals of dynamic blocks decoded per refill. The loop is only
+ * built on 64-bit platforms, where a refill brings at least 56 bits. A dynamic
+ * tree may have codes of up to 15 bits, but gen_fast_table() only places in
+ * fast_lit[] those of at most USLZ_FAST_BITS bits, and the longer ones consume
+ * nothing (see USLZ_FAST_LONG), so whatever the tree, a lookup consumes at
+ * most USLZ_FAST_BITS bits: 5 lookups per refill with 10-bit tables. It is
+ * capped to the 7 DYN_LITERAL() calls of the loop.
+ */
+#if USLZ_FAST_BITS
+#define DYN_LIT_PER_REFILL (56 / USLZ_FAST_BITS > 7 ? 7 : 56 / USLZ_FAST_BITS)
+#else
+#define DYN_LIT_PER_REFILL 0 /* no fast table, the loop is never entered */
+#endif
+
+/* same as FIXED_LITERAL() above for dynamic blocks, from fast_lit[]. A code
+ * too long for the table reads USLZ_FAST_LONG, whose zero length consumes
+ * nothing, and goes to the generic path at <dyn_slow> to be walked in the
+ * tree.
+ *
+ * As in FIXED_LITERAL(), <num_bits> is decremented by the whole entry rather
+ * than by its length (bits 0-3) to save a mask per literal: <num_bits> being
+ * 8-bit, the symbol part (sym << 7) only subtracts 0 or 128, which can only
+ * flip bit 7 since <num_bits> never exceeds 63. Bit 7 is cleared by the
+ * "num_bits &= 0x3F" after the last literal of the refill, or on exit.
+ *
+ * Any other symbol than a literal is consumed and handled at
+ * <have_symbol>.
+ */
+#define DYN_LITERAL(ofs)                                                       \
+	do {                                                                   \
+		if (ofs < DYN_LIT_PER_REFILL) {                                \
+			unsigned int entry, sym;                               \
+			entry = state->fast_lit[bit_accum & ((1U << USLZ_FAST_BITS) - 1)]; \
+			bit_accum >>= entry & 0xF;                             \
+			num_bits   -= entry;                                   \
+			sym = entry >> 7;                                      \
+			if (sym >= 256) {                                      \
+				num_bits &= 0x3F;                              \
+				if (!(entry & 0xF))                            \
+					goto dyn_slow;                         \
+				state->symbol = sym;                           \
+				goto have_symbol;                              \
+			}                                                      \
+			*out++ = sym;                                          \
 		}                                                              \
 	} while (0)
 
@@ -1057,14 +1114,45 @@ static enum uslz_decode_ret uslz_decode_block(struct uslz_stream *state)
 			 */
 			int ret = -1;
 
-			if (USLZ_FAST_BITS && !state->huff_index)
+			if (USLZ_FAST_BITS && !state->huff_index) {
+#if defined(UNALIGNED_LE_OK) && __SIZEOF_LONG__ >= 8
+				/* Literal loop, the same as for fixed blocks
+				 * above, from the block's own fast_lit[] table:
+				 * up to 5 literals per refill. The first symbol
+				 * that is not a literal is consumed and handled
+				 * by the generic path, and a code too long for
+				 * the table is walked in the tree at
+				 * <dyn_slow>. Only built on 64-bit platforms,
+				 * see DYN_LIT_PER_REFILL.
+				 */
+				while (out_lim - out >= DYN_LIT_PER_REFILL &&
+				       in_top - in_ptr >= __SIZEOF_LONG__) {
+					REFILL();
+					DYN_LITERAL(0); DYN_LITERAL(1);
+					DYN_LITERAL(2); DYN_LITERAL(3);
+					DYN_LITERAL(4); DYN_LITERAL(5);
+					DYN_LITERAL(6);
+					num_bits &= 0x3F;
+				}
+				/* same as for fixed blocks above */
+				if (out == out_lim)
+					continue;
+#endif
 				ret = gethuff_fast(&in_ptr, in_top, &num_bits, &bit_accum,
 				                   &state->symbol, state->fast_lit,
 				                   USLZ_FAST_BITS);
+			}
 			if (!ret)
 				goto out_of_data;
-			if (ret < 0)
+			if (ret < 0) {
+#if defined(UNALIGNED_LE_OK) && __SIZEOF_LONG__ >= 8
+				/* note that dyn_slow can jump here from above
+				 * because it leaves ret to -1.
+				 */
+			dyn_slow:
+#endif
 				GETHUFF(state->symbol, state->literal_table);
+			}
 		}
 
 #if defined(UNALIGNED_LE_OK)
