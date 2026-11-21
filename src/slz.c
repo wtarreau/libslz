@@ -285,12 +285,12 @@ uint32_t slz_hash_bits(uint32_t a, const int bits)
 	__asm__ volatile("crc32l %1,%0" : "+r"(a) : "r"(0));
 #elif defined(HAVE_FAST_MULT)
 	// optimal factor for SLZ_HASH_BITS=12 and SLZ_HASH_BITS=13 among 48k tested: 0x1af42f
-	a = (a * 0x1af42f); // 12: 44.12, 13: 43.35
-	//return (a * 0x1aaee3) >> (32 - SLZ_HASH_BITS); // 12: 44.14, 13: 43.34
-	//return (a * 0x1aae0b) >> (32 - SLZ_HASH_BITS); // 12: 44.15, 13: 43.35, -30k
-	//return (a * 0x17e7bd) >> (32 - SLZ_HASH_BITS); // 12: 44.15, 13: 43.36
-	//return (a * 0xaae7b) >> (32 - SLZ_HASH_BITS); // 12: 44.22, 13:43.35, -1k
-	//return (a * 0xaaec3) >> (32 - SLZ_HASH_BITS); // 12: 44.20, 13: 43.35, -10k // 275659647
+	if (bits >= 15)
+		a *= 0x60441;  // 14: 40.13, 15: 39.96
+	else if (bits == 14)
+		a *= 0x44041;  // 14: 40.11, 15: 40.01
+	else
+		a *= 0x1af42f; // 12: 41.19, 13: 40.47, 14: 40.14, 15: 40.01
 #else
 	a = ((a << 19) + (a << 6) - a);
 #endif
