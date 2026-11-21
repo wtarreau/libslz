@@ -260,8 +260,14 @@ static void gen_fast_table(unsigned int symbols, const unsigned char *lengths,
 		if (len > tbits)
 			continue;
 
-		/* codes appear bit-reversed in the accumulator */
-		rev = rbit9(code, len);
+		/* codes appear bit-reversed in the accumulator; rbit9() is only
+		 * guaranteed up to 9 bits.
+		 */
+		if (len <= 9)
+			rev = rbit9(code, len);
+		else
+			for (rev = 0, step = 0; step < len; step++)
+				rev |= ((code >> step) & 1) << (len - 1 - step);
 		step = 1U << len;
 		for (; rev < (1U << tbits); rev += step)
 			table[rev] = (i << 7) | len;
