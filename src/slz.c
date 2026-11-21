@@ -110,10 +110,20 @@ static uint32_t text_dist_table[32768];
 # define SLZ_LITERAL_SKIP 1
 #endif
 
-/* Log2 of the size of the hash table used for the references table. */
+/* Log2 of the size of the hash table used for the references table, for levels
+ * 1 to 3. Level 4 may use a larger table to find more matches (14 bits: -0.33
+ * point, 15 bits: -0.46 point, for 4.4% extra CPU each). The table is already
+ * 64 kB which need to be initialized at each call so better keep L4 at the
+ * default size, but it's easy to change it with a -DSLZ_HASH_BITS_L4 just for
+ * this compression level.
+ */
 #ifndef SLZ_HASH_BITS
 # define SLZ_HASH_BITS 13
 #endif
+#ifndef SLZ_HASH_BITS_L4
+# define SLZ_HASH_BITS_L4 SLZ_HASH_BITS
+#endif
+#define SLZ_HASH_BITS_MAX (SLZ_HASH_BITS > SLZ_HASH_BITS_L4 ? SLZ_HASH_BITS : SLZ_HASH_BITS_L4)
 
 /* First, RFC1951-specific declarations and extracts from the RFC.
  *
@@ -285,12 +295,6 @@ uint32_t slz_hash_bits(uint32_t a, const int bits)
 	a = ((a << 19) + (a << 6) - a);
 #endif
 	return a >> (32 - bits);
-}
-
-/* the hash of the main encoder's reference table, on SLZ_HASH_BITS bits */
-static inline uint32_t slz_hash(uint32_t a)
-{
-	return slz_hash_bits(a, SLZ_HASH_BITS);
 }
 
 /* This function compares buffers <a> and <b> and reads 32 or 64 bits at a time
@@ -937,11 +941,11 @@ static void reset_refs(union ref *refs, long count)
 	memset(refs, 0xFE, count);
 }
 
-/* Inserts position <p> of input buffer <in> into the reference table <refs>.
- * Reads the 4 bytes at in[p], so the caller must guarantee that in[p + 3] is
- * within the input buffer.
+/* Inserts position <p> of input buffer <in> into the reference table <refs>
+ * of <hbits> bits. Reads the 4 bytes at in[p], so the caller must guarantee
+ * that in[p + 3] is within the input buffer.
  */
-static inline void insert_ref(union ref *refs, const unsigned char *in, unsigned long p)
+static inline void insert_ref(union ref *refs, const unsigned char *in, unsigned long p, const int hbits)
 {
 #ifdef UNALIGNED_LE_OK
 	uint32_t w = *(uint32_t *)&in[p];
@@ -949,7 +953,7 @@ static inline void insert_ref(union ref *refs, const unsigned char *in, unsigned
 	uint32_t w = ((uint32_t)in[p]) | ((uint32_t)in[p + 1] << 8) |
 	             ((uint32_t)in[p + 2] << 16) | ((uint32_t)in[p + 3] << 24);
 #endif
-	uint32_t h = slz_hash(w);
+	uint32_t h = slz_hash_bits(w, hbits);
 
 	if (sizeof(long) >= 8)
 		refs[h].by64 = ((uint64_t)p) + ((uint64_t)w << 32);
@@ -1254,7 +1258,7 @@ long backward_match(const unsigned char *in, unsigned long pos, const unsigned c
  * All three must be constants. Each tree has its own part below.
  */
 static inline __attribute__((always_inline))
-long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more, int level, int bmatch, int auto_tree)
+long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more, int level, int bmatch, int auto_tree, const int hbits)
 {
 	long rem = ilen;
 	unsigned long pos = 0;
@@ -1267,7 +1271,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 
 	uint32_t plit = 0;
 	uint32_t dist, code;
-	union ref refs[1 << SLZ_HASH_BITS];
+	union ref refs[1 << SLZ_HASH_BITS_MAX]; /* only 1 << hbits are used */
 
 	if (__builtin_expect(!strm->level, 0)) {
 		/* force to send as literals (eg to preserve CPU) */
@@ -1277,7 +1281,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 		goto leave;
 	}
 
-	reset_refs(refs, sizeof(refs));
+	reset_refs(refs, sizeof(refs[0]) << hbits);
 	strm->outbuf = out;
 
 	if (auto_tree) {
@@ -1327,7 +1331,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 #else
 			word = *(uint32_t *)&in[pos];
 #endif
-			h = slz_hash(word);
+			h = slz_hash_bits(word, hbits);
 			asm volatile ("" ::); // prevent gcc from trying to be smart with the prefetch
 
 			if (sizeof(long) >= 8) {
@@ -1396,7 +1400,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 						skip &= 63;
 						do {
 							uint32_t w = read_le32(in + pos + 60);
-							uint32_t hw = slz_hash(w);
+							uint32_t hw = slz_hash_bits(w, hbits);
 
 							if (sizeof(long) >= 8) {
 								uint64_t old = refs[hw].by64;
@@ -1457,7 +1461,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 						skip &= 63;
 						do {
 							uint32_t w = read_le32(in + pos + 60);
-							uint32_t hw = slz_hash(w);
+							uint32_t hw = slz_hash_bits(w, hbits);
 
 							if (sizeof(long) >= 8) {
 								uint64_t old = refs[hw].by64;
@@ -1743,9 +1747,9 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 			 * that a similar sequence will be a hit next time. We only
 			 * need 4 remaining bytes starting from the current one.
 			 */
-			insert_ref(refs, in, pos - mlen + 3);
-			insert_ref(refs, in, pos - mlen + 2);
-			insert_ref(refs, in, pos - mlen + 1);
+			insert_ref(refs, in, pos - mlen + 3, hbits);
+			insert_ref(refs, in, pos - mlen + 2, hbits);
+			insert_ref(refs, in, pos - mlen + 1, hbits);
 #endif // SLZ_INSERT_SKIPPED
 
 #ifndef UNALIGNED_FASTER
@@ -1825,7 +1829,7 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 #else
 			word = *(uint32_t *)&in[pos];
 #endif
-			h = slz_hash(word);
+			h = slz_hash_bits(word, hbits);
 			asm volatile ("" ::); // prevent gcc from trying to be smart with the prefetch
 
 			if (sizeof(long) >= 8) {
@@ -2049,9 +2053,9 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
 #if SLZ_INSERT_SKIPPED
 			if (rem < 4)
 				break;
-			insert_ref(refs, in, pos - mlen + 3);
-			insert_ref(refs, in, pos - mlen + 2);
-			insert_ref(refs, in, pos - mlen + 1);
+			insert_ref(refs, in, pos - mlen + 3, hbits);
+			insert_ref(refs, in, pos - mlen + 2, hbits);
+			insert_ref(refs, in, pos - mlen + 1, hbits);
 #endif // SLZ_INSERT_SKIPPED
 
 #ifndef UNALIGNED_FASTER
@@ -2164,36 +2168,39 @@ long _slz_rfc1951_encode(struct slz_stream *__restrict strm, unsigned char *out,
  * increase they cause, and tend to result in higher compression speed due to
  * the savings on encoding. At compression level 4, 8 bytes save 0.03% over 2
  * on silesia for 0.5% of speed.
+ * Its <hbits> argument is the size of the reference table in bits, which
+ * must be a constant (SLZ_HASH_BITS or SLZ_HASH_BITS_L4).
  * The compression levels are made of:
  *   level 1: encoder level 1, 1-byte backward match, fixed tree only;
  *   level 2: encoder level 1, 1-byte backward match, automatic tree (see
  *            SLZ_AUTO_IN);
  *   level 3: encoder level 2, 1-byte backward match, automatic tree;
- *   level 4: encoder level 3, 8-byte backward match, automatic tree.
+ *   level 4: encoder level 3, 8-byte backward match, automatic tree, table
+ *            of SLZ_HASH_BITS_L4 bits.
  * The text tree's part is the same at all levels (2-byte backward match).
  */
 static __attribute__((noinline))
 long _slz_rfc1951_encode_lev1(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
 {
-	return _slz_rfc1951_encode(strm, out, in, ilen, more, 1, 1, 0);
+	return _slz_rfc1951_encode(strm, out, in, ilen, more, 1, 1, 0, SLZ_HASH_BITS);
 }
 
 static __attribute__((noinline))
 long _slz_rfc1951_encode_lev2(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
 {
-	return _slz_rfc1951_encode(strm, out, in, ilen, more, 1, 1, 1);
+	return _slz_rfc1951_encode(strm, out, in, ilen, more, 1, 1, 1, SLZ_HASH_BITS);
 }
 
 static __attribute__((noinline))
 long _slz_rfc1951_encode_lev3(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
 {
-	return _slz_rfc1951_encode(strm, out, in, ilen, more, 2, 1, 1);
+	return _slz_rfc1951_encode(strm, out, in, ilen, more, 2, 1, 1, SLZ_HASH_BITS);
 }
 
 static __attribute__((noinline))
 long _slz_rfc1951_encode_lev4(struct slz_stream *__restrict strm, unsigned char *out, const unsigned char *in, long ilen, int more)
 {
-	return _slz_rfc1951_encode(strm, out, in, ilen, more, 3, 8, 1);
+	return _slz_rfc1951_encode(strm, out, in, ilen, more, 3, 8, 1, SLZ_HASH_BITS_L4);
 }
 
 /* Event encoder, used with SLZ_CT_EVENT: streams made of small events flushed
