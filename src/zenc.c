@@ -68,37 +68,53 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 #ifdef SLZ_VERSION
 	    " version " SLZ_VERSION
 #endif
+#if defined(SLZ_DEV_BUILD) && defined(SLZ_BUILD)
+	    " (" SLZ_BUILD " build)"
+#endif
 	    "\nUsage: %s [option]* [file]*\n"
 	    "\n"
 	    "Compresses each <file> in place: the output goes to <file> followed by the\n"
 	    "format's extension (.gz, .zz or .dfl), which receives <file>'s mode and\n"
-	    "times, and <file> is then removed. Without <file>, or with -c, the output\n"
-	    "goes to stdout. A <file> named \"-\" is stdin.\n"
+	    "times, and <file> is then removed. With -d, decompresses each <file> to\n"
+	    "<file> without its extension, whichever it is.\n"
+	    "Without <file>, or with -c, the output goes to stdout. A <file> named \"-\"\n"
+	    "is stdin.\n"
 	    "\n"
 	    "The following arguments are supported :\n"
 	    "  -0         disable compression, only uses output format\n"
 	    "  -1..9      compression level (1=fastest, 4 and above=best); default=2\n"
-	    "  -K <size>  block size, in kB or with a b/k/m/g suffix (default: 4096)\n"
+	    "  -K <size>  block size, in kB or with a b/k/m/g suffix (default: 4096); with\n"
+	    "             -d, output ring size (default and minimum: 32 kB)\n"
 	    "  -b <size>  only use <size> bytes from the input file (needs -c or -t)\n"
 	    "  -m         memory mode: read the input into a buffer of the block size\n"
 	    "             instead of mapping it (default when it cannot be mapped)\n"
 	    "  -c         send output to stdout, keep the files [default without file]\n"
+	    "  -d         decompress\n"
 	    "  -f         force sending output to a terminal, overwrite existing output\n"
 	    "             files, and compress symbolic links and files which already\n"
 	    "             have the extension\n"
 	    "  -h         display this help\n"
+#ifdef SLZ_DEV_BUILD
+	    "  -i <size>  with -d, read the input by chunks of <size>, in kB or with a\n"
+	    "             b/k/m suffix (default: 8 kB); for debugging only\n"
+#endif
 	    "  -k         keep the input files\n"
 	    "  -l <loops> loop <loops> times over the same file (test mode only)\n"
 	    "  -n         does nothing, just for gzip compatibility\n"
 	    "  -p         pre-heat: fault the input (mmap mode) and output buffers in\n"
 	    "             before compressing, and keep the input mapped between loops\n"
 	    "             (test mode only)\n"
-	    "  -t         test mode: do not emit anything\n"
+	    "  -t         test mode: do not emit anything; with -d, the exit status says\n"
+	    "             whether the inputs could be decompressed\n"
 	    "  -v         increase verbosity\n"
 	    "\n"
-	    "  -D         use raw Deflate output format (RFC1951) -> .dfl\n"
-	    "  -G         use Gzip output format (RFC1952) [default] -> .gz\n"
-	    "  -Z         use Zlib output format (RFC1950) -> .zz\n"
+	    "  -D         use raw Deflate format (RFC1951) -> .dfl\n"
+	    "  -G         use Gzip format (RFC1952) [default] -> .gz\n"
+	    "  -Z         use Zlib format (RFC1950) -> .zz\n"
+	    "\n"
+	    "When decompressing, the format is detected from the stream's header unless one\n"
+	    "of -D/-G/-Z is set, or the file's extension is .dfl (raw Deflate cannot be\n"
+	    "detected).\n"
 	    "\n"
 	    ,name);
 }
@@ -115,6 +131,8 @@ static int verbose = 0;
 static int test    = 0;
 static int format  = SLZ_FMT_GZIP;
 
+static int fmt_forced = 0;     /* -D, -G or -Z was set */
+static int decompress = 0;     /* -d */
 static int force   = 0;
 static int keep    = 0;
 static int to_stdout = 0;
@@ -126,6 +144,39 @@ static const char *volatile cur_output;
 /* the output buffer, shared by all inputs */
 static unsigned char *outbuf;
 static size_t outbsize;
+
+/* decompression: the output ring (at least 32 kB, see uslz_init()), and
+ * the input buffer, read by chunks of <in_size> bytes (-i in development
+ * builds).
+ */
+#define DEC_MIN_RING 32768
+#define DEC_IN_SIZE  8192
+static unsigned char *ring;
+static long ring_size = DEC_MIN_RING;
+static unsigned char *inbuf;
+static long in_size = DEC_IN_SIZE;
+
+/* the options only offered by development builds (see BUILD in the
+ * Makefile), appended to getopt()'s list.
+ */
+#ifdef SLZ_DEV_BUILD
+#define DEV_OPTS "i:"
+#else
+#define DEV_OPTS ""
+#endif
+
+/* the extensions of the formats. Raw deflate cannot be detected, so it is
+ * the only one that an extension imposes when decompressing, the other
+ * ones are detected from the stream's header.
+ */
+static const struct {
+	const char *ext;
+	int fmt;
+} exts[] = {
+	{ ".gz",   SLZ_FMT_GZIP    },
+	{ ".zz",   SLZ_FMT_ZLIB    },
+	{ ".dfl",  SLZ_FMT_DEFLATE },
+};
 
 /* Parses size <str>, in kB by default, or in the unit of its suffix: "b"
  * for bytes, "k" for kB, "m" for MB, in lower or upper case. Returns the
@@ -174,6 +225,55 @@ static int write_all(int fd, const unsigned char *buf, size_t len)
 		len -= ret;
 	}
 	return 0;
+}
+
+/* returns the index in exts[] of the extension <name> ends with, or -1 */
+static int find_ext(const char *name)
+{
+	size_t nlen = strlen(name);
+	int i;
+
+	for (i = 0; i < sizeof(exts) / sizeof(exts[0]); i++) {
+		size_t elen = strlen(exts[i].ext);
+
+		if (nlen > elen && strcmp(name + nlen - elen, exts[i].ext) == 0)
+			return i;
+	}
+	return -1;
+}
+
+/* returns the length of the extension of <name>, its dot included, or 0 if
+ * it has none. The extension is what follows the last dot of the last path
+ * component, which must neither be its first character (hidden files) nor
+ * its last one.
+ */
+static size_t ext_len(const char *name)
+{
+	const char *base = strrchr(name, '/');
+	const char *dot;
+
+	base = base ? base + 1 : name;
+	dot = strrchr(base, '.');
+	if (!dot || dot == base || !dot[1])
+		return 0;
+	return strlen(dot);
+}
+
+/* returns the format to decompress <name> (NULL for stdin) with, or -1 to
+ * detect it from the stream. -D, -G and -Z come first, then the .dfl
+ * extension since raw deflate cannot be detected, and the stream must not
+ * be taken for gzip or zlib when its name says it is raw deflate.
+ */
+static int dec_format(const char *name)
+{
+	int i;
+
+	if (fmt_forced)
+		return format;
+	i = name ? find_ext(name) : -1;
+	if (i >= 0 && exts[i].fmt == SLZ_FMT_DEFLATE)
+		return SLZ_FMT_DEFLATE;
+	return -1;
 }
 
 /* removes the partial output file on SIGINT/SIGTERM/SIGHUP, then dies from
@@ -432,15 +532,156 @@ static int compress_fd(int fd, int ofd, const char *name)
 	return error;
 }
 
-/* Compresses file <name> in place: to <name> followed by the extension of
- * the format, which receives <name>'s mode, owner and times, then removes
- * <name> unless -k is set. The output is only created once the input could
- * be opened, and an existing output is only removed with -f. On error, the
- * output is removed and the input kept. Returns 0 on success, non-zero on
- * error.
+/* Decompresses the input read from <fd> to <ofd> following the options
+ * above, in format <fmt> (SLZ_FMT_*, or -1 to detect it). <name> is the
+ * input's name for the messages, NULL for stdin. Returns 0 on success,
+ * non-zero on error, including a truncated or corrupted input.
  */
-static int compress_file(const char *name)
+static int decompress_fd(int fd, int ofd, const char *name, int fmt)
 {
+	struct uslz_stream state;
+	struct timeval tv_beg, tv_end;
+	unsigned long long timed_out = 0;
+	unsigned long long decoded_total = 0;
+	unsigned long long tot_in = 0;
+	int timed_round;        /* index of the pass the measurement starts on */
+	int round = 0;          /* index of the pass being run */
+	int passes = loops;
+	int ret;
+
+	if (passes > 1 && lseek(fd, 0, SEEK_SET) == (off_t)-1) {
+		fprintf(stderr, "%s: %s: input is not seekable, cannot loop\n", progname, name ? name : "stdin");
+		return 1;
+	}
+
+	/* When looping, the first pass is not measured: it is the one that
+	 * faults the input in and warms the caches, and counting it would
+	 * report the cost of the I/O rather than that of the decompression.
+	 * A single pass is measured as-is, there is nothing else to report.
+	 */
+	timed_round = (passes > 1);
+	gettimeofday(&tv_beg, NULL); /* in case no pass runs at all, eg -l 0 */
+
+	while (passes--) {
+		int complete = 0;
+		int done = 0;
+
+		if (round == timed_round) {
+			timed_out = decoded_total;
+			gettimeofday(&tv_beg, NULL);
+		}
+
+		if (round)
+			lseek(fd, 0, SEEK_SET);
+
+		if (fmt < 0)
+			ret = uslz_init(&state, ring, ring_size);
+		else
+			ret = uslz_init_fmt(&state, ring, ring_size, fmt);
+
+		if (!ret) {
+			fprintf(stderr, "%s: failed to init uslz state\n", progname);
+			return 1;
+		}
+
+		while (!done) {
+			unsigned char *input;
+			unsigned char *decoded;
+			long decoded_len;
+			long consumed;
+			enum uslz_decode_ret decode_ret;
+			long rret;
+
+			rret = read(fd, inbuf, in_size);
+			if (rret <= 0) {
+				if (rret < 0) {
+					if (errno == EINTR)
+						continue;
+					report(name, "read");
+					return 1;
+				}
+				if (!complete) {
+					fprintf(stderr, "%s: %s: truncated stream\n", progname, name ? name : "stdin");
+					return 1;
+				}
+				/* a complete stream followed by end of file:
+				 * there simply was no other member.
+				 */
+				break;
+			}
+			input = inbuf;
+ redo:
+			decode_ret = uslz_decode(&state, input, rret, &decoded,
+			                         &decoded_len, &consumed, NULL);
+			switch (decode_ret) {
+			case USLZ_DECODE_SUCCESS:
+			case USLZ_DECODE_OUT_OF_SPACE:
+			case USLZ_DECODE_OUT_OF_DATA:
+				decoded_total += decoded_len;
+				tot_in += consumed;
+
+				if (!test && decoded_len && write_all(ofd, decoded, decoded_len) < 0) {
+					report(name, "write");
+					return 1;
+				}
+
+				input += consumed;
+				rret -= consumed;
+
+				/* A gzip stream may be a series of members, so
+				 * keep feeding rather than stopping on the
+				 * first success. Only end of file tells us
+				 * there is no other member; stopping here on
+				 * an exhausted buffer would silently ignore
+				 * every remaining member whenever one ends on
+				 * a read boundary.
+				 */
+				complete = (decode_ret == USLZ_DECODE_SUCCESS);
+				if (complete && !rret)
+					continue;
+				else if (decode_ret != USLZ_DECODE_OUT_OF_DATA)
+					goto redo;
+				break;
+			default:
+				fprintf(stderr, "%s: %s: invalid stream (error %d)\n", progname, name ? name : "stdin", decode_ret);
+				return 1;
+			}
+		}
+		round++;
+	}
+	gettimeofday(&tv_end, NULL);
+
+	if (verbose) {
+		/* <timed_out> holds the output already produced when the clock
+		 * was started, so the difference is what the measured passes
+		 * went through. MB/s are decimal megabytes per second.
+		 */
+		double sec = (tv_end.tv_sec  - tv_beg.tv_sec) +
+		             (tv_end.tv_usec - tv_beg.tv_usec) / 1000000.0;
+		unsigned long long done = decoded_total - timed_out;
+
+		if (name)
+			fprintf(stderr, "%s: ", name);
+		fprintf(stderr, "totin=%llu totout=%llu ratio=%.2f%% time=%.3fs %.1fMB/s\n",
+		        tot_in, decoded_total, decoded_total * 100.0 / tot_in,
+		        sec, sec > 0.0 ? done / sec / 1000000.0 : 0.0);
+	}
+	return 0;
+}
+
+/* Compresses or decompresses file <name> in place. When compressing, the
+ * output is <name> followed by the extension of the format. When
+ * decompressing, the output is <name> without its extension, whichever it
+ * is, the format being chosen by dec_format(); a name without extension is
+ * refused since there is no name for the output. The output receives <name>'s mode, owner and times,
+ * then <name> is removed unless -k is set. The output is only created once
+ * the input could be opened, and an existing output is only removed with
+ * -f. On error, the output is removed and the input kept. Returns 0 on
+ * success, non-zero on error.
+ */
+static int process_file(const char *name)
+{
+	const char *verb = decompress ? "decompress" : "compress";
 	const char *ext = format == SLZ_FMT_GZIP ? ".gz" : format == SLZ_FMT_ZLIB ? ".zz" : ".dfl";
 	size_t nlen = strlen(name), elen = strlen(ext);
 	struct timespec times[2];
@@ -450,11 +691,18 @@ static int compress_file(const char *name)
 	int err = 1;
 
 	if (lstat(name, &st) == 0 && S_ISLNK(st.st_mode) && !force) {
-		fprintf(stderr, "%s: %s is a symbolic link, use -f to compress it\n", progname, name);
+		fprintf(stderr, "%s: %s is a symbolic link, use -f to %s it\n", progname, name, verb);
 		return 1;
 	}
 
-	if (nlen > elen && strcmp(name + nlen - elen, ext) == 0 && !force) {
+	if (decompress) {
+		elen = ext_len(name);
+		if (!elen) {
+			fprintf(stderr, "%s: %s has no extension, not decompressing it in place, use -c\n", progname, name);
+			return 1;
+		}
+	}
+	else if (nlen > elen && strcmp(name + nlen - elen, ext) == 0 && !force) {
 		fprintf(stderr, "%s: %s already has the %s extension, use -f to compress it\n", progname, name, ext);
 		return 1;
 	}
@@ -480,8 +728,14 @@ static int compress_file(const char *name)
 		report(name, "malloc");
 		goto close_in;
 	}
-	memcpy(out, name, nlen);
-	memcpy(out + nlen, ext, elen + 1);
+	if (decompress) {
+		memcpy(out, name, nlen - elen);
+		out[nlen - elen] = 0;
+	}
+	else {
+		memcpy(out, name, nlen);
+		memcpy(out + nlen, ext, elen + 1);
+	}
 
 	/* only readable by us until it is complete */
 	cur_output = out;
@@ -504,7 +758,8 @@ static int compress_file(const char *name)
 		goto free_out;
 	}
 
-	if (compress_fd(fd, ofd, name) != 0)
+	if ((decompress ? decompress_fd(fd, ofd, name, dec_format(name)) :
+	     compress_fd(fd, ofd, name)) != 0)
 		goto remove_out;
 
 	/* the owner first, since changing it may clear the mode's setuid
@@ -559,7 +814,7 @@ int main(int argc, char **argv)
 	 * is thus a single digit, which is enough since the levels above 4
 	 * work as level 4.
 	 */
-	while ((opt = getopt(argc, argv, "0123456789b:cfhkK:l:mnptvDGZ")) != -1) {
+	while ((opt = getopt(argc, argv, "0123456789b:cdfhkK:l:mnptvDGZ" DEV_OPTS)) != -1) {
 		switch (opt) {
 		case '0': case '1': case '2': case '3': case '4':
 		case '5': case '6': case '7': case '8': case '9':
@@ -572,15 +827,28 @@ int main(int argc, char **argv)
 			block_size = parse_size(optarg);
 			if (!block_size)
 				usage(name, 1);
+			ring_size = block_size;
+			if (ring_size < DEC_MIN_RING)
+				ring_size = DEC_MIN_RING;
 			break;
 		case 'c':
 			to_stdout = 1;
+			break;
+		case 'd':
+			decompress = 1;
 			break;
 		case 'f':
 			force = 1;
 			break;
 		case 'h':
 			usage(name, 0);
+#ifdef SLZ_DEV_BUILD
+		case 'i':
+			in_size = parse_size(optarg);
+			if (in_size <= 0)
+				usage(name, 1);
+			break;
+#endif
 		case 'k':
 			keep = 1;
 			break;
@@ -604,12 +872,15 @@ int main(int argc, char **argv)
 			break;
 		case 'D':
 			format = SLZ_FMT_DEFLATE;
+			fmt_forced = 1;
 			break;
 		case 'G':
 			format = SLZ_FMT_GZIP;
+			fmt_forced = 1;
 			break;
 		case 'Z':
 			format = SLZ_FMT_ZLIB;
+			fmt_forced = 1;
 			break;
 		default:
 			usage(name, 1);
@@ -639,21 +910,34 @@ int main(int argc, char **argv)
 	if (preheat && !test)
 		die(1, "-p is only supported in test mode (-t).\n");
 
+	if (in_size != DEC_IN_SIZE && !decompress)
+		die(1, "-i is only supported with -d.\n");
+
 	/* -b would remove the end of the input files */
 	if (max_read >= 0 && !to_stdout && !test)
 		die(1, "-b is only supported with -c or -t.\n");
 
-	if ((to_stdout || uses_stdout) && isatty(1) && !test && !force)
+	if (!decompress && (to_stdout || uses_stdout) && isatty(1) && !test && !force)
 		die(1, "Use -f if you really want to send compressed data to a terminal, or -h for help.\n");
 
 	slz_make_crc_table();
 	slz_prepare_dist_table();
 
-	outbsize = 2 * block_size; // allows to pack more than one full output at each round
-	outbuf = calloc(1, outbsize + 4096);
-	if (!outbuf) {
-		perror("calloc");
-		exit(1);
+	if (decompress) {
+		ring = malloc(ring_size);
+		inbuf = malloc(in_size);
+		if (!ring || !inbuf) {
+			perror("malloc");
+			exit(1);
+		}
+	}
+	else {
+		outbsize = 2 * block_size; // allows to pack more than one full output at each round
+		outbuf = calloc(1, outbsize + 4096);
+		if (!outbuf) {
+			perror("calloc");
+			exit(1);
+		}
 	}
 
 	/* try to increase output pipe size to avoid blocking on writes */
@@ -669,7 +953,8 @@ int main(int argc, char **argv)
 #endif
 
 	if (!argc)
-		return compress_fd(0, 1, NULL) != 0;
+		return (decompress ? decompress_fd(0, 1, NULL, dec_format(NULL)) :
+		        compress_fd(0, 1, NULL)) != 0;
 
 	signal(SIGINT, interrupted);
 	signal(SIGTERM, interrupted);
@@ -679,7 +964,8 @@ int main(int argc, char **argv)
 		int fd;
 
 		if (strcmp(*argv, "-") == 0)
-			error |= compress_fd(0, 1, NULL) != 0;
+			error |= (decompress ? decompress_fd(0, 1, NULL, dec_format(NULL)) :
+			          compress_fd(0, 1, NULL)) != 0;
 		else if (to_stdout || test) {
 			fd = open(*argv, O_RDONLY);
 			if (fd < 0) {
@@ -687,11 +973,12 @@ int main(int argc, char **argv)
 				error = 1;
 				continue;
 			}
-			error |= compress_fd(fd, 1, *argv) != 0;
+			error |= (decompress ? decompress_fd(fd, 1, *argv, dec_format(*argv)) :
+			          compress_fd(fd, 1, *argv)) != 0;
 			close(fd);
 		}
 		else
-			error |= compress_file(*argv);
+			error |= process_file(*argv);
 	}
 	return error;
 }

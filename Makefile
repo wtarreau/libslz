@@ -76,7 +76,7 @@ zdecode: src/zdecode.o
 zdec: src/zdec.o src/slz_common.o src/uslz.o
 	$(LD) $(LDFLAGS) -o $@ $^
 
-zenc: src/zenc.o src/slz_common.o src/slz.o
+zenc: src/zenc.o src/slz_common.o src/slz.o src/uslz.o
 	$(LD) $(LDFLAGS) -o $@ $^
 
 $(STATIC): src/slz_common.o src/slz.o src/uslz.o
