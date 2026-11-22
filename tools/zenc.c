@@ -38,8 +38,8 @@
 #include <sys/user.h>
 #include <fcntl.h>
 #include <signal.h>
-#include "slz.h"
-#include "slz-prv.h"
+#include "../src/slz.h"
+#include "../src/slz-prv.h"
 #if defined(__linux__)
 #include <linux/fs.h>
 #endif

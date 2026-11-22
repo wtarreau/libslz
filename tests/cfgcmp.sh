@@ -38,7 +38,7 @@ for cfg in "$@"; do
 		pad=$((p * 16 + 1))
 		echo "__asm__(\".pushsection .text\\n.space $pad\\n.popsection\");" > "$S/pad.c"
 		gcc $CF -c -o "$S/pad.o" "$S/pad.c" || exit 1
-		gcc $CF $cfg -o "$S/z.$n.$p" "$S/pad.o" src/zenc.c src/slz.c \
+		gcc $CF $cfg -o "$S/z.$n.$p" "$S/pad.o" tools/zenc.c src/slz.c \
 		    src/slz_common.c src/uslz.c || exit 1
 	done
 	n=$((n + 1))

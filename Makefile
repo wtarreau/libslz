@@ -70,10 +70,10 @@ shared: $(SHARED)
 
 tools: $(BINS)
 
-zdecode: src/zdecode.o
+zdecode: tools/zdecode.o
 	$(LD) $(LDFLAGS) -o $@ $^
 
-slz: src/zenc.o src/slz_common.o src/slz.o src/uslz.o
+slz: tools/zenc.o src/slz_common.o src/slz.o src/uslz.o
 	$(LD) $(LDFLAGS) -o $@ $^
 
 zenc zdec: slz

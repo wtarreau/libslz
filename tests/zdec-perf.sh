@@ -111,7 +111,8 @@ echo "# repeats : best of $REPEAT run(s) of 'zdec -t -v -l 3' (or 'slz -d -t -v 
 echo
 
 # build <srcdir> <outfile> <extra cflags...>
-# Trees which still have zdec use it, later ones use slz -d, built from zenc.c (see DECOPT).
+# Trees which still have zdec use it, later ones use slz -d, built from zenc.c
+# (see DECOPT), which moved from src/ to tools/.
 build() {
 	local d=$1 out=$2; shift 2
 	if [ -f "$d/src/zdec.c" ]; then
@@ -120,8 +121,10 @@ build() {
 		    -o "$out" "$d/src/zdec.c" "$d/src/slz_common.c" "$d/src/uslz.c" 2>"$tmp/cc.log"
 	else
 		DECOPT=-d
+		local drv="$d/tools/zenc.c"
+		[ -f "$drv" ] || drv="$d/src/zenc.c"
 		$CC $CFLAGS "$@" -I"$d/src" -DSLZ_VERSION='"zdec-perf"' \
-		    -o "$out" "$d/src/zenc.c" "$d/src/slz.c" "$d/src/slz_common.c" "$d/src/uslz.c" 2>"$tmp/cc.log"
+		    -o "$out" "$drv" "$d/src/slz.c" "$d/src/slz_common.c" "$d/src/uslz.c" 2>"$tmp/cc.log"
 	fi
 }
 

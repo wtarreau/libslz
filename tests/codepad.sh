@@ -28,7 +28,7 @@ for p in $(seq 0 $((PADS - 1))); do
 	gcc $CF -c -o "$S/pad.o" "$S/pad.c" || exit 1
 	for v in a b; do
 		gcc $CF -DSLZ_VERSION='"test"' -c -o "$S/uslz_$v.o" "$S/uslz_$v.c" || exit 1
-		gcc $CF -o "$S/zdec_${v}_$p" "$S/pad.o" src/zenc.c src/slz.c \
+		gcc $CF -o "$S/zdec_${v}_$p" "$S/pad.o" tools/zenc.c src/slz.c \
 		    src/slz_common.c "$S/uslz_$v.o" || exit 1
 	done
 done
