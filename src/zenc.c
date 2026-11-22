@@ -74,7 +74,8 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    "  -1..9      compression level (1=fastest, 4 and above=best); default=2\n"
 	    "  -K <size>  block size, in kB or with a b/k/m/g suffix (default: 4096)\n"
 	    "  -b <size>  only use <size> bytes from the input file\n"
-	    "  -B         use buffered mode instead of mmap (uses less memory)\n"
+	    "  -m         memory mode: read the input into a buffer of the block size\n"
+	    "             instead of mapping it (default when it cannot be mapped)\n"
 	    "  -c         send output to stdout [default]\n"
 	    "  -f         force sending output to a terminal\n"
 	    "  -h         display this help\n"
@@ -157,7 +158,7 @@ int main(int argc, char **argv)
 	 * is thus a single digit, which is enough since the levels above 4
 	 * work as level 4.
 	 */
-	while ((opt = getopt(argc, argv, "0123456789b:cfhK:l:nBptvDGZ")) != -1) {
+	while ((opt = getopt(argc, argv, "0123456789b:cfhK:l:mnptvDGZ")) != -1) {
 		switch (opt) {
 		case '0': case '1': case '2': case '3': case '4':
 		case '5': case '6': case '7': case '8': case '9':
@@ -185,7 +186,7 @@ int main(int argc, char **argv)
 		case 'n':
 			/* just for gzip compatibility */
 			break;
-		case 'B':
+		case 'm':
 			buffer_mode = 1;
 			break;
 		case 'p':
@@ -389,10 +390,11 @@ int main(int argc, char **argv)
 				start = buffer + ofs;
 			}
 			else {
-				/* we'll try to fill at least half a buffer with
-				 * input data, it ensures we compress reasonably
-				 * well without having to wait too much for the
-				 * sender when it's a pipe.
+				/* fill the whole block before compressing it,
+				 * even from a pipe which delivers small reads:
+				 * compressing partial blocks loses ratio and
+				 * speed for no benefit, nobody waits for each
+				 * block here.
 				 */
 				ssize_t ret;
 				tocompress = 0;
@@ -407,7 +409,7 @@ int main(int argc, char **argv)
 						break;
 					}
 					tocompress += ret;
-				} while (tocompress < block_size / 3);
+				} while (tocompress < (more ? block_size : toread - ofs));
 
 				if (!tocompress) // done
 					break;
