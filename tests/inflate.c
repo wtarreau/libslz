@@ -34,7 +34,7 @@
  *
  * Note that this only checks the size bound. A fix for it can easily cost
  * compression ratio instead, which this test cannot see, so the ratio must be
- * verified separately on a real corpus, e.g. "zenc -t -v < silesia.tar".
+ * verified separately on a real corpus, e.g. "slz -t -v < silesia.tar".
  *
  * Usage: inflate [runs]
  *   0 (default) tests everything, otherwise only the crafted pattern is

@@ -35,7 +35,7 @@ LDFLAGS    := $(DEB_LFLAGS) $(USR_LFLAGS) $(LIB_LFLAGS)
 
 AR         := $(CROSS_COMPILE)ar
 STRIP      := $(CROSS_COMPILE)strip
-BINS       := zdecode zenc
+BINS       := zdecode slz
 STATIC     := libslz.a
 ifneq ($(filter darwin%, $(PLATFORM)),)
 	SHARED := libslz.dylib
@@ -73,7 +73,7 @@ tools: $(BINS)
 zdecode: src/zdecode.o
 	$(LD) $(LDFLAGS) -o $@ $^
 
-zenc: src/zenc.o src/slz_common.o src/slz.o src/uslz.o
+slz: src/zenc.o src/slz_common.o src/slz.o src/uslz.o
 	$(LD) $(LDFLAGS) -o $@ $^
 
 $(STATIC): src/slz_common.o src/slz.o src/uslz.o
@@ -118,12 +118,12 @@ install-shared: shared
 	chmod 644 $(DESTDIR)$(LIBDIR)/$(SONAME)
 
 install-tools: tools
-	$(STRIP) zenc
+	$(STRIP) slz
 	[ -d "$(DESTDIR)$(PREFIX)/bin/." ] || mkdir -p -m 0755 $(DESTDIR)$(PREFIX)/bin
 	cp zdecode $(DESTDIR)$(PREFIX)/bin/zdecode
-	cp zenc $(DESTDIR)$(PREFIX)/bin/zenc
+	cp slz $(DESTDIR)$(PREFIX)/bin/slz
 	chmod 755 $(DESTDIR)$(PREFIX)/bin/zdecode
-	chmod 755 $(DESTDIR)$(PREFIX)/bin/zenc
+	chmod 755 $(DESTDIR)$(PREFIX)/bin/slz
 
 clean:
 	-rm -f $(BINS) $(OBJS) $(STATIC) $(SHARED) *.[oa] *.so *.so.* *.dylib *~ */*.[oa] */*~

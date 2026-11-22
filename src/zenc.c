@@ -64,7 +64,7 @@ __attribute__((noreturn)) void die(int code, const char *format, ...)
 __attribute__((noreturn)) void usage(const char *name, int code)
 {
 	die(code,
-	    "zenc"
+	    "slz"
 #ifdef SLZ_VERSION
 	    " version " SLZ_VERSION
 #endif

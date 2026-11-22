@@ -6,7 +6,7 @@
  * lengths. This tool has five modes:
  *
  *   mktext -c file.raw...      counts the symbols found in raw deflate
- *                              streams (e.g. "zenc -D"), and prints the
+ *                              streams (e.g. "slz -D"), and prints the
  *                              counts in the same format, one line per
  *                              alphabet.
  *
@@ -40,7 +40,7 @@
  *
  * Typical use, to train on a corpus then generate the tables:
  *
- *   for f in corpus/[*]; do zenc -D -1 < $f > $f.raw; done
+ *   for f in corpus/[*]; do slz -D -1 < $f > $f.raw; done
  *   mktext -c corpus/[*].raw > counts
  *   mktext -t -m 11 counts > tools/text-tree.txt
  *   mktext -g tools/text-tree.txt

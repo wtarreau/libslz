@@ -22,7 +22,7 @@
 #
 # Corpora, both expected to be silesia.tar compressed two ways (any file will
 # do, the numbers are only ever compared against each other):
-#   SLZ=/dev/shm/silesia.tslz   produced by zenc (fixed huffman)
+#   SLZ=/dev/shm/silesia.tslz   produced by slz (fixed huffman)
 #   GZ=/dev/shm/silesia.tgz     produced by gzip (dynamic huffman)
 #
 # Other knobs:
@@ -107,11 +107,11 @@ echo "# machine : $(uname -m) | $cpu"
 echo "# compiler: $($CC --version | head -1)"
 echo "# flags   : $CFLAGS"
 echo "# corpora : $SLZ ($(stat -c %s "$SLZ") B), $GZ ($(stat -c %s "$GZ") B)"
-echo "# repeats : best of $REPEAT run(s) of 'zdec -t -v -l 3' (or 'zenc -d -t -v -l 3') per configuration"
+echo "# repeats : best of $REPEAT run(s) of 'zdec -t -v -l 3' (or 'slz -d -t -v -l 3') per configuration"
 echo
 
 # build <srcdir> <outfile> <extra cflags...>
-# Trees which still have zdec use it, later ones use zenc -d (see DECOPT).
+# Trees which still have zdec use it, later ones use slz -d, built from zenc.c (see DECOPT).
 build() {
 	local d=$1 out=$2; shift 2
 	if [ -f "$d/src/zdec.c" ]; then

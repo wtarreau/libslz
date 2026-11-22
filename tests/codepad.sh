@@ -1,5 +1,5 @@
 #!/bin/bash
-# Paired A/B benchmark for two versions of src/uslz.c, using zenc -d.
+# Paired A/B benchmark for two versions of src/uslz.c, using slz -d.
 #
 # The point of this script is that a single build tells you almost nothing
 # here: shifting the code by a few bytes moves the decoding time of an
