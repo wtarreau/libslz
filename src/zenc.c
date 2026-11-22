@@ -70,7 +70,7 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    "\n"
 	    "The following arguments are supported :\n"
 	    "  -0         disable compression, only uses output format\n"
-	    "  -1..15     compression level (1=fastest, 15=best); default=2 (balanced)\n"
+	    "  -1..9      compression level (1=fastest, 4 and above=best); default=2\n"
 	    "  -k <size>  block size in kB (default: 4096)\n"
 	    "  -b <size>  only use <size> bytes from the input file\n"
 	    "  -B         use buffered mode instead of mmap (uses less memory)\n"
@@ -128,85 +128,70 @@ int main(int argc, char **argv)
 	int force   = 0;
 	int fd = 0;
 	int error = 0;
+	int opt;
 
-	argv++;
-	argc--;
-
-	while (argc > 0) {
-		if (**argv != '-')
+	/* digits are options too, like with gzip: "-c1" is "-c -1". A level
+	 * is thus a single digit, which is enough since the levels above 4
+	 * work as level 4.
+	 */
+	while ((opt = getopt(argc, argv, "0123456789b:k:cfhl:nBptTvDGZ")) != -1) {
+		switch (opt) {
+		case '0': case '1': case '2': case '3': case '4':
+		case '5': case '6': case '7': case '8': case '9':
+			level = opt - '0';
 			break;
-
-		if (argv[0][0] == '-' && argv[0][1] >= '0' && argv[0][1] <= '9')
-			level = atoi(argv[0] + 1);
-
-		else if (strcmp(argv[0], "-b") == 0) {
-			if (argc < 2)
-				usage(name, 1);
-			toread = strtoll(argv[1], NULL, 0);
-			argv++;
-			argc--;
-		}
-
-		else if (strcmp(argv[0], "-k") == 0) {
-			if (argc < 2)
-				usage(name, 1);
-			block_size = strtoll(argv[1], NULL, 0) * 1024;
+		case 'b':
+			toread = strtoll(optarg, NULL, 0);
+			break;
+		case 'k':
+			block_size = strtoll(optarg, NULL, 0) * 1024;
 			if (block_size < 1024)
 				block_size = 1024; // 1 kB min
-			argv++;
-			argc--;
-		}
-
-		else if (strcmp(argv[0], "-c") == 0)
+			break;
+		case 'c':
 			console = 1;
-
-		else if (strcmp(argv[0], "-f") == 0)
+			break;
+		case 'f':
 			force = 1;
-
-		else if (strcmp(argv[0], "-h") == 0)
+			break;
+		case 'h':
 			usage(name, 0);
-
-		else if (strcmp(argv[0], "-l") == 0) {
-			if (argc < 2)
-				usage(name, 1);
-			loops = atoi(argv[1]);
-			argv++;
-			argc--;
-		}
-
-		else if (strcmp(argv[0], "-n") == 0)
-			/* just for gzip compatibility */ ;
-
-		else if (strcmp(argv[0], "-B") == 0)
+		case 'l':
+			loops = atoi(optarg);
+			break;
+		case 'n':
+			/* just for gzip compatibility */
+			break;
+		case 'B':
 			buffer_mode = 1;
-
-		else if (strcmp(argv[0], "-p") == 0)
+			break;
+		case 'p':
 			preheat = 1;
-
-		else if (strcmp(argv[0], "-t") == 0)
+			break;
+		case 't':
 			test = 1;
-
-		else if (strcmp(argv[0], "-T") == 0)
+			break;
+		case 'T':
 			ctype = SLZ_CT_TEXT;
-
-		else if (strcmp(argv[0], "-v") == 0)
+			break;
+		case 'v':
 			verbose++;
-
-		else if (strcmp(argv[0], "-D") == 0)
+			break;
+		case 'D':
 			format = SLZ_FMT_DEFLATE;
-
-		else if (strcmp(argv[0], "-G") == 0)
+			break;
+		case 'G':
 			format = SLZ_FMT_GZIP;
-
-		else if (strcmp(argv[0], "-Z") == 0)
+			break;
+		case 'Z':
 			format = SLZ_FMT_ZLIB;
-
-		else
+			break;
+		default:
 			usage(name, 1);
-
-		argv++;
-		argc--;
+		}
 	}
+	argv += optind;
+	argc -= optind;
 
 	if (argc > 0) {
 		fd = open(argv[0], O_RDONLY);
