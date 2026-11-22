@@ -107,14 +107,22 @@ echo "# machine : $(uname -m) | $cpu"
 echo "# compiler: $($CC --version | head -1)"
 echo "# flags   : $CFLAGS"
 echo "# corpora : $SLZ ($(stat -c %s "$SLZ") B), $GZ ($(stat -c %s "$GZ") B)"
-echo "# repeats : best of $REPEAT run(s) of 'zdec -t -v -l 3' per configuration"
+echo "# repeats : best of $REPEAT run(s) of 'zdec -t -v -l 3' (or 'zenc -d -t -v -l 3') per configuration"
 echo
 
 # build <srcdir> <outfile> <extra cflags...>
+# Trees which still have zdec use it, later ones use zenc -d (see DECOPT).
 build() {
 	local d=$1 out=$2; shift 2
-	$CC $CFLAGS "$@" -I"$d/src" -DSLZ_VERSION='"zdec-perf"' \
-	    -o "$out" "$d/src/zdec.c" "$d/src/slz_common.c" "$d/src/uslz.c" 2>"$tmp/cc.log"
+	if [ -f "$d/src/zdec.c" ]; then
+		DECOPT=
+		$CC $CFLAGS "$@" -I"$d/src" -DSLZ_VERSION='"zdec-perf"' \
+		    -o "$out" "$d/src/zdec.c" "$d/src/slz_common.c" "$d/src/uslz.c" 2>"$tmp/cc.log"
+	else
+		DECOPT=-d
+		$CC $CFLAGS "$@" -I"$d/src" -DSLZ_VERSION='"zdec-perf"' \
+		    -o "$out" "$d/src/zenc.c" "$d/src/slz.c" "$d/src/slz_common.c" "$d/src/uslz.c" 2>"$tmp/cc.log"
+	fi
 }
 
 # one number out of zdec, or "-" if it would not run
@@ -122,7 +130,7 @@ speed() {
 	local bin=$1 f=$2 best= out=
 	local i=0
 	while [ $i -lt "$REPEAT" ]; do
-		out=$("$bin" -t -v -l 3 "$f" 2>&1 | sed -n 's/.* \([0-9.]*\)MB\/s.*/\1/p')
+		out=$("$bin" $DECOPT -t -v -l 3 "$f" 2>&1 | sed -n 's/.* \([0-9.]*\)MB\/s.*/\1/p')
 		[ -n "$out" ] || { echo "-"; return; }
 		best=${best:-$out}
 		# keep the highest of the repeats, the slow ones are interference

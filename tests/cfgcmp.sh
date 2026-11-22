@@ -38,8 +38,8 @@ for cfg in "$@"; do
 		pad=$((p * 16 + 1))
 		echo "__asm__(\".pushsection .text\\n.space $pad\\n.popsection\");" > "$S/pad.c"
 		gcc $CF -c -o "$S/pad.o" "$S/pad.c" || exit 1
-		gcc $CF $cfg -o "$S/z.$n.$p" "$S/pad.o" src/zdec.c src/slz_common.c \
-		    src/uslz.c || exit 1
+		gcc $CF $cfg -o "$S/z.$n.$p" "$S/pad.o" src/zenc.c src/slz.c \
+		    src/slz_common.c src/uslz.c || exit 1
 	done
 	n=$((n + 1))
 done
@@ -50,7 +50,7 @@ for f in ${CORPUS:-tests/silesia.tslz tests/silesia.tgz}; do
 	for r in $(seq $ROUNDS); do
 		for p in $(seq 0 $((PADS - 1))); do
 			for i in $(seq 0 $((n - 1))); do
-				t=$( { /usr/bin/time -f %e taskset -c 0 "$S/z.$i.$p" \
+				t=$( { /usr/bin/time -f %e taskset -c 0 "$S/z.$i.$p" -d \
 				       < "$f" > /dev/null; } 2>&1 | tail -1)
 				echo "$i $p $t" >> "$S/res"
 			done
