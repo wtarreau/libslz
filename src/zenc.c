@@ -97,6 +97,21 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 }
 
 
+/* options, shared by all inputs */
+static size_t block_size = 4194304;
+static off_t max_read = -1;     /* -b, or -1 for the whole input */
+static int buffer_opt = 0;      /* -m */
+static int preheat = 0;
+static int loops = 1;
+static int level   = 2;
+static int verbose = 0;
+static int test    = 0;
+static int format  = SLZ_FMT_GZIP;
+
+/* the output buffer, shared by all inputs */
+static unsigned char *outbuf;
+static size_t outbsize;
+
 /* Parses size <str>, in kB by default, or in the unit of its suffix: "b"
  * for bytes, "k" for kB, "m" for MB, in lower or upper case. Returns the
  * size in bytes, or 0 if <str> is not a valid size.
@@ -121,131 +136,28 @@ static unsigned long long parse_size(const char *str)
 	return *end ? 0 : size;
 }
 
-int main(int argc, char **argv)
+/* Compresses the input read from <fd> to <ofd> following the options above.
+ * Returns 0 on success, non-zero on error.
+ */
+static int compress_fd(int fd, int ofd)
 {
-	const char *name = argv[0];
 	struct stat statbuf;
 	struct slz_stream strm;
-	unsigned char *outbuf;
 	unsigned char *buffer;
-	off_t toread = -1;
+	off_t toread = max_read;
 	off_t tocompress = 0;
 	off_t ofs;
 	size_t outblen;
-	size_t outbsize;
-	size_t block_size = 4194304;
 	size_t mapsize = 0;
 	unsigned long long totin = 0;
 	unsigned long long totout = 0;
-	int buffer_mode = 0;
-	int preheat = 0;
-	int loops = 1;
+	int buffer_mode = buffer_opt;
+	int passes = loops;
 	int round = 0;          /* index of the pass being run */
 	int timed_round;        /* index of the pass the measurement starts on */
 	struct timeval tv_beg, tv_end;
 	unsigned long long timed_in = 0;
-	int console = 1;
-	int level   = 2;
-	int verbose = 0;
-	int test    = 0;
-	int format  = SLZ_FMT_GZIP;
-	int force   = 0;
-	int fd = 0;
 	int error = 0;
-	int opt;
-
-	/* digits are options too, like with gzip: "-c1" is "-c -1". A level
-	 * is thus a single digit, which is enough since the levels above 4
-	 * work as level 4.
-	 */
-	while ((opt = getopt(argc, argv, "0123456789b:cfhK:l:mnptvDGZ")) != -1) {
-		switch (opt) {
-		case '0': case '1': case '2': case '3': case '4':
-		case '5': case '6': case '7': case '8': case '9':
-			level = opt - '0';
-			break;
-		case 'b':
-			toread = strtoll(optarg, NULL, 0);
-			break;
-		case 'K':
-			block_size = parse_size(optarg);
-			if (!block_size)
-				usage(name, 1);
-			break;
-		case 'c':
-			console = 1;
-			break;
-		case 'f':
-			force = 1;
-			break;
-		case 'h':
-			usage(name, 0);
-		case 'l':
-			loops = atoi(optarg);
-			break;
-		case 'n':
-			/* just for gzip compatibility */
-			break;
-		case 'm':
-			buffer_mode = 1;
-			break;
-		case 'p':
-			preheat = 1;
-			break;
-		case 't':
-			test = 1;
-			break;
-		case 'v':
-			verbose++;
-			break;
-		case 'D':
-			format = SLZ_FMT_DEFLATE;
-			break;
-		case 'G':
-			format = SLZ_FMT_GZIP;
-			break;
-		case 'Z':
-			format = SLZ_FMT_ZLIB;
-			break;
-		default:
-			usage(name, 1);
-		}
-	}
-	argv += optind;
-	argc -= optind;
-
-	if (argc > 0) {
-		fd = open(argv[0], O_RDONLY);
-		if (fd == -1) {
-			perror("open()");
-			exit(1);
-		}
-	}
-
-	/* loops are a benchmarking tool: repeating the output would produce a
-	 * concatenation of identical streams that nobody wants.
-	 */
-	if (loops != 1 && !test)
-		die(1, "-l is only supported in test mode (-t).\n");
-
-	/* pre-heating only makes measurements more stable, it is useless and
-	 * wastes memory otherwise.
-	 */
-	if (preheat && !test)
-		die(1, "-p is only supported in test mode (-t).\n");
-
-	if (isatty(1) && !test && !force)
-		die(1, "Use -f if you really want to send compressed data to a terminal, or -h for help.\n");
-
-	slz_make_crc_table();
-	slz_prepare_dist_table();
-
-	outbsize = 2 * block_size; // allows to pack more than one full output at each round
-	outbuf = calloc(1, outbsize + 4096);
-	if (!outbuf) {
-		perror("calloc");
-		exit(1);
-	}
 
 	/* principle : we'll determine the input file size and try to map the
 	 * file at once. If it works we have a single input buffer of the whole
@@ -277,18 +189,6 @@ int main(int argc, char **argv)
 #endif
 		}
 	}
-
-	/* try to increase output pipe size to avoid blocking on writes */
-#if defined(F_GETPIPE_SZ) && defined(F_SETPIPE_SZ)
-	if (fstat(1, &statbuf) != -1) {
-		/* attempt to optimize the pipe size if needed and possible */
-		if (S_ISFIFO(statbuf.st_mode)) {
-			int size = fcntl(1, F_GETPIPE_SZ);
-			if (size > 0 && size < block_size)
-				fcntl(1, F_SETPIPE_SZ, block_size);
-		}
-	}
-#endif
 
 	if (toread && !buffer_mode) {
 		/* we know the size to map, let's do it */
@@ -342,8 +242,8 @@ int main(int argc, char **argv)
 			}
 		}
 
-		if (loops > 1 && !toread) {
-			loops = 1;
+		if (passes > 1 && !toread) {
+			passes = 1;
 			fprintf(stderr, "Warning: disabling loops on non-regular file\n");
 		}
 	}
@@ -364,10 +264,10 @@ int main(int argc, char **argv)
 	 * report the cost of the I/O rather than that of the compression.
 	 * A single pass is measured as-is, there is nothing else to report.
 	 */
-	timed_round = (loops > 1);
+	timed_round = (passes > 1);
 	gettimeofday(&tv_beg, NULL); /* in case no pass runs at all, eg -l 0 */
 
-	while (loops--) {
+	while (passes--) {
 		if (round == timed_round) {
 			timed_in = totin;
 			gettimeofday(&tv_beg, NULL);
@@ -428,8 +328,8 @@ int main(int argc, char **argv)
 #endif
 			if (outblen + block_size > outbsize) {
 				/* not enough space left, need to flush */
-				if (console && !test && !error)
-					if (write(1, outbuf, outblen) < 0)
+				if (!test && !error)
+					if (write(ofd, outbuf, outblen) < 0)
 						error = 1;
 				totout += outblen;
 				outblen = 0;
@@ -440,11 +340,11 @@ int main(int argc, char **argv)
 		outblen += slz_finish(&strm, outbuf + outblen);
 		totin += ofs;
 		totout += outblen;
-		if (console && !test && !error)
-			if (write(1, outbuf, outblen) < 0)
+		if (!test && !error)
+			if (write(ofd, outbuf, outblen) < 0)
 				error = 1;
 
-		if (loops && (!toread || toread > mapsize)) {
+		if (passes && (!toread || toread > mapsize)) {
 			/* this is a seeked file, let's rewind it now */
 			lseek(fd, 0, SEEK_SET);
 		}
@@ -467,5 +367,125 @@ int main(int argc, char **argv)
 		        (sec > 0.0 ? done / sec / 1000000.0 : 0.0) * (1.0 - (double)totout / totin));
 	}
 
+	if (buffer_mode)
+		free(buffer);
+	else
+		munmap(buffer, mapsize);
 	return error;
+}
+
+int main(int argc, char **argv)
+{
+	const char *name = argv[0];
+	struct stat statbuf;
+	int force = 0;
+	int fd = 0;
+	int opt;
+
+	/* digits are options too, like with gzip: "-c1" is "-c -1". A level
+	 * is thus a single digit, which is enough since the levels above 4
+	 * work as level 4.
+	 */
+	while ((opt = getopt(argc, argv, "0123456789b:cfhK:l:mnptvDGZ")) != -1) {
+		switch (opt) {
+		case '0': case '1': case '2': case '3': case '4':
+		case '5': case '6': case '7': case '8': case '9':
+			level = opt - '0';
+			break;
+		case 'b':
+			max_read = strtoll(optarg, NULL, 0);
+			break;
+		case 'K':
+			block_size = parse_size(optarg);
+			if (!block_size)
+				usage(name, 1);
+			break;
+		case 'c':
+			/* the default, and the only output for now */
+			break;
+		case 'f':
+			force = 1;
+			break;
+		case 'h':
+			usage(name, 0);
+		case 'l':
+			loops = atoi(optarg);
+			break;
+		case 'n':
+			/* just for gzip compatibility */
+			break;
+		case 'm':
+			buffer_opt = 1;
+			break;
+		case 'p':
+			preheat = 1;
+			break;
+		case 't':
+			test = 1;
+			break;
+		case 'v':
+			verbose++;
+			break;
+		case 'D':
+			format = SLZ_FMT_DEFLATE;
+			break;
+		case 'G':
+			format = SLZ_FMT_GZIP;
+			break;
+		case 'Z':
+			format = SLZ_FMT_ZLIB;
+			break;
+		default:
+			usage(name, 1);
+		}
+	}
+	argv += optind;
+	argc -= optind;
+
+	if (argc > 0) {
+		fd = open(argv[0], O_RDONLY);
+		if (fd == -1) {
+			perror("open()");
+			exit(1);
+		}
+	}
+
+	/* loops are a benchmarking tool: repeating the output would produce a
+	 * concatenation of identical streams that nobody wants.
+	 */
+	if (loops != 1 && !test)
+		die(1, "-l is only supported in test mode (-t).\n");
+
+	/* pre-heating only makes measurements more stable, it is useless and
+	 * wastes memory otherwise.
+	 */
+	if (preheat && !test)
+		die(1, "-p is only supported in test mode (-t).\n");
+
+	if (isatty(1) && !test && !force)
+		die(1, "Use -f if you really want to send compressed data to a terminal, or -h for help.\n");
+
+	slz_make_crc_table();
+	slz_prepare_dist_table();
+
+	outbsize = 2 * block_size; // allows to pack more than one full output at each round
+	outbuf = calloc(1, outbsize + 4096);
+	if (!outbuf) {
+		perror("calloc");
+		exit(1);
+	}
+
+	/* try to increase output pipe size to avoid blocking on writes */
+#if defined(F_GETPIPE_SZ) && defined(F_SETPIPE_SZ)
+	if (fstat(1, &statbuf) != -1) {
+		/* attempt to optimize the pipe size if needed and possible */
+		if (S_ISFIFO(statbuf.st_mode)) {
+			int size = fcntl(1, F_GETPIPE_SZ);
+			if (size > 0 && size < block_size)
+				fcntl(1, F_SETPIPE_SZ, block_size);
+		}
+	}
+#endif
+
+	return compress_fd(fd, 1);
 }
