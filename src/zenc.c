@@ -81,6 +81,7 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    "  -n         does nothing, just for gzip compatibility\n"
 	    "  -p         pre-heat: fault the input (mmap mode) and output buffers in\n"
 	    "             before compressing, and keep the input mapped between loops\n"
+	    "             (test mode only)\n"
 	    "  -t         test mode: do not emit anything\n"
 	    "  -T         hint that the contents are mostly text (html, css, js, ...),\n"
 	    "             levels 1 and 2 then work as level 3\n"
@@ -206,6 +207,12 @@ int main(int argc, char **argv)
 	 */
 	if (loops != 1 && !test)
 		die(1, "-l is only supported in test mode (-t).\n");
+
+	/* pre-heating only makes measurements more stable, it is useless and
+	 * wastes memory otherwise.
+	 */
+	if (preheat && !test)
+		die(1, "-p is only supported in test mode (-t).\n");
 
 	if (isatty(1) && !test && !force)
 		die(1, "Use -f if you really want to send compressed data to a terminal, or -h for help.\n");
