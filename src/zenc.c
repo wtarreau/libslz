@@ -71,7 +71,7 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    "The following arguments are supported :\n"
 	    "  -0         disable compression, only uses output format\n"
 	    "  -1..9      compression level (1=fastest, 4 and above=best); default=2\n"
-	    "  -k <size>  block size in kB (default: 4096)\n"
+	    "  -K <size>  block size in kB (default: 4096)\n"
 	    "  -b <size>  only use <size> bytes from the input file\n"
 	    "  -B         use buffered mode instead of mmap (uses less memory)\n"
 	    "  -c         send output to stdout [default]\n"
@@ -132,7 +132,7 @@ int main(int argc, char **argv)
 	 * is thus a single digit, which is enough since the levels above 4
 	 * work as level 4.
 	 */
-	while ((opt = getopt(argc, argv, "0123456789b:k:cfhl:nBptvDGZ")) != -1) {
+	while ((opt = getopt(argc, argv, "0123456789b:cfhK:l:nBptvDGZ")) != -1) {
 		switch (opt) {
 		case '0': case '1': case '2': case '3': case '4':
 		case '5': case '6': case '7': case '8': case '9':
@@ -141,7 +141,7 @@ int main(int argc, char **argv)
 		case 'b':
 			toread = strtoll(optarg, NULL, 0);
 			break;
-		case 'k':
+		case 'K':
 			block_size = strtoll(optarg, NULL, 0) * 1024;
 			if (block_size < 1024)
 				block_size = 1024; // 1 kB min
