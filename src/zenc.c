@@ -85,9 +85,11 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    "  -1..9      compression level (1=fastest, 4 and above=best); default=2\n"
 	    "  -K <size>  block size, in kB or with a b/k/m/g suffix (default: 4096); with\n"
 	    "             -d, output ring size (default and minimum: 32 kB)\n"
-	    "  -b <size>  only use <size> bytes from the input file (needs -c or -t)\n"
+	    "  -b <size>  only use <size> bytes from the input file (needs -c or -t,\n"
+	    "             not with -d)\n"
 	    "  -m         memory mode: read the input into a buffer of the block size\n"
-	    "             instead of mapping it (default when it cannot be mapped)\n"
+	    "             instead of mapping it (default when it cannot be mapped; not\n"
+	    "             with -d)\n"
 	    "  -c         send output to stdout, keep the files [default without file]\n"
 	    "  -d         decompress\n"
 	    "  -f         force sending output to a terminal, overwrite existing output\n"
@@ -103,7 +105,7 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    "  -n         does nothing, just for gzip compatibility\n"
 	    "  -p         pre-heat: fault the input (mmap mode) and output buffers in\n"
 	    "             before compressing, and keep the input mapped between loops\n"
-	    "             (test mode only)\n"
+	    "             (test mode only, not with -d)\n"
 	    "  -t         test mode: do not emit anything; with -d, the exit status says\n"
 	    "             whether the inputs could be decompressed\n"
 	    "  -v         increase verbosity\n"
@@ -947,6 +949,10 @@ int main(int argc, char **argv)
 
 	if (in_size != DEC_IN_SIZE && !decompress)
 		die(1, "-i is only supported with -d.\n");
+
+	/* these ones only act on the compression's input */
+	if (decompress && (preheat || buffer_opt || max_read >= 0))
+		die(1, "-b, -m and -p are not supported with -d.\n");
 
 	/* -b would remove the end of the input files */
 	if (max_read >= 0 && !to_stdout && !test)
