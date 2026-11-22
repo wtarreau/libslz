@@ -7,6 +7,17 @@ CROSS_COMPILE :=
 CC         := $(CROSS_COMPILE)gcc
 PLATFORM   := $(shell $(CC) -dumpmachine | sed -e 's,-gnu[^-]*,,; s,.*-,,')
 
+# BUILD=release is the default. Setting it to anything else (e.g. "make BUILD="
+# or "make BUILD=dev") makes a development build, which defines SLZ_DEV_BUILD
+# in every C file to expose debugging features. Its name is passed in
+# SLZ_BUILD. Run "make clean" when changing it, the objects don't depend on it.
+BUILD      := release
+ifeq ($(BUILD),release)
+BLD_CFLAGS := -DSLZ_BUILD='"$(BUILD)"'
+else
+BLD_CFLAGS := -DSLZ_BUILD='"$(BUILD)"' -DSLZ_DEV_BUILD
+endif
+
 OPT_CFLAGS := -O3
 CPU_CFLAGS := -fomit-frame-pointer
 DEB_CFLAGS := -Wall -g
@@ -14,7 +25,7 @@ DEF_CFLAGS :=
 USR_CFLAGS :=
 LIB_CFLAGS := -fPIC -DPRECOMPUTE_TABLES
 INC_CFLAGS := -I$(TOPDIR)/include
-CFLAGS     := $(OPT_CFLAGS) $(CPU_CFLAGS) $(DEB_CFLAGS) $(DEF_CFLAGS) $(USR_CFLAGS) $(INC_CFLAGS)
+CFLAGS     := $(OPT_CFLAGS) $(CPU_CFLAGS) $(DEB_CFLAGS) $(DEF_CFLAGS) $(BLD_CFLAGS) $(USR_CFLAGS) $(INC_CFLAGS)
 
 LD         := $(CC)
 DEB_LFLAGS := -g
