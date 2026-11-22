@@ -78,17 +78,22 @@ bandwidth was measured by sending the output to /dev/null so as not to let the
   zstd-1.5.7 -1     617 MB/s  2.89  # zstd -c1
   zstd-1.5.7 -2     552 MB/s  3.05  # zstd -c2
   zstd-1.5.7 -3     405 MB/s  3.20  # zstd -c3
-  slz-1.4 -1 -D     939 MB/s  2.15  # zenc in deflate format, level 1 (fastest)
-  slz-1.4 -1 -G     908 MB/s  2.15  # zenc in gzip format, level 1 (fastest)
-  slz-1.4 -1 -Z     908 MB/s  2.15  # zenc in zlib format, level 1 (fastest)
-  slz-1.4 -2 -D     830 MB/s  2.30  # zenc in deflate format, level 2 (default)
-  slz-1.4 -3 -D     795 MB/s  2.32  # zenc in deflate format, level 3
-  slz-1.4 -4 -D     746 MB/s  2.32  # zenc in deflate format, level 4 (best)
-  slz-1.4 -T -D     742 MB/s  2.40  # zenc in deflate format, text content type
-  slz-1.3.2 -1 -D   619 MB/s  2.13  # zenc in deflate format, level 1
-  slz-1.3.2 -1 -G   478 MB/s  2.13  # zenc in gzip format, level 1
-  slz-1.3.2 -1 -Z   547 MB/s  2.13  # zenc in zlib format, level 1
+  slz-1.4 -1 -D     939 MB/s  2.15  # slz in deflate format, level 1 (fastest)
+  slz-1.4 -1 -G     908 MB/s  2.15  # slz in gzip format, level 1 (fastest)
+  slz-1.4 -1 -Z     908 MB/s  2.15  # slz in zlib format, level 1 (fastest)
+  slz-1.4 -2 -D     830 MB/s  2.30  # slz in deflate format, level 2 (default)
+  slz-1.4 -3 -D     795 MB/s  2.32  # slz in deflate format, level 3
+  slz-1.4 -4 -D     746 MB/s  2.32  # slz in deflate format, level 4 (best)
+  slz-1.4 -T -D     742 MB/s  2.40  # slz in deflate format, text type (*)
+  slz-1.3.2 -1 -D   619 MB/s  2.13  # slz in deflate format, level 1
+  slz-1.3.2 -1 -G   478 MB/s  2.13  # slz in gzip format, level 1
+  slz-1.3.2 -1 -Z   547 MB/s  2.13  # slz in zlib format, level 1
   gzip-1.14 -1      163 MB/s  2.74  # gzip level 1 (fastest)
+
+  (*) -T set the text content type hint. The option was removed since: the
+      levels 2 and above now switch to the text tree by themselves when it
+      pays, and with the hint, levels 1 and 2 produced the same output as
+      level 3.
 
 Only gzip/zlib and SLZ can emit a stream that a regular zlib-compatible browser
 can decompress (RFC1950/1951/1952 aka zlib, deflate, gzip). Here SLZ is 4.5 to
@@ -103,8 +108,9 @@ shows 924 and 811 MB/s respectively, hence only level 1 is faster, but 2 is
 slightly slower (but both still compress better). Compared to zstd, slz is not
 put to shame either. Zstd always compresses better at all levels, and is always
 slower at all levels. The closest between the two is zstd --fast that is close
-to slz -T, at 2.44 vs 2.40 compression ratios (2% better for zstd), where slz
-is 6.9% faster. Again, we're flirting with CPU-specific optimizations here.
+to slz with the text content type, at 2.44 vs 2.40 compression ratios (2%
+better for zstd), where slz is 6.9% faster. Again, we're flirting with
+CPU-specific optimizations here.
 
 The text content type was trained on web contents while Silesia does not match,
 but it still brings the output within 14% of zlib's because it contains some
@@ -117,9 +123,9 @@ expect from text inputs, on the same machine:
 
   Parameters        Input BW  Compression ratio
   zstd-1.5.7        879 MB/s  5.29  # zstd --fast
-  zenc -1 -D       1052 MB/s  4.28  # slz in deflate format, level 1 (fastest)
-  zenc -2 -D       1046 MB/s  4.28  # slz in deflate format, level 2 (default)
-  zenc -T -D        994 MB/s  4.85  # slz in deflate format, text content type
+  slz -1 -D        1052 MB/s  4.28  # slz in deflate format, level 1 (fastest)
+  slz -2 -D        1046 MB/s  4.28  # slz in deflate format, level 2 (default)
+  slz -T -D         994 MB/s  4.85  # slz in deflate format, text type (*)
   gzip-1.14 -1      284 MB/s  4.97  # gzip level 1 (fastest)
 
 This is more than one gigabyte per second of input data that is divided in size
@@ -134,13 +140,13 @@ Modern ARM cores deliver good performance as well, as seen below on an A720
 core of a CIX-P1 processor in Radxa Orion O6 on the Silesia corpus file:
 
    parameters     ratio              speed (MB/s)
-   zenc -G -1     0.4680 = 1/2.14    505.7
-   zenc -Z -1     0.4680 = 1/2.14    529.5
-   zenc -D -1     0.4680 = 1/2.14    548.0
-   zenc -D -2     0.4362 = 1/2.29    485.1
-   zenc -D -3     0.4326 = 1/2.31    467.7
-   zenc -D -4     0.4315 = 1/2.32    438.4
-   zenc -D -T     0.4167 = 1/2.29    423.0
+   slz -G -1      0.4680 = 1/2.14    505.7
+   slz -Z -1      0.4680 = 1/2.14    529.5
+   slz -D -1      0.4680 = 1/2.14    548.0
+   slz -D -2      0.4362 = 1/2.29    485.1
+   slz -D -3      0.4326 = 1/2.31    467.7
+   slz -D -4      0.4315 = 1/2.32    438.4
+   slz -D -T (*)  0.4167 = 1/2.29    423.0
 
 Since SLZ focuses a lot on performance savings gained by keeping most of the
 workload in CPU cache, it scales very well when multiple cores are used in
@@ -224,18 +230,20 @@ level 3, which compresses better (ratio 2.32 instead of 2.15), it still
 processes 26.0 GB/s, or 208 Gbps of input traffic compressed to 89.7 Gbps, and
 a single core runs at 491 MB/s (650 MB/s with two threads).
 
-Decompression is not SLZ's main purpose, but the zdec utility, based on the
-built-in uslz decompressor, is much faster (3x) than zcat on streams produced
-by zenc, and remains 2x faster on streams produced by gzip. These tests were
+Decompression is not SLZ's main purpose, but "slz -d", based on the built-in
+uslz decompressor, is much faster (3x) than zcat on streams produced by slz,
+and remains 2x faster on streams produced by gzip. These tests were
 run on a single core of a 3rd gen AMD EPYC at 3.7 GHz, decompressing the
 Silesia corpus compressed in gzip format (the output size is the 211947520
-bytes of the original data):
+bytes of the original data). The numbers come from zdec, the separate
+decompression utility of that time, which "slz -d" replaced with the same
+decoding loop and the same speed:
 
    Stream produced by  Decompressor          Time(s)  Output BW(MB/s)
-   zenc -G -1          zdec (slz-1.4-dev5)    0.364       582
-   zenc -G -1          zcat (gzip-1.12)       1.076       196
-   zenc -G -T          zdec (slz-1.4-dev5)    0.570       372
-   zenc -G -T          zcat (gzip-1.12)       1.090       191
+   slz -G -1           zdec (slz-1.4-dev5)    0.364       582
+   slz -G -1           zcat (gzip-1.12)       1.076       196
+   slz -G -T (*)       zdec (slz-1.4-dev5)    0.570       372
+   slz -G -T (*)       zcat (gzip-1.12)       1.090       191
    gzip -1             zdec (slz-1.4-dev5)    0.567       374
    gzip -1             zcat (gzip-1.12)       1.114       190
 
@@ -272,14 +280,57 @@ is then the input bandwidth which varies according to the average compression
 ratio. In all situations, SLZ resulted in bandwidth savings 3 times higher than
 zlib.
 
-The "zenc" utility, which was orginally aimed at running regression tests,
-found its way into backup systems since it permits to reach network links
-limits with compressed streams before saturating the CPU. This results in a
-shorter total backup time, while relying on a well-known and standard output
-compression format. Such use cases could benefit from a multithreaded version
-that would work on different blocks and adapt the running CRC once blocks are
-finished, but given that a not-so-fast x86 system easily saturates a gigabit
-link using a single core, there's not much demand for this at the moment.
+The "slz" utility (formerly named "zenc"), which was orginally aimed at running
+regression tests, found its way into backup systems since it permits to reach
+network links limits with compressed streams before saturating the CPU. This
+results in a shorter total backup time, while relying on a well-known and
+standard output compression format. Such use cases could benefit from a
+multithreaded version that would work on different blocks and adapt the running
+CRC once blocks are finished, but given that a not-so-fast x86 system easily
+saturates a gigabit link using a single core, there's not much demand for this
+at the moment.
+
+It is now used mostly like gzip. Given file names, it compresses each file in
+place to the same name followed by the format's extension (".gz" for -G, the
+default, ".zz" for -Z, ".dfl" for -D), which receives the file's mode, owner
+and times, then removes the file. The file's name is not stored in the output.
+
+"slz -d" decompresses files in place the same way, to the file's name without
+its extension, whichever it is. One of -G, -Z or -D forces the format.
+Otherwise the gzip and zlib formats are detected from the stream, but raw
+deflate cannot be, so the ".dfl" extension selects it. A file without
+extension can only be decompressed to stdout (-c). Without file name, it works
+from stdin to stdout. Its main options are:
+
+  -1..-9      compression level (1=fastest, 4 and above=best, 2 by default),
+              "-0" only emits the format without compressing
+  -c          write to stdout and keep the files (the default without file)
+  -d          decompress
+  -f          overwrite existing outputs, compress symbolic links and files
+              which already carry the extension, write compressed data to a
+              terminal
+  -k          keep the input files
+  -t          test mode: process the inputs without emitting anything; with
+              -d, the exit status tells whether they could be decompressed
+  -v          report the sizes, ratio and speed
+  -K <size>   block size (4 MB by default), or the output ring size with -d
+              (32 kB by default and at least), in kB or with a b/k/m suffix
+  -m          memory mode: read the input into a buffer of the block size
+              instead of mapping it; it is the default for pipes and other
+              inputs which cannot be mapped
+
+For convenience, the program recognizes names such as "zdec", "zcat", "gzcat"
+and "slzcat" as equivalent to "slz -dc", and "gunzip" and "unslz" as equivalent
+to "slz -d". Symbolic links will make this possible if needed. By default, only
+"zenc" and "zdec" are provided.
+
+An output is only created once its input could be opened, an existing one is
+only replaced with -f, and on error or interruption the output is removed and
+the input kept. For benchmarks, -l <loops> repeats the processing of each input
+and -p pre-heats the input and output buffers, both in test mode only. A
+development build ("make BUILD=dev") offers debugging features, such as -i to
+set the size of the chunks fed to the decompressor (e.g. "-i 1b" for one byte
+per call).
 
 There are 6 key points having a large impact on compression speed in any LZ-
 based compressor :
@@ -415,14 +466,14 @@ These three factors have a significant impact on the compression ratio :
   contents by 12 to 18%. It is not suited to binary contents nor to contents of
   less than 1-2 kB.
 
-SLZ is provided as a library with a few extra tools (such as the zenc testing
-utility mentioned above, and zdec, a decompressor based on uslz which can
-decompress any gzip, zlib or raw deflate stream, not only those produced by
-SLZ, and detects the gzip and zlib formats by itself). It is distributed under
-the X11 license, meaning that you can do a lot of things with it, such as merge
-it into GPL or BSD-licensed programs, as well as use it in proprietary
-software. Contributions are welcome and should be sent as Git patches (see "git
-format-patch") and will be made under the same license exclusively.
+SLZ is provided as a library with a few extra tools, such as the slz utility
+mentioned above, whose decompressor, based on uslz, decompresses any gzip, zlib
+or raw deflate stream, not only those produced by SLZ, and detects the gzip and
+zlib formats by itself. It is distributed under the X11 license, meaning that
+you can do a lot of things with it, such as merge it into GPL or BSD-licensed
+programs, as well as use it in proprietary software. Contributions are welcome
+and should be sent as Git patches (see "git format-patch") and will be made
+under the same license exclusively.
 
 Project's webpage : http://www.libslz.org/
 Download sources  : https://github.com/wtarreau/libslz/
