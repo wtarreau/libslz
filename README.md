@@ -1,5 +1,7 @@
-SLZ / StateLess Zip - v1.4-dev5 - 2026/11/08 - Willy Tarreau <w+slz@1wt.eu>
----------------------------------------------------------------------------
+SLZ / StateLess Zip version 1.4
+-------------------------------
+
+## Intro
 
 SLZ is a fast and memory-less stream compressor which produces an output that
 can be decompressed with slz, zlib or gzip. It provides uslz API for
@@ -14,6 +16,8 @@ have to compress many streams in parallel with little CPU resources to assign
 to this task, and without having to limit the compression ratio due to the
 memory usage. In such an environment, the server's memory usage can easily be
 divided by 10 and the CPU usage by 3.
+
+## How does it work ?
 
 While zlib uses 256 kB of memory per stream in addition to a few tens of bytes
 for the stream descriptor itself, SLZ only stores a stream descriptor made of
@@ -50,19 +54,14 @@ backwards, for a slightly better ratio. In addition, a text content type may
 be selected for HTML, CSS, JS, JSON, SVG and similar contents
 (see "content type" below).
 
-Some performance tests were run using version 1.0 on various types of data
-showing anything between 227 MB/s and 753 MB/s per core on the older hardware
-depending on the difficulty to find matching strings and on the amount of data
-emitted as literals (hence not compressed). In the end, comparative tests were
-performed using some reference datasets that are already being used for other
-libraries. This performance report was produced using the Silesia Corpus to get
-something comparable to what is reported by the LZ4 utility here :
+## Comparative tests
 
-        https://github.com/Cyan4973/lz4
-
-Since then, tests have been performed on modern hardware, from 16-core ARM
-to 64-core AMD EPYC, and performance on x86_64 and ARMv8 has been further
-improved.
+Comparative tests were performed using some reference datasets that are already
+being used for other libraries. This performance report was produced using the
+Silesia Corpus to get something comparable to what is reported by the [LZ4
+utility here](https://github.com/Cyan4973/lz4) and is also used as a reference
+in lzbench. Tests were performed on various hardware, from 16-core ARM to
+64-core AMD EPYC, including modern x86_64 and ARMv9 cores.
 
 The following tests were run on a single core of an Intel Core Ultra 7 265K at
 5.5 GHz (turbo mode). The input file is the Silesia Corpus tar file placed in a
@@ -78,84 +77,98 @@ compressors will deliver a slightly higher performance by avoiding a few
 file-oriented syscalls, but at least here they're all compared under the exact
 same conditions.
 
-  Product              Input BW  Compression ratio
-  lz4-1.8.2 -1         853 MB/s  2.10 # lz4 -1zc (fastest)
-  lz4-1.8.2 -2         853 MB/s  2.10 # lz4 -2zc (exact same output as -1)
-  zstd-1.5.7 --fast=4  863 MB/s  2.15 # zstd -c --fast=4
-  zstd-1.5.7 --fast=3  837 MB/s  2.24 # zstd -c --fast=3
-  zstd-1.5.7 --fast=2  798 MB/s  2.34 # zstd -c --fast=2
-  zstd-1.5.7 --fast=1  756 MB/s  2.44 # zstd -c --fast=1 (same as --fast)
-  zstd-1.5.7 -1        617 MB/s  2.89 # zstd -c1
-  zstd-1.5.7 -2        552 MB/s  3.05 # zstd -c2
-  zstd-1.5.7 -3        405 MB/s  3.20 # zstd -c3
-  slz-1.4 -1 -D        928 MB/s  2.15 # slz in deflate format, level 1 (fastest)
-  slz-1.4 -1 -G        902 MB/s  2.15 # slz in gzip format, level 1 (fastest)
-  slz-1.4 -1 -Z        899 MB/s  2.15 # slz in zlib format, level 1 (fastest)
-  slz-1.4 -2 -D        903 MB/s  2.27 # slz in deflate format, level 2 (default)
-  slz-1.4 -3 -D        792 MB/s  2.45 # slz in deflate format, level 3
-  slz-1.4 -4 -D        752 MB/s  2.47 # slz in deflate format, level 4 (best)
-  slz-1.3.2 -1 -D      619 MB/s  2.13 # slz in deflate format, level 1
-  slz-1.3.2 -1 -G      478 MB/s  2.13 # slz in gzip format, level 1
-  slz-1.3.2 -1 -Z      547 MB/s  2.13 # slz in zlib format, level 1
-  gzip-1.14 -1         163 MB/s  2.74 # gzip level 1 (fastest)
+|  Product              |  Input BW  |  Compression ratio |                              |
+|:--------------------- |:----------:|:-----:|:------------------------------------------|
+|  lz4-1.8.2 -1         |  853 MB/s  |  2.10 | lz4 -1zc (fastest)                        |
+|  lz4-1.8.2 -2         |  853 MB/s  |  2.10 | lz4 -2zc (exact same output as -1)        |
+|  zstd-1.5.7 --fast=4  |  863 MB/s  |  2.15 | zstd -c --fast=4                          |
+|  zstd-1.5.7 --fast=3  |  837 MB/s  |  2.24 | zstd -c --fast=3                          |
+|  zstd-1.5.7 --fast=2  |  798 MB/s  |  2.34 | zstd -c --fast=2                          |
+|  zstd-1.5.7 --fast=1  |  756 MB/s  |  2.44 | zstd -c --fast=1 (same as --fast)         |
+|  zstd-1.5.7 -1        |  617 MB/s  |  2.89 | zstd -c1                                  |
+|  zstd-1.5.7 -2        |  552 MB/s  |**3.05**| zstd -c2                                 |
+|  zstd-1.5.7 -3        |  405 MB/s  |**3.20**| zstd -c3                                 |
+|  slz-1.4 -1 -D        |**928** MB/s|  2.15 | slz in deflate format, level 1 (fastest)  |
+|  slz-1.4 -1 -G        |**902** MB/s|  2.15 | slz in gzip format, level 1 (fastest)     |
+|  slz-1.4 -1 -Z        |  899 MB/s  |  2.15 | slz in zlib format, level 1 (fastest)     |
+|  slz-1.4 -2 -D        |**903** MB/s|  2.27 | slz in deflate format, level 2 (default)  |
+|  slz-1.4 -3 -D        |  792 MB/s  |  2.45 | slz in deflate format, level 3            |
+|  slz-1.4 -4 -D        |  752 MB/s  |  2.47 | slz in deflate format, level 4 (best)     |
+|  slz-1.3.2 -1 -D      |  619 MB/s  |  2.13 | slz in deflate format, level 1            |
+|  slz-1.3.2 -1 -G      |  478 MB/s  |  2.13 | slz in gzip format, level 1               |
+|  slz-1.3.2 -1 -Z      |  547 MB/s  |  2.13 | slz in zlib format, level 1               |
+|  gzip-1.14 -1         |  163 MB/s  |  2.74 | gzip level 1 (fastest)                    |
+
+![Silesia corpus on a Core Ultra 7 265K](tests/bench/img/slz-cmp-silesia.png)
 
 zstd --fast=N selects zstd's negative levels, which trade compression ratio for
 speed as N grows, --fast alone being --fast=1. At --fast=4, zstd already
 compresses no more than slz -1, and the higher values continue the trend. Lz4
 only takes one file, so it was measured on 10 concatenated copies of the file.
+For the last 10 years, SLZ has been part of
+[Inikep's lzbench benchmark suite](https://github.com/inikep/lzbench/), which
+compares a wide range of compression tools. The project maintains an updated
+performance table where other solutions can be compared. Please visit it, it
+shows that there are compressors for many different purposes.
 
-Only gzip/zlib and SLZ can emit a stream that a regular zlib-compatible browser
-can decompress (RFC1950/1951/1952 aka zlib, deflate, gzip). Here SLZ is 4.5 to
-5.5 times faster than zlib, for a payload 11 to 28% larger than zlib's at its
-fastest level 1. Slz 1.4's gzip compression is 1.77 times faster than that of
+**Only gzip/zlib and SLZ** can emit a stream that a regular zlib-compatible browser
+can decompress (RFC1950/1951/1952 aka zlib, deflate, gzip). Here SLZ is **4.5 to
+5.5 times faster than zlib**, for a payload 11 to 28% larger than zlib's at its
+fastest level 1. Slz 1.4's gzip compression is **1.77 times faster** than that of
 slz-1.3, its zlib compression is 1.54 times faster, and its deflate compression
-is 45% faster, all while compressing slightly more. Slz-1.4's levels 1 and 2
-are both faster and stronger than lz4 on this machine.
+is 45% faster, all while compressing slightly more. **Slz-1.4's levels 1 and 2
+are both faster and stronger than lz4 on this machine**.
 
 Compared to zstd, slz is not put to shame either. Zstd's regular levels always
 compress better, and are always slower. On the fast side, slz -1 compresses as
-much as zstd --fast=4 and is 7.5% faster, slz -2 is both faster and stronger
+much as zstd --fast=4 and is 7.5% faster, **slz -2 is both faster and stronger
 than zstd --fast=3 and --fast=4, and slz -3 is both faster and stronger than
-zstd --fast=1 (792 MB/s for 2.45 against 756 MB/s for 2.44).
+zstd --fast=1** (792 MB/s for 2.45 against 756 MB/s for 2.44).
 
 Levels 2 and above switch to slz's text tree by themselves when it pays, which
 brings the output of levels 3 and 4 within 11% of zlib's on Silesia, as it
 contains some text. The -T option of earlier versions, which forced the text
 content type, was removed: with it, levels 1 and 2 produced the same output as
-level 3. The gzip and zlib formats cost 2.8% and 3.1% respectively compared to
-raw deflate on this CPU.
+level 3. The **gzip and zlib formats cost 2.8% and 3.1%** respectively compared
+to raw deflate on this CPU.
 
 Modern ARM cores deliver good performance as well, as seen below on an A720
 core of a CIX-P1 processor in Radxa Orion O6 on the Silesia corpus file (passed
 3 times, measured as above):
 
-  Product              Input BW  Compression ratio
-  slz-1.4 -1 -D        519 MB/s  2.14 # slz in deflate format, level 1 (fastest)
-  slz-1.4 -1 -G        480 MB/s  2.14 # slz in gzip format, level 1 (fastest)
-  slz-1.4 -1 -Z        496 MB/s  2.14 # slz in zlib format, level 1 (fastest)
-  slz-1.4 -2 -D        501 MB/s  2.26 # slz in deflate format, level 2 (default)
-  slz-1.4 -3 -D        433 MB/s  2.45 # slz in deflate format, level 3
-  slz-1.4 -4 -D        409 MB/s  2.47 # slz in deflate format, level 4 (best)
-  gzip -1               81 MB/s  2.74 # gzip level 1 (fastest)
+|  Product          |   Input BW  | Compression ratio |                             |
+|:------------------|:-----------:|:----:|:-----------------------------------------|
+|  slz-1.4 -1 -D    |    519 MB/s | 2.14 | slz in deflate format, level 1 (fastest) |
+|  slz-1.4 -1 -G    |    480 MB/s | 2.14 | slz in gzip format, level 1 (fastest)    |
+|  slz-1.4 -1 -Z    |    496 MB/s | 2.14 | slz in zlib format, level 1 (fastest)    |
+|  slz-1.4 -2 -D    |    501 MB/s | 2.26 | slz in deflate format, level 2 (default) |
+|  slz-1.4 -3 -D    |    433 MB/s | 2.45 | slz in deflate format, level 3           |
+|  slz-1.4 -4 -D    |    409 MB/s | 2.47 | slz in deflate format, level 4 (best)    |
+|  gzip -1          |     81 MB/s | 2.74 | gzip level 1 (fastest)                   |
 
-Here slz -1 is 6.4 times faster than gzip -1.
+![Silesia corpus on an A720 core](tests/bench/img/slz-cmp-a720.png)
+
+Here **slz -1 is 6.4 times faster than gzip -1**.
 
 Compressing the sources of a Linux 7.0 kernel better illustrates the gains to
 expect from text inputs, on the same Core Ultra 7 265K (a 1643110400 bytes tar
 file, passed 3 times, on the same RAM disk):
 
-  Product              Input BW  Compression ratio
-  zstd-1.5.7 --fast=4  945 MB/s  4.44 # zstd -c --fast=4
-  zstd-1.5.7 --fast=3  928 MB/s  4.72 # zstd -c --fast=3
-  zstd-1.5.7 --fast=2  912 MB/s  5.01 # zstd -c --fast=2
-  zstd-1.5.7 --fast=1  895 MB/s  5.29 # zstd -c --fast=1 (same as --fast)
-  slz-1.4 -1 -D       1012 MB/s  4.28 # slz in deflate format, level 1 (fastest)
-  slz-1.4 -1 -G        966 MB/s  4.28 # slz in gzip format, level 1 (fastest)
-  slz-1.4 -1 -Z        963 MB/s  4.28 # slz in zlib format, level 1 (fastest)
-  slz-1.4 -2 -D        990 MB/s  4.81 # slz in deflate format, level 2 (default)
-  slz-1.4 -3 -D        984 MB/s  4.85 # slz in deflate format, level 3
-  slz-1.4 -4 -D        980 MB/s  4.85 # slz in deflate format, level 4 (best)
-  gzip-1.14 -1         284 MB/s  4.97 # gzip level 1 (fastest)
+| Product             |   Input BW  | Compression ratio |                             |
+|:--------------------|:-----------:|:----:|:-----------------------------------------|
+| zstd-1.5.7 --fast=4 |   945 MB/s  | 4.44 | zstd -c --fast=4                         |
+| zstd-1.5.7 --fast=3 |   928 MB/s  | 4.72 | zstd -c --fast=3                         |
+| zstd-1.5.7 --fast=2 |   912 MB/s  | 5.01 | zstd -c --fast=2                         |
+| zstd-1.5.7 --fast=1 |   895 MB/s  |**5.29**| zstd -c --fast=1 (same as --fast)        |
+| slz-1.4 -1 -D       |**1012 MB/s**| 4.28 | slz in deflate format, level 1 (fastest) |
+| slz-1.4 -1 -G       |   966 MB/s  | 4.28 | slz in gzip format, level 1 (fastest)    |
+| slz-1.4 -1 -Z       |   963 MB/s  | 4.28 | slz in zlib format, level 1 (fastest)    |
+| slz-1.4 -2 -D       |   990 MB/s  | 4.81 | slz in deflate format, level 2 (default) |
+| slz-1.4 -3 -D       |   984 MB/s  | 4.85 | slz in deflate format, level 3           |
+| slz-1.4 -4 -D       |   980 MB/s  | 4.85 | slz in deflate format, level 4 (best)    |
+| gzip-1.14 -1        |   284 MB/s  | 4.97 | gzip level 1 (fastest)                   |
+
+![Linux 7.0 sources on a Core Ultra 7 265K](tests/bench/img/slz-cmp-linux.png)
 
 This is about one gigabyte per second of input data that is divided in size by
 4.3 to 4.8. It's 3.6 times faster than gzip for a 16% larger output at level 1,
@@ -171,15 +184,18 @@ parallel (low memory bandwidth) as shown in this tests run on a 16-core ARM
 Cortex A72 (NXP LX2160A) running at 2.2 GHz, using the Silesia corpus at
 level 1 in deflate format :
 
-   #Cores  Input size  BW/core(MB/s)   Total BW(MB/s)
-       1    211947520      169.4            169.4
-       2    211947520      172.6            345.2
-       3    211947520      171.6            514.8
-       4    211947520      172.2            688.8
-       6    211947520      172.6           1035.6
-       8    211947520      173.3           1386.4
-      12    211947520      173.1           2077.2
-      16    211947520      172.7           2763.2
+|   #Cores | Input size | BW/core(MB/s) |  Total BW(MB/s) |
+|:---------|:----------:|:-------------:| ---------------:|
+|       1  |  211947520 |     169.4     |       169.4     |
+|       2  |  211947520 |     172.6     |       345.2     |
+|       3  |  211947520 |     171.6     |       514.8     |
+|       4  |  211947520 |     172.2     |       688.8     |
+|       6  |  211947520 |     172.6     |      1035.6     |
+|       8  |  211947520 |     173.3     |      1386.4     |
+|      12  |  211947520 |     173.1     |      2077.2     |
+|      16  |  211947520 |     172.7     |      2763.2     |
+
+![Scalability on a 16-core Cortex A72](tests/bench/img/slz-scale-a72.png)
 
 Here the scaling is perfectly linear: each core compresses as fast with all 16
 cores busy as when it runs alone. At level 3, the same machine processes
@@ -188,27 +204,29 @@ cores busy as when it runs alone. At level 3, the same machine processes
 On a more powerful machine (64-core 3rd gen AMD EPYC at 3.7 GHz), with the same
 settings, we observe this:
 
-   #Cores  Input size  BW/core(MB/s)   Total BW(MB/s)
-       1    211947520      573.8            573.8
-       2    211947520      574.9           1095.8
-       3    211947520      572.4           1717.2
-       4    211947520      569.4           2277.6
-       8    211947520      540.1           4320.8
-      16    211947520      472.7           7563.2
-      32    211947520      461.6          14771.2
-      64    211947520      380.0          24320.0
+|   #Cores | Input size | BW/core(MB/s) |  Total BW(MB/s) |
+|:---------|:----------:|:-------------:| ---------------:|
+|       1  |  211947520 |     573.8     |       573.8     |
+|       2  |  211947520 |     574.9     |      1095.8     |
+|       3  |  211947520 |     572.4     |      1717.2     |
+|       4  |  211947520 |     569.4     |      2277.6     |
+|       8  |  211947520 |     540.1     |      4320.8     |
+|      16  |  211947520 |     472.7     |      7563.2     |
+|      32  |  211947520 |     461.6     |     14771.2     |
+|      64  |  211947520 |     380.0     |     24320.0     |
 
 On the same 64-core AMD EPYC with 2 threads per core:
 
-   #Cores  Input size  BW/core(MB/s)   Total BW(MB/s)
-       1  2*211947520      757.0            757.0
-       2  2*211947520      762.6           1523.2
-       3  2*211947520      754.0           2262.0
-       4  2*211947520      756.2           3024.8
-       8  2*211947520      720.0           5760.0
-      16  2*211947520      624.4           9990.4
-      32  2*211947520      610.4          19532.8
-      64  2*211947520      447.6          28646.4
+|   #Cores | Input size  | BW/core(MB/s) |  Total BW(MB/s) |
+|:---------|:-----------:|:-------------:| ---------------:|
+|       1  | 2*211947520 |      757.0    |        757.0    |
+|       2  | 2*211947520 |      762.6    |       1523.2    |
+|       3  | 2*211947520 |      754.0    |       2262.0    |
+|       4  | 2*211947520 |      756.2    |       3024.8    |
+|       8  | 2*211947520 |      720.0    |       5760.0    |
+|      16  | 2*211947520 |      624.4    |       9990.4    |
+|      32  | 2*211947520 |      610.4    |      19532.8    |
+|      64  | 2*211947520 |      447.6    |      28646.4    |
 
 The per-core drop seen here is not caused by SLZ but by the CPU's frequency,
 which falls as more cores become active: it runs at 3.7 GHz on up to 4 cores,
@@ -219,49 +237,54 @@ running two threads per core brings 25 to 35% more.
 
 One thread per core, at 2.5 GHz:
 
-   #Cores  Input size  BW/core(MB/s)   Total BW(MB/s)
-       1    211947520      380.4            384.9
-       2    211947520      380.6            761.2
-       3    211947520      379.0           1137.0
-       4    211947520      378.9           1515.6
-       8    211947520      374.0           2992.0
-      16    211947520      376.1           6017.6
-      32    211947520      371.4          11885.1
-      64    211947520      356.0          22783.4
+|   #Cores | Input size | BW/core(MB/s) |  Total BW(MB/s) |
+|:---------|:----------:|:-------------:| ---------------:|
+|       1  |  211947520 |     380.4     |       384.9     |
+|       2  |  211947520 |     380.6     |       761.2     |
+|       3  |  211947520 |     379.0     |      1137.0     |
+|       4  |  211947520 |     378.9     |      1515.6     |
+|       8  |  211947520 |     374.0     |      2992.0     |
+|      16  |  211947520 |     376.1     |      6017.6     |
+|      32  |  211947520 |     371.4     |     11885.1     |
+|      64  |  211947520 |     356.0     |     22783.4     |
 
 Two threads per core, at 2.5 GHz:
 
-   #Cores  Input size  BW/core(MB/s)   Total BW(MB/s)
-       1  2*211947520      506.3            506.3
-       2  2*211947520      507.2           1014.3
-       3  2*211947520      505.0           1515.0
-       4  2*211947520      504.2           2016.8
-       8  2*211947520      496.5           3971.8
-      16  2*211947520      494.1           7906.1
-      32  2*211947520      490.1          15684.0
-      64  2*211947520      450.9          28855.6
+|   #Cores | Input size  | BW/core(MB/s) |  Total BW(MB/s) |
+|:---------|:-----------:|:-------------:| ---------------:|
+|       1  | 2*211947520 |     506.3     |       506.3     |
+|       2  | 2*211947520 |     507.2     |      1014.3     |
+|       3  | 2*211947520 |     505.0     |      1515.0     |
+|       4  | 2*211947520 |     504.2     |      2016.8     |
+|       8  | 2*211947520 |     496.5     |      3971.8     |
+|      16  | 2*211947520 |     494.1     |      7906.1     |
+|      32  | 2*211947520 |     490.1     |     15684.0     |
+|      64  | 2*211947520 |     450.9     |     28855.6     |
 
-With all 128 threads busy, the machine compresses the equivalent of about 230
-Gbps of input TCP traffic to 107 Gbps of output TCP traffic at level 1. At
+With all 128 threads busy, the machine compresses the equivalent of about **230
+Gbps of input TCP traffic to 107 Gbps of output TCP traffic** at level 1. At
 level 3, which compresses better (ratio 2.32 instead of 2.15), it still
 processes 26.0 GB/s, or 208 Gbps of input traffic compressed to 89.7 Gbps, and
 a single core runs at 491 MB/s (650 MB/s with two threads).
 
-Decompression is not SLZ's main purpose, but "slz -d", based on the built-in
-uslz decompressor, is 1.7 to 1.8 times as fast as zcat on streams produced by
-slz, and 1.5 times as fast on streams produced by gzip. These tests were run on
-a single core of the same Core Ultra 7 265K, decompressing the Silesia corpus
-compressed in gzip format, passed 3 times on the command line. The times are
-the best of 4 runs divided by 3, so that they are those of one pass producing
-the 211947520 bytes of the original data:
+![Scalability on a 64-core AMD EPYC](tests/bench/img/slz-scale-epyc.png)
 
-   Stream produced by  Decompressor          Time(s)  Output BW(MB/s)
-   slz -G -1           slz -d (slz-1.4)       0.228       930
-   slz -G -1           zcat (gzip-1.14)       0.391       542
-   slz -G -3           slz -d (slz-1.4)       0.246       862
-   slz -G -3           zcat (gzip-1.14)       0.438       484
-   gzip -1             slz -d (slz-1.4)       0.314       674
-   gzip -1             zcat (gzip-1.14)       0.464       457
+Decompression is not SLZ's main purpose, but "slz -d", based on the built-in
+uslz decompressor, is **1.7 to 1.8 times** as fast as zcat on streams produced
+by slz, and 1.5 times as fast on streams produced by gzip. These tests were run
+on a single core of the same Core Ultra 7 265K, decompressing the Silesia
+corpus compressed in gzip format, passed 3 times on the command line. The times
+are the best of 4 runs divided by 3, so that they are those of one pass
+producing the 211947520 bytes of the original data:
+
+|  Stream produced by  |   Decompressor    |   Time(s)  | Output BW(MB/s) |
+|:---------------------|:-----------------:|:----------:|----------------:|
+|   slz -G -1          | slz -d (slz-1.4)  |     0.228  |     930         |
+|   slz -G -1          | zcat (gzip-1.14)  |     0.391  |     542         |
+|   slz -G -3          | slz -d (slz-1.4)  |     0.246  |     862         |
+|   slz -G -3          | zcat (gzip-1.14)  |     0.438  |     484         |
+|   gzip -1            | slz -d (slz-1.4)  |     0.314  |     674         |
+|   gzip -1            | zcat (gzip-1.14)  |     0.464  |     457         |
 
 Since some products automatically throttle the compression level based on the
 CPU usage or the available memory, on high speed networks, zlib can end up
@@ -271,8 +294,10 @@ reduced by 2.5-3.5 times, meaning that the throttling will happen at much
 higher data rates. The net effect is a significant improvement on the
 compression ratio compared to zlib at a given resource usage.
 
-Note: the measurements below were performed with version 1.2 and will need to
-be performed again with the current version.
+## Increasing compression ratio in HTTP gateways
+
+*Note: the measurements below were performed with version 1.2 and will need to
+be performed again with the current version.*
 
 HAProxy running on a single core of a core i5-3320M, with 500 concurrent users,
 the default 16kB buffers, and accessing www.haproxy.org (76 kB) shows the
@@ -280,21 +305,25 @@ following measures with traffic leaving the machine via a gigabit Ethernet link
 (hence the 976 Mbps of IP traffic) after being compressed with zlib and SLZ,
 respectively :
 
-  At 100% CPU (no CPU usage limit) :
-            BW In      BW Out     BW Saved   Ratio   memory VSZ/RSS  hits/s
-  zlib      480 Mbps   188 Mbps   292 Mbps   2.55     130M / 101M     744
-  slz      1700 Mbps   810 Mbps   890 Mbps   2.10    23.7M / 9.7M    2382
+At 100% CPU (no CPU usage limit) :
+|         |   BW In    |  BW Out   |  BW Saved |  Ratio |  memory VSZ/RSS | hits/s |
+|:--------|:----------:|:---------:|:---------:|:------:|:---------------:|-------:|
+|  zlib   |   480 Mbps |  188 Mbps |  292 Mbps |  2.55  |   130M / 101M   |  744   |
+|  slz    |  1700 Mbps |  810 Mbps |  890 Mbps |  2.10  |  23.7M / 9.7M   | 2382   |
 
-  At 85% CPU (limited) :
-            BW In      BW Out     BW Saved   Ratio   memory VSZ/RSS  hits/s
-  zlib     1240 Mbps   976 Mbps   264 Mbps   1.27     130M / 100M    1738
-  slz      1600 Mbps   976 Mbps   624 Mbps   1.64    23.7M / 9.7M    2210
+At 85% CPU (limited) :
+|         |   BW In    |  BW Out   |  BW Saved |  Ratio |  memory VSZ/RSS | hits/s |
+|:--------|:----------:|:---------:|:---------:|:------:|:---------------:|-------:|
+|  zlib   |  1240 Mbps |  976 Mbps |  264 Mbps |  1.27  |   130M / 100M   | 1738   |
+|  slz    |  1600 Mbps |  976 Mbps |  624 Mbps |  1.64  |  23.7M / 9.7M   | 2210   |
 
 In the CPU-limited test, once CPU usage limit was reached, blocks were sent
 uncompressed. This explains how the gigabit link was always saturated, and it
 is then the input bandwidth which varies according to the average compression
 ratio. In all situations, SLZ resulted in bandwidth savings 3 times higher than
 zlib.
+
+## No magics inside!
 
 The "slz" utility (formerly named "zenc"), which was orginally aimed at running
 regression tests, found its way into backup systems since it permits to reach
@@ -318,6 +347,7 @@ deflate cannot be, so the ".dfl" extension selects it. A file without
 extension can only be decompressed to stdout (-c). Without file name, it works
 from stdin to stdout. Its main options are:
 
+```
   -1..-9      compression level (1=fastest, 4 and above=best, 2 by default),
               "-0" only emits the format without compressing
   -c          write to stdout and keep the files (the default without file)
@@ -334,6 +364,7 @@ from stdin to stdout. Its main options are:
   -m          memory mode: read the input into a buffer of the block size
               instead of mapping it; it is the default for pipes and other
               inputs which cannot be mapped
+```
 
 For convenience, the program recognizes names such as "zdec", "zcat", "gzcat"
 and "slzcat" as equivalent to "slz -dc", and "gunzip" and "unslz" as equivalent
@@ -342,8 +373,8 @@ to "slz -d". Symbolic links will make this possible if needed. By default, only
 
 An output is only created once its input could be opened, an existing one is
 only replaced with -f, and on error or interruption the output is removed and
-the input kept. For benchmarks, -l <loops> repeats the processing of each input
-and -p pre-heats the input and output buffers, both in test mode only. A
+the input kept. For benchmarks, -l `<loops>` repeats the processing of each
+input and -p pre-heats the input and output buffers, both in test mode only. A
 development build ("make BUILD=dev") offers debugging features, such as -i to
 set the size of the chunks fed to the decompressor (e.g. "-i 1b" for one byte
 per call).
@@ -369,9 +400,9 @@ based compressor :
 - indexing : if sequences of less than 3 bytes are considered for a lookup,
   since we only keep the last occurrence, there's a high risk of not keeping
   the most useful sequence which has large changes of matching a similar word.
-  For example in HTML a lot of occurrences of '><', '</', '/>' can be found so
-  the probability that the one from '</a>' is picked instead of the one from
-  '</td>' will make it hard to find long matches. Conversely, sequences larger
+  For example in HTML a lot of occurrences of `><`, `</`, `/>` can be found
+  so the probability that the one from `</a>` is picked instead of the one from
+  `</td>` will make it hard to find long matches. Conversely, sequences larger
   than 4 bytes will only match once in a while and will prevent shorter series
   of characters from being matched. Experimentation has shown that hashing 3
   bytes only provided the same compression ratio as hashing 4 bytes, with up to
@@ -482,6 +513,8 @@ These three factors have a significant impact on the compression ratio :
   contents by 12 to 18%. It is not suited to binary contents nor to contents of
   less than 1-2 kB.
 
+## Get it!
+
 SLZ is provided as a library with a few extra tools, such as the slz utility
 mentioned above, whose decompressor, based on uslz, decompresses any gzip, zlib
 or raw deflate stream, not only those produced by SLZ, and detects the gzip and
@@ -491,6 +524,6 @@ programs, as well as use it in proprietary software. Contributions are welcome
 and should be sent as Git patches (see "git format-patch") and will be made
 under the same license exclusively.
 
-Project's webpage : http://www.libslz.org/
-Download sources  : https://github.com/wtarreau/libslz/
-Contact           : Willy Tarreau <w+slz@1wt.eu>
+Project's webpage : http://www.libslz.org/  
+Download sources  : https://github.com/wtarreau/libslz/  
+Contact           : Willy Tarreau <w+slz@1wt.eu>  
