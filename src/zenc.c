@@ -37,6 +37,7 @@
 #include <sys/time.h>
 #include <sys/user.h>
 #include <fcntl.h>
+#include <signal.h>
 #include "slz.h"
 #include "slz-prv.h"
 #if defined(__linux__)
@@ -67,18 +68,26 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 #ifdef SLZ_VERSION
 	    " version " SLZ_VERSION
 #endif
-	    "\nUsage: %s [option]* [file]\n"
+	    "\nUsage: %s [option]* [file]*\n"
+	    "\n"
+	    "Compresses each <file> in place: the output goes to <file> followed by the\n"
+	    "format's extension (.gz, .zz or .dfl), which receives <file>'s mode and\n"
+	    "times, and <file> is then removed. Without <file>, or with -c, the output\n"
+	    "goes to stdout. A <file> named \"-\" is stdin.\n"
 	    "\n"
 	    "The following arguments are supported :\n"
 	    "  -0         disable compression, only uses output format\n"
 	    "  -1..9      compression level (1=fastest, 4 and above=best); default=2\n"
 	    "  -K <size>  block size, in kB or with a b/k/m/g suffix (default: 4096)\n"
-	    "  -b <size>  only use <size> bytes from the input file\n"
+	    "  -b <size>  only use <size> bytes from the input file (needs -c or -t)\n"
 	    "  -m         memory mode: read the input into a buffer of the block size\n"
 	    "             instead of mapping it (default when it cannot be mapped)\n"
-	    "  -c         send output to stdout [default]\n"
-	    "  -f         force sending output to a terminal\n"
+	    "  -c         send output to stdout, keep the files [default without file]\n"
+	    "  -f         force sending output to a terminal, overwrite existing output\n"
+	    "             files, and compress symbolic links and files which already\n"
+	    "             have the extension\n"
 	    "  -h         display this help\n"
+	    "  -k         keep the input files\n"
 	    "  -l <loops> loop <loops> times over the same file (test mode only)\n"
 	    "  -n         does nothing, just for gzip compatibility\n"
 	    "  -p         pre-heat: fault the input (mmap mode) and output buffers in\n"
@@ -87,11 +96,9 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    "  -t         test mode: do not emit anything\n"
 	    "  -v         increase verbosity\n"
 	    "\n"
-	    "  -D         use raw Deflate output format (RFC1951)\n"
-	    "  -G         use Gzip output format (RFC1952) [default]\n"
-	    "  -Z         use Zlib output format (RFC1950)\n"
-	    "\n"
-	    "If no file is specified, stdin will be used instead.\n"
+	    "  -D         use raw Deflate output format (RFC1951) -> .dfl\n"
+	    "  -G         use Gzip output format (RFC1952) [default] -> .gz\n"
+	    "  -Z         use Zlib output format (RFC1950) -> .zz\n"
 	    "\n"
 	    ,name);
 }
@@ -107,6 +114,14 @@ static int level   = 2;
 static int verbose = 0;
 static int test    = 0;
 static int format  = SLZ_FMT_GZIP;
+
+static int force   = 0;
+static int keep    = 0;
+static int to_stdout = 0;
+static const char *progname;
+
+/* the output file being created, removed if we are interrupted */
+static const char *volatile cur_output;
 
 /* the output buffer, shared by all inputs */
 static unsigned char *outbuf;
@@ -136,10 +151,47 @@ static unsigned long long parse_size(const char *str)
 	return *end ? 0 : size;
 }
 
-/* Compresses the input read from <fd> to <ofd> following the options above.
- * Returns 0 on success, non-zero on error.
+/* reports an error about <name> (or stdin if NULL) caused by errno */
+static void report(const char *name, const char *what)
+{
+	fprintf(stderr, "%s: %s: %s: %s\n", progname, name ? name : "stdin", what, strerror(errno));
+}
+
+/* writes all <len> bytes of <buf> to <fd>, returns 0 on success or -1 on
+ * error with errno set.
  */
-static int compress_fd(int fd, int ofd)
+static int write_all(int fd, const unsigned char *buf, size_t len)
+{
+	while (len) {
+		ssize_t ret = write(fd, buf, len);
+
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		buf += ret;
+		len -= ret;
+	}
+	return 0;
+}
+
+/* removes the partial output file on SIGINT/SIGTERM/SIGHUP, then dies from
+ * the same signal.
+ */
+static void interrupted(int sig)
+{
+	if (cur_output)
+		unlink(cur_output);
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
+/* Compresses the input read from <fd> to <ofd> following the options above.
+ * <name> is the input's name for the messages, NULL for stdin. Returns 0 on
+ * success, non-zero on error.
+ */
+static int compress_fd(int fd, int ofd, const char *name)
 {
 	struct stat statbuf;
 	struct slz_stream strm;
@@ -267,7 +319,7 @@ static int compress_fd(int fd, int ofd)
 	timed_round = (passes > 1);
 	gettimeofday(&tv_beg, NULL); /* in case no pass runs at all, eg -l 0 */
 
-	while (passes--) {
+	while (passes-- && !error) {
 		if (round == timed_round) {
 			timed_in = totin;
 			gettimeofday(&tv_beg, NULL);
@@ -329,20 +381,24 @@ static int compress_fd(int fd, int ofd)
 			if (outblen + block_size > outbsize) {
 				/* not enough space left, need to flush */
 				if (!test && !error)
-					if (write(ofd, outbuf, outblen) < 0)
+					if (write_all(ofd, outbuf, outblen) < 0) {
+						report(name, "write");
 						error = 1;
+					}
 				totout += outblen;
 				outblen = 0;
 			}
 			ofs += tocompress;
-		} while (!toread || ofs < toread);
+		} while ((!toread || ofs < toread) && !error);
 
 		outblen += slz_finish(&strm, outbuf + outblen);
 		totin += ofs;
 		totout += outblen;
 		if (!test && !error)
-			if (write(ofd, outbuf, outblen) < 0)
+			if (write_all(ofd, outbuf, outblen) < 0) {
+				report(name, "write");
 				error = 1;
+			}
 
 		if (passes && (!toread || toread > mapsize)) {
 			/* this is a seeked file, let's rewind it now */
@@ -361,6 +417,8 @@ static int compress_fd(int fd, int ofd)
 		             (tv_end.tv_usec - tv_beg.tv_usec) / 1000000.0;
 		unsigned long long done = totin - timed_in;
 
+		if (name)
+			fprintf(stderr, "%s: ", name);
 		fprintf(stderr, "totin=%llu totout=%llu ratio=%.2f%% crc32=%08x time=%.3fs %.1fMB/s saving %.1fMB/s\n",
 		        totin, totout, totout * 100.0 / totin, strm.crc32,
 		        sec, sec > 0.0 ? done / sec / 1000000.0 : 0.0,
@@ -374,19 +432,134 @@ static int compress_fd(int fd, int ofd)
 	return error;
 }
 
+/* Compresses file <name> in place: to <name> followed by the extension of
+ * the format, which receives <name>'s mode, owner and times, then removes
+ * <name> unless -k is set. The output is only created once the input could
+ * be opened, and an existing output is only removed with -f. On error, the
+ * output is removed and the input kept. Returns 0 on success, non-zero on
+ * error.
+ */
+static int compress_file(const char *name)
+{
+	const char *ext = format == SLZ_FMT_GZIP ? ".gz" : format == SLZ_FMT_ZLIB ? ".zz" : ".dfl";
+	size_t nlen = strlen(name), elen = strlen(ext);
+	struct timespec times[2];
+	struct stat st;
+	char *out;
+	int fd, ofd;
+	int err = 1;
+
+	if (lstat(name, &st) == 0 && S_ISLNK(st.st_mode) && !force) {
+		fprintf(stderr, "%s: %s is a symbolic link, use -f to compress it\n", progname, name);
+		return 1;
+	}
+
+	if (nlen > elen && strcmp(name + nlen - elen, ext) == 0 && !force) {
+		fprintf(stderr, "%s: %s already has the %s extension, use -f to compress it\n", progname, name, ext);
+		return 1;
+	}
+
+	fd = open(name, O_RDONLY);
+	if (fd < 0) {
+		report(name, "open");
+		return 1;
+	}
+
+	if (fstat(fd, &st) < 0) {
+		report(name, "fstat");
+		goto close_in;
+	}
+
+	if (!S_ISREG(st.st_mode)) {
+		fprintf(stderr, "%s: %s is not a regular file, ignored\n", progname, name);
+		goto close_in;
+	}
+
+	out = malloc(nlen + elen + 1);
+	if (!out) {
+		report(name, "malloc");
+		goto close_in;
+	}
+	memcpy(out, name, nlen);
+	memcpy(out + nlen, ext, elen + 1);
+
+	/* only readable by us until it is complete */
+	cur_output = out;
+	ofd = open(out, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (ofd < 0 && errno == EEXIST && force) {
+		if (unlink(out) < 0) {
+			cur_output = NULL;
+			report(out, "unlink");
+			goto free_out;
+		}
+		ofd = open(out, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	}
+
+	if (ofd < 0) {
+		cur_output = NULL;
+		if (errno == EEXIST)
+			fprintf(stderr, "%s: %s already exists, use -f to overwrite it\n", progname, out);
+		else
+			report(out, "open");
+		goto free_out;
+	}
+
+	if (compress_fd(fd, ofd, name) != 0)
+		goto remove_out;
+
+	/* the owner first, since changing it may clear the mode's setuid
+	 * bits. It may fail when we are not root, that's fine.
+	 */
+	if (fchown(ofd, st.st_uid, st.st_gid) < 0 && fchown(ofd, -1, st.st_gid) < 0) {
+		/* ignored */
+	}
+	times[0] = st.st_atim;
+	times[1] = st.st_mtim;
+	if (fchmod(ofd, st.st_mode & 07777) < 0 || futimens(ofd, times) < 0) {
+		report(out, "setting the mode and times");
+		goto remove_out;
+	}
+
+	if (close(ofd) < 0) {
+		ofd = -1;
+		report(out, "close");
+		goto remove_out;
+	}
+	ofd = -1;
+	cur_output = NULL;
+
+	if (!keep && unlink(name) < 0) {
+		report(name, "unlink");
+		goto free_out;
+	}
+	err = 0;
+	goto free_out;
+
+ remove_out:
+	if (ofd >= 0)
+		close(ofd);
+	unlink(out);
+	cur_output = NULL;
+ free_out:
+	free(out);
+ close_in:
+	close(fd);
+	return err;
+}
+
 int main(int argc, char **argv)
 {
 	const char *name = argv[0];
 	struct stat statbuf;
-	int force = 0;
-	int fd = 0;
+	int uses_stdout = 0;
+	int error = 0;
 	int opt;
 
 	/* digits are options too, like with gzip: "-c1" is "-c -1". A level
 	 * is thus a single digit, which is enough since the levels above 4
 	 * work as level 4.
 	 */
-	while ((opt = getopt(argc, argv, "0123456789b:cfhK:l:mnptvDGZ")) != -1) {
+	while ((opt = getopt(argc, argv, "0123456789b:cfhkK:l:mnptvDGZ")) != -1) {
 		switch (opt) {
 		case '0': case '1': case '2': case '3': case '4':
 		case '5': case '6': case '7': case '8': case '9':
@@ -401,13 +574,16 @@ int main(int argc, char **argv)
 				usage(name, 1);
 			break;
 		case 'c':
-			/* the default, and the only output for now */
+			to_stdout = 1;
 			break;
 		case 'f':
 			force = 1;
 			break;
 		case 'h':
 			usage(name, 0);
+		case 'k':
+			keep = 1;
+			break;
 		case 'l':
 			loops = atoi(optarg);
 			break;
@@ -442,13 +618,14 @@ int main(int argc, char **argv)
 	argv += optind;
 	argc -= optind;
 
-	if (argc > 0) {
-		fd = open(argv[0], O_RDONLY);
-		if (fd == -1) {
-			perror("open()");
-			exit(1);
-		}
-	}
+	progname = name;
+	if (!argc)
+		to_stdout = 1;
+
+	/* stdin given as "-" is always sent to stdout */
+	for (opt = 0; opt < argc; opt++)
+		if (strcmp(argv[opt], "-") == 0)
+			uses_stdout = 1;
 
 	/* loops are a benchmarking tool: repeating the output would produce a
 	 * concatenation of identical streams that nobody wants.
@@ -462,7 +639,11 @@ int main(int argc, char **argv)
 	if (preheat && !test)
 		die(1, "-p is only supported in test mode (-t).\n");
 
-	if (isatty(1) && !test && !force)
+	/* -b would remove the end of the input files */
+	if (max_read >= 0 && !to_stdout && !test)
+		die(1, "-b is only supported with -c or -t.\n");
+
+	if ((to_stdout || uses_stdout) && isatty(1) && !test && !force)
 		die(1, "Use -f if you really want to send compressed data to a terminal, or -h for help.\n");
 
 	slz_make_crc_table();
@@ -487,5 +668,30 @@ int main(int argc, char **argv)
 	}
 #endif
 
-	return compress_fd(fd, 1);
+	if (!argc)
+		return compress_fd(0, 1, NULL) != 0;
+
+	signal(SIGINT, interrupted);
+	signal(SIGTERM, interrupted);
+	signal(SIGHUP, interrupted);
+
+	for (; argc; argc--, argv++) {
+		int fd;
+
+		if (strcmp(*argv, "-") == 0)
+			error |= compress_fd(0, 1, NULL) != 0;
+		else if (to_stdout || test) {
+			fd = open(*argv, O_RDONLY);
+			if (fd < 0) {
+				report(*argv, "open");
+				error = 1;
+				continue;
+			}
+			error |= compress_fd(fd, 1, *argv) != 0;
+			close(fd);
+		}
+		else
+			error |= compress_file(*argv);
+	}
+	return error;
 }
