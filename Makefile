@@ -2,6 +2,7 @@ TOPDIR     := $(PWD)
 DESTDIR    :=
 PREFIX     := /usr/local
 LIBDIR     := $(PREFIX)/lib
+MANDIR     := $(PREFIX)/share/man
 
 CROSS_COMPILE :=
 CC         := $(CROSS_COMPILE)gcc
@@ -102,7 +103,7 @@ $(SHARED): $(SONAME)
 %-pic.o: %.c src/slz.h src/tables.h
 	$(CC) $(CFLAGS) $(LIB_CFLAGS) -o $@ -c $<
 
-install: install-headers install-static install-shared install-tools
+install: install-headers install-static install-shared install-tools install-man
 
 install-headers:
 	[ -d "$(DESTDIR)$(PREFIX)/include/." ] || mkdir -p -m 0755 $(DESTDIR)$(PREFIX)/include
@@ -127,6 +128,11 @@ install-tools: tools
 	cp slz $(DESTDIR)$(PREFIX)/bin/slz
 	chmod 755 $(DESTDIR)$(PREFIX)/bin/zdecode
 	chmod 755 $(DESTDIR)$(PREFIX)/bin/slz
+
+install-man:
+	[ -d "$(DESTDIR)$(MANDIR)/man1/." ] || mkdir -p -m 0755 $(DESTDIR)$(MANDIR)/man1
+	cp tools/slz.1 $(DESTDIR)$(MANDIR)/man1/slz.1
+	chmod 644 $(DESTDIR)$(MANDIR)/man1/slz.1
 
 clean:
 	-rm -f $(BINS) $(OBJS) $(STATIC) $(SHARED) *.[oa] *.so *.so.* *.dylib *~ */*.[oa] */*~
