@@ -51,7 +51,8 @@ static void usage(const char *name, int ret)
 	       "  -c         send output to stdout [default]\n"
 	       "  -h         display this help\n"
 	       "  -i <size>  read the input by chunks of <size> bytes (default %d)\n"
-	       "  -l <loops> loop <loops> times over the same file (needs a seekable input)\n"
+	       "  -l <loops> loop <loops> times over the same file (test mode only, needs\n"
+	       "             a seekable input)\n"
 	       "  -t         test mode: decompress but do not emit anything\n"
 	       "  -v         increase verbosity\n"
 	       "\n"
@@ -118,6 +119,14 @@ int main(int argc, char **argv)
 
 	if (argc > 1)
 		file = argv[1];
+
+	/* loops are a benchmarking tool: repeating the output would produce a
+	 * concatenation of identical copies that nobody wants.
+	 */
+	if (loops != 1 && !test_only) {
+		fprintf(stderr, "-l is only supported in test mode (-t).\n");
+		exit(1);
+	}
 
 	if (ring_size < MIN_RING || in_size < 1) {
 		fprintf(stderr, "ring size must be at least %d and input chunk at least 1\n", MIN_RING);

@@ -77,7 +77,7 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    "  -c         send output to stdout [default]\n"
 	    "  -f         force sending output to a terminal\n"
 	    "  -h         display this help\n"
-	    "  -l <loops> loop <loops> times over the same file\n"
+	    "  -l <loops> loop <loops> times over the same file (test mode only)\n"
 	    "  -n         does nothing, just for gzip compatibility\n"
 	    "  -p         pre-heat: fault the input (mmap mode) and output buffers in\n"
 	    "             before compressing, and keep the input mapped between loops\n"
@@ -200,6 +200,12 @@ int main(int argc, char **argv)
 			exit(1);
 		}
 	}
+
+	/* loops are a benchmarking tool: repeating the output would produce a
+	 * concatenation of identical streams that nobody wants.
+	 */
+	if (loops != 1 && !test)
+		die(1, "-l is only supported in test mode (-t).\n");
 
 	if (isatty(1) && !test && !force)
 		die(1, "Use -f if you really want to send compressed data to a terminal, or -h for help.\n");
