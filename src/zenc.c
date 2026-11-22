@@ -961,6 +961,9 @@ int main(int argc, char **argv)
 	if (!decompress && (to_stdout || uses_stdout) && isatty(1) && !test && !force)
 		die(1, "Use -f if you really want to send compressed data to a terminal, or -h for help.\n");
 
+	if (decompress && !argc && isatty(0) && !force)
+		die(1, "Use -f if you really want to read compressed data from a terminal, or -h for help.\n");
+
 	slz_make_crc_table();
 	slz_prepare_dist_table();
 
