@@ -802,6 +802,39 @@ static int process_file(const char *name)
 	return err;
 }
 
+/* Sets the default mode from the name the program was called by, so that it
+ * can be installed under the names of the tools it replaces. The options
+ * given on the command line apply on top of it. Any other name compresses.
+ */
+static void mode_from_name(const char *name)
+{
+	static const struct {
+		const char *name;
+		int decompress;
+		int to_stdout;
+	} names[] = {
+		{ "gunzip", 1, 0 },     /* gunzip: decompress in place */
+		{ "unslz",  1, 0 },
+		{ "zcat",   1, 1 },     /* zcat: decompress to stdout */
+		{ "gzcat",  1, 1 },     /* zcat's name on macOS and the BSDs */
+		{ "slzcat", 1, 1 },
+		{ "zdec",   1, 1 },     /* the former decompression tool */
+	};
+	const char *slash = strrchr(name, '/');
+	int i;
+
+	if (slash)
+		name = slash + 1;
+
+	for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		if (strcmp(name, names[i].name) == 0) {
+			decompress = names[i].decompress;
+			to_stdout = names[i].to_stdout;
+			return;
+		}
+	}
+}
+
 int main(int argc, char **argv)
 {
 	const char *name = argv[0];
@@ -809,6 +842,8 @@ int main(int argc, char **argv)
 	int uses_stdout = 0;
 	int error = 0;
 	int opt;
+
+	mode_from_name(name);
 
 	/* digits are options too, like with gzip: "-c1" is "-c -1". A level
 	 * is thus a single digit, which is enough since the levels above 4

@@ -35,7 +35,7 @@ LDFLAGS    := $(DEB_LFLAGS) $(USR_LFLAGS) $(LIB_LFLAGS)
 
 AR         := $(CROSS_COMPILE)ar
 STRIP      := $(CROSS_COMPILE)strip
-BINS       := zdecode slz
+BINS       := zdecode slz zenc zdec
 STATIC     := libslz.a
 ifneq ($(filter darwin%, $(PLATFORM)),)
 	SHARED := libslz.dylib
@@ -75,6 +75,9 @@ zdecode: src/zdecode.o
 
 slz: src/zenc.o src/slz_common.o src/slz.o src/uslz.o
 	$(LD) $(LDFLAGS) -o $@ $^
+
+zenc zdec: slz
+	ln -sf $^ $@
 
 $(STATIC): src/slz_common.o src/slz.o src/uslz.o
 	$(AR) rv $@ $^
