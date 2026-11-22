@@ -295,6 +295,7 @@ static void interrupted(int sig)
  */
 static int compress_fd(int fd, int ofd, const char *name)
 {
+	size_t released;
 	struct stat statbuf;
 	struct slz_stream strm;
 	unsigned char *buffer;
@@ -430,6 +431,7 @@ static int compress_fd(int fd, int ofd, const char *name)
 		slz_init(&strm, level, format);
 
 		outblen = ofs = 0;
+		released = 0;
 		do {
 			int more = !toread || (toread - ofs) > block_size;
 			unsigned char *start;
@@ -473,11 +475,15 @@ static int compress_fd(int fd, int ofd, const char *name)
 			outblen += slz_encode(&strm, outbuf + outblen, start, tocompress, more);
 
 #if defined(MADV_DONTNEED)
-			if (!buffer_mode && !preheat && (((ofs + tocompress) ^ ofs) & 2097152)) {
-				/* we've crossed a MB boundary, let's release the previous MB,
-				 * unless pre-heating, which wants it to stay mapped.
+			if (!buffer_mode && !preheat && !passes && ((ofs + tocompress) & -2097152) > released) {
+				/* release all complete 2 MB areas consumed so far, unless
+				 * pre-heating, or before the last pass, which want the
+				 * input to stay mapped.
 				 */
-				madvise((void *)(buffer + (ofs & -2097152)), 2097152, MADV_DONTNEED);
+				size_t upto = (ofs + tocompress) & -2097152;
+
+				madvise((void *)(buffer + released), upto - released, MADV_DONTNEED);
+				released = upto;
 			}
 #endif
 			if (outblen + block_size > outbsize) {
