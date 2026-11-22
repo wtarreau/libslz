@@ -243,7 +243,7 @@ int main(int argc, char **argv)
 
 #if defined(BLKGETSIZE64)
 			/* block devices are reported as size zero */
-			if (statbuf.st_mode & S_IFBLK) {
+			if (S_ISBLK(statbuf.st_mode)) {
 				if (ioctl(fd, BLKGETSIZE64, &toread) == -1)
 					toread = 0;
 			}
