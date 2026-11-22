@@ -38,6 +38,7 @@
 #include <sys/user.h>
 #include <fcntl.h>
 #include "slz.h"
+#include "slz-prv.h"
 #if defined(__linux__)
 #include <linux/fs.h>
 #endif
@@ -71,7 +72,7 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    "The following arguments are supported :\n"
 	    "  -0         disable compression, only uses output format\n"
 	    "  -1..9      compression level (1=fastest, 4 and above=best); default=2\n"
-	    "  -K <size>  block size in kB (default: 4096)\n"
+	    "  -K <size>  block size, in kB or with a b/k/m/g suffix (default: 4096)\n"
 	    "  -b <size>  only use <size> bytes from the input file\n"
 	    "  -B         use buffered mode instead of mmap (uses less memory)\n"
 	    "  -c         send output to stdout [default]\n"
@@ -94,6 +95,30 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    ,name);
 }
 
+
+/* Parses size <str>, in kB by default, or in the unit of its suffix: "b"
+ * for bytes, "k" for kB, "m" for MB, in lower or upper case. Returns the
+ * size in bytes, or 0 if <str> is not a valid size.
+ */
+static unsigned long long parse_size(const char *str)
+{
+	unsigned long long size;
+	char *end;
+
+	size = strtoull(str, &end, 0);
+	if (end == str)
+		return 0;
+
+	switch (*end) {
+	case 'g': case 'G': size *= 1024; __fallthrough;
+	case 'm': case 'M': size *= 1024; __fallthrough;
+	case 'k': case 'K': size *= 1024; __fallthrough;
+	case 'b': case 'B': end++; break;
+	case 0: size *= 1024; break;
+	}
+
+	return *end ? 0 : size;
+}
 
 int main(int argc, char **argv)
 {
@@ -142,9 +167,9 @@ int main(int argc, char **argv)
 			toread = strtoll(optarg, NULL, 0);
 			break;
 		case 'K':
-			block_size = strtoll(optarg, NULL, 0) * 1024;
-			if (block_size < 1024)
-				block_size = 1024; // 1 kB min
+			block_size = parse_size(optarg);
+			if (!block_size)
+				usage(name, 1);
 			break;
 		case 'c':
 			console = 1;
