@@ -83,8 +83,6 @@ __attribute__((noreturn)) void usage(const char *name, int code)
 	    "             before compressing, and keep the input mapped between loops\n"
 	    "             (test mode only)\n"
 	    "  -t         test mode: do not emit anything\n"
-	    "  -T         hint that the contents are mostly text (html, css, js, ...),\n"
-	    "             levels 1 and 2 then work as level 3\n"
 	    "  -v         increase verbosity\n"
 	    "\n"
 	    "  -D         use raw Deflate output format (RFC1951)\n"
@@ -125,7 +123,6 @@ int main(int argc, char **argv)
 	int verbose = 0;
 	int test    = 0;
 	int format  = SLZ_FMT_GZIP;
-	int ctype   = SLZ_CT_GENERIC;
 	int force   = 0;
 	int fd = 0;
 	int error = 0;
@@ -135,7 +132,7 @@ int main(int argc, char **argv)
 	 * is thus a single digit, which is enough since the levels above 4
 	 * work as level 4.
 	 */
-	while ((opt = getopt(argc, argv, "0123456789b:k:cfhl:nBptTvDGZ")) != -1) {
+	while ((opt = getopt(argc, argv, "0123456789b:k:cfhl:nBptvDGZ")) != -1) {
 		switch (opt) {
 		case '0': case '1': case '2': case '3': case '4':
 		case '5': case '6': case '7': case '8': case '9':
@@ -171,9 +168,6 @@ int main(int argc, char **argv)
 			break;
 		case 't':
 			test = 1;
-			break;
-		case 'T':
-			ctype = SLZ_CT_TEXT;
 			break;
 		case 'v':
 			verbose++;
@@ -354,7 +348,6 @@ int main(int argc, char **argv)
 		}
 
 		slz_init(&strm, level, format);
-		slz_set_content_type(&strm, ctype);
 
 		outblen = ofs = 0;
 		do {
