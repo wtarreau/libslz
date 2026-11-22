@@ -1,4 +1,4 @@
-SLZ / StateLess Zip version 1.4
+SLZ / StateLess Zip version 1.5-dev0
 -------------------------------
 
 ## Intro
