@@ -109,7 +109,9 @@ For the last 10 years, SLZ has been part of
 [Inikep's lzbench benchmark suite](https://github.com/inikep/lzbench/), which
 compares a wide range of compression tools. The project maintains an updated
 performance table where other solutions can be compared. Please visit it, it
-shows that there are compressors for many different purposes.
+shows that there are compressors for many different purposes. Version 1.4 was
+also integrated into [TurboBench](https://github.com/powturbo/TurboBench) which
+is another compression benchmark.
 
 **Only gzip/zlib and SLZ** can emit a stream that a regular zlib-compatible browser
 can decompress (RFC1950/1951/1952 aka zlib, deflate, gzip). Here SLZ is **4.5 to
